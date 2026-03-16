@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Recording Retrieval Service</title>
+    <link rel="stylesheet" href="/assets/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="hero">
+        <p class="eyebrow">Standalone Surface</p>
+        <h1>Recording Retrieval Service</h1>
+        <p class="summary">直接提交版本检索请求，查看任务状态、终态结果与原始 JSON。</p>
+      </section>
+
+      <section class="panel grid">
+        <form id="request-form" class="stack">
+          <label><span>版本标题</span><input name="title" value="Kleiber 1975" /></label>
+          <label><span>作曲家</span><input name="composerName" value="贝多芬" /></label>
+          <label><span>作曲家 Latin</span><input name="composerNameLatin" value="Ludwig van Beethoven" /></label>
+          <label><span>作品标题</span><input name="workTitle" value="第五交响曲" /></label>
+          <label><span>作品 Latin</span><input name="workTitleLatin" value="Symphony No. 5" /></label>
+          <label><span>Catalogue</span><input name="catalogue" value="Op.67" /></label>
+          <label><span>演出时间</span><input name="performanceDateText" value="1975" /></label>
+          <label><span>原始导入行</span><input name="sourceLine" value="Kleiber | Wiener Philharmoniker | 1975 | -" /></label>
+          <div class="actions"><button type="submit">提交任务</button></div>
+        </form>
+
+        <section class="stack">
+          <h2>Request Preview</h2>
+          <pre id="request-preview" class="code"></pre>
+          <h2>Status</h2>
+          <pre id="job-status" class="code"></pre>
+          <h2>Results</h2>
+          <pre id="job-results" class="code"></pre>
+        </section>
+      </section>
+    </main>
+
+    <script type="module" src="/assets/app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,14 @@
+.venv/
+build/
+dist/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.egg-info/
+logs/*.log
+cache/*
+downloads/*
+
+!cache/.gitkeep
+!downloads/.gitkeep
+!logs/.gitkeep
