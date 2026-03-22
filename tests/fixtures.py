@@ -12,7 +12,7 @@ def sample_request(item_count: int = 1) -> dict:
                 "workId": f"work-{index + 1}",
                 "composerId": f"composer-{index + 1}",
                 "workTypeHint": "orchestral",
-                "sourceLine": f"Conductor {index + 1} | Orchestra {index + 1} | 197{index} | -",
+                "sourceLine": f"Conductor {index + 1} | Orchestra {index + 1} | 197{index} | live",
                 "seed": {
                     "title": f"Recording {index + 1}",
                     "composerName": "贝多芬",
@@ -25,7 +25,10 @@ def sample_request(item_count: int = 1) -> dict:
                     "albumTitle": "",
                     "label": "",
                     "releaseDate": "",
-                    "credits": [],
+                    "credits": [
+                        {"role": "conductor", "displayName": f"Conductor {index + 1}", "label": f"Conductor {index + 1}"},
+                        {"role": "orchestra", "displayName": f"Orchestra {index + 1}", "label": f"Orchestra {index + 1}"},
+                    ],
                     "links": [],
                     "notes": "",
                 },

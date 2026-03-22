@@ -4,13 +4,22 @@ from pathlib import Path
 
 project_root = Path(SPECPATH).resolve().parent
 ui_root = project_root / "app" / "ui"
+materials_root = project_root / "materials"
+config_root = project_root / "config"
 
 a = Analysis(
     [str(project_root / "app" / "main.py")],
     pathex=[str(project_root)],
     binaries=[],
-    datas=[(str(ui_root), "app/ui")],
-    hiddenimports=[],
+    datas=[
+        (str(ui_root), "app/ui"),
+        (str(materials_root), "materials"),
+        (str(config_root), "config"),
+    ],
+    hiddenimports=[
+        "playwright",
+        "playwright.async_api",
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

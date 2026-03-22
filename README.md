@@ -27,7 +27,9 @@
   - `python -m app.main --mode ui`
 - 默认地址：`http://127.0.0.1:4780`
 - 协议版本：`v1`
-- 当前检索器：`StubRetriever`（占位检索器），用于联调合同、状态机和 UI
+- 当前检索器：规则检索管线 `RetrievalPipeline`
+- 默认来源：`materials/source-profiles/`
+- 可选 LLM 配置：`config/llm.local.json`
 
 ## 本地开发
 
@@ -68,6 +70,8 @@ tools/recording-retrieval-service/
   tests/
   scripts/
   packaging/
+  materials/
+  config/
   cache/
   logs/
   downloads/
@@ -77,9 +81,12 @@ tools/recording-retrieval-service/
 
 独立 UI 首版只提供：
 
-- 单条版本检索表单
+- 原始文本 + 关键字段提示的混合输入
+- 粗条目解析预览
 - 原始请求 JSON 预览
 - 任务状态轮询
+- 字段级 before / after（变更前后）对比
+- 证据、候选链接、warnings、logs 展示
 - 终态结果展示
 
 不提供：
@@ -95,7 +102,32 @@ tools/recording-retrieval-service/
 - 使用 `PyInstaller onedir`（单目录可执行包）生成 `recording-retrieval-service.exe`
 - 附带 `start-service.cmd` 与 `start-ui.cmd`
 - 每次输出新的发布目录到 `dist/releases/`
+- 同时刷新 `dist/portable/`，它始终指向当前最新的一份便携目录
 - 同时生成一个可直接交付的 `dist/recording-retrieval-service-portable-<timestamp>.zip`
+
+启动建议：
+
+- 在源码目录中，优先双击根目录的 `start-ui.cmd` 或 `start-service.cmd`
+- 在便携目录中，优先双击同目录下的 `start-ui.cmd` 或 `start-service.cmd`
+- 如果端口 `4780` 已被占用，脚本会保留错误信息并暂停，避免窗口瞬间关闭
+
+## 规则与配置
+
+- 高质量来源与流媒体来源规则位于 `materials/source-profiles/`
+- 规则采用纯文本格式：一行一个 URL 或 hostname，上到下为优先级
+- LLM 配置文件使用 `config/llm.local.json`，格式与父项目现有 OpenAI-compatible 配置一致：
+- 平台搜索 API 配置使用 `config/platform-search.local.json`，示例文件为 `config/platform-search.example.json`
+- 平台配置与人工介入步骤见 `docs/platform-api-setup-checklist.md`
+
+```json
+{
+  "enabled": true,
+  "baseUrl": "https://your-llm-endpoint/v1",
+  "apiKey": "your-secret",
+  "model": "your-model",
+  "timeoutMs": 30000
+}
+```
 
 ## owner 调用前提
 

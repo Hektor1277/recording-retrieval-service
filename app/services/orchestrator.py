@@ -18,7 +18,7 @@ from app.models.protocol import (
     ResultItemResponse,
     ResultsResponse,
 )
-from app.services.retrieval import StubRetriever
+from app.services.retrieval import StubRetriever, build_default_retriever
 from app.services.summary_logger import SummaryLogger
 
 TERMINAL_JOB_STATUSES = {"succeeded", "partial", "failed", "timed_out", "canceled"}
@@ -38,7 +38,7 @@ class JobOrchestrator:
         self._jobs: dict[str, JobRuntime] = {}
         self._lock = threading.Lock()
         self._logger = SummaryLogger(log_dir)
-        self._retriever = retriever or StubRetriever()
+        self._retriever = retriever or build_default_retriever()
 
     def create_job(self, request: CreateJobRequest) -> AcceptedJobResponse:
         job_id = f"job-{uuid4().hex}"
@@ -125,31 +125,37 @@ class JobOrchestrator:
                 future_map[future] = item.item_id
                 self._set_item_status(job_id, item.item_id, "running")
 
-            for future in as_completed(future_map):
-                item_id = future_map[future]
-                if runtime.cancel_event.is_set():
-                    break
-                try:
-                    result = future.result()
-                except Exception as error:  # pragma: no cover
-                    result = ResultItemResponse(
-                        itemId=item_id,
-                        status="failed",
-                        confidence=0.0,
-                        warnings=["retrieval failed"],
-                        result={},
-                        evidence=[],
-                        linkCandidates=[],
-                        imageCandidates=[],
-                        logs=[LogEntry(message=str(error), itemId=item_id, level="error")],
-                    )
-                if time.monotonic() > deadline:
-                    self._mark_timed_out(job_id)
-                    break
-                results.append(result)
-                self._set_item_status(job_id, item_id, result.status)
-                self._append_logs(job_id, result.logs)
-                self._update_progress(job_id)
+            try:
+                remaining = max(0.01, deadline - time.monotonic())
+                for future in as_completed(future_map, timeout=remaining):
+                    item_id = future_map[future]
+                    if runtime.cancel_event.is_set():
+                        break
+                    try:
+                        result = future.result()
+                    except Exception as error:  # pragma: no cover
+                        result = ResultItemResponse(
+                            itemId=item_id,
+                            status="failed",
+                            confidence=0.0,
+                            warnings=["retrieval failed"],
+                            result={},
+                            evidence=[],
+                            linkCandidates=[],
+                            imageCandidates=[],
+                            logs=[LogEntry(message=str(error), itemId=item_id, level="error")],
+                        )
+                    if time.monotonic() > deadline:
+                        runtime.cancel_event.set()
+                        self._mark_timed_out(job_id)
+                        break
+                    results.append(result)
+                    self._set_item_status(job_id, item_id, result.status)
+                    self._append_logs(job_id, result.logs)
+                    self._update_progress(job_id)
+            except TimeoutError:
+                runtime.cancel_event.set()
+                self._mark_timed_out(job_id)
 
         final_status = self._finalize_job(job_id, request, results)
         self._logger.log(job_id, event="completed", status=final_status)
@@ -165,7 +171,7 @@ class JobOrchestrator:
                 final_status = "failed"
             elif all(item.status == "succeeded" for item in results):
                 final_status = "succeeded"
-            elif any(item.status == "succeeded" for item in results) and request.options.return_partial_results:
+            elif request.options.return_partial_results and any(item.status in {"succeeded", "partial"} for item in results):
                 final_status = "partial"
             else:
                 final_status = "failed"

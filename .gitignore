@@ -1,14 +1,18 @@
 .venv/
 build/
 dist/
+output/
+.codex-handoff/
 __pycache__/
 .pytest_cache/
 *.pyc
 *.egg-info/
-logs/*.log
+logs/*
 cache/*
 downloads/*
+config/*.local.json
 
 !cache/.gitkeep
 !downloads/.gitkeep
 !logs/.gitkeep
+!config/.gitkeep

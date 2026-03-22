@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from threading import Event
 
 from app.models.protocol import (
@@ -13,6 +14,10 @@ from app.models.protocol import (
     ResultPayload,
     RetrievalItem,
 )
+from app.services.http_sources import HttpSourceProvider, materials_root
+from app.services.llm_client import DualModelLlmClient, is_llm_configured, load_llm_config
+from app.services.pipeline import RetrievalPipeline
+from app.services.source_profiles import SourceProfileLoader
 
 
 @dataclass
@@ -80,3 +85,10 @@ class StubRetriever:
             imageCandidates=[],
             logs=logs,
         )
+
+
+def build_default_retriever() -> RetrievalPipeline:
+    llm_config = load_llm_config()
+    llm_client = DualModelLlmClient(llm_config) if is_llm_configured(llm_config) else None
+    source_provider = HttpSourceProvider(profile_loader=SourceProfileLoader(materials_root()))
+    return RetrievalPipeline(source_provider=source_provider, llm_client=llm_client)

@@ -5,11 +5,12 @@ import time
 from fastapi.testclient import TestClient
 
 from app.main import create_app
+from app.services.retrieval import StubRetriever
 from tests.fixtures import sample_request
 
 
 def test_health_matches_owner_contract() -> None:
-    client = TestClient(create_app())
+    client = TestClient(create_app(retriever=StubRetriever()))
 
     response = client.get("/health")
 
@@ -23,7 +24,7 @@ def test_health_matches_owner_contract() -> None:
 
 
 def test_create_job_then_poll_and_fetch_results() -> None:
-    client = TestClient(create_app())
+    client = TestClient(create_app(retriever=StubRetriever()))
 
     accepted = client.post("/v1/jobs", json=sample_request(item_count=2))
     assert accepted.status_code == 202
@@ -54,7 +55,7 @@ def test_create_job_then_poll_and_fetch_results() -> None:
 
 
 def test_duplicate_item_id_is_rejected() -> None:
-    client = TestClient(create_app())
+    client = TestClient(create_app(retriever=StubRetriever()))
     payload = sample_request(item_count=2)
     payload["items"][1]["itemId"] = payload["items"][0]["itemId"]
 
@@ -65,7 +66,7 @@ def test_duplicate_item_id_is_rejected() -> None:
 
 
 def test_cancel_updates_job_status() -> None:
-    client = TestClient(create_app())
+    client = TestClient(create_app(retriever=StubRetriever(delay_seconds=0.2)))
 
     accepted = client.post("/v1/jobs", json=sample_request(item_count=1))
     job_id = accepted.json()["jobId"]
