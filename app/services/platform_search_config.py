@@ -29,6 +29,7 @@ class BilibiliSearchConfig:
     cookie: str = ""
     user_agent: str = ""
     referer: str = "https://www.bilibili.com"
+    storage_state_path: str = ""
 
 
 @dataclass(slots=True)
@@ -84,6 +85,10 @@ def load_platform_search_config(path: Path | None = None) -> PlatformSearchConfi
                 os.getenv("RECORDING_RETRIEVAL_BILIBILI_REFERER", ""),
                 bilibili_payload.get("referer"),
                 "https://www.bilibili.com",
+            ),
+            storage_state_path=_string_value(
+                os.getenv("RECORDING_RETRIEVAL_BILIBILI_STORAGE_STATE_PATH", ""),
+                bilibili_payload.get("storageStatePath"),
             ),
         ),
     )

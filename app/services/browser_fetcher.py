@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import atexit
 import asyncio
 import sys
+from contextlib import asynccontextmanager
+from contextlib import suppress
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 
 class BrowserFetchUnavailable(RuntimeError):
@@ -17,17 +22,39 @@ class BrowserPageSnapshot:
     body_text: str
     image_url: str
     uploader: str
+    bvid: str
     duration_seconds: int
     view_count: int
 
 
 class PlaywrightBrowserFetcher:
-    def __init__(self, max_concurrency: int = 2) -> None:
+    def __init__(
+        self,
+        max_concurrency: int = 2,
+        *,
+        bilibili_cookie: str = "",
+        bilibili_user_agent: str = "",
+        bilibili_referer: str = "https://www.bilibili.com",
+        bilibili_storage_state_path: str = "",
+    ) -> None:
         self._semaphore = asyncio.Semaphore(max_concurrency)
+        self._bilibili_cookie = bilibili_cookie.strip()
+        self._bilibili_user_agent = bilibili_user_agent.strip()
+        self._bilibili_referer = bilibili_referer.strip() or "https://www.bilibili.com"
+        self._bilibili_storage_state_path = bilibili_storage_state_path.strip()
+        self._playwright = None
+        self._playwright_manager = None
+        self._browser = None
+        self._shared_bilibili_context = None
+        self._browser_lock = asyncio.Lock()
+        self._context_lock = asyncio.Lock()
+        self._atexit_registered = False
+        atexit.register(self._aclose_sync)
+        self._atexit_registered = True
 
     async def fetch_page(self, url: str, timeout_seconds: float | None = None) -> dict[str, str]:
         async with self._semaphore:
-            return await asyncio.wait_for(self._fetch_page_inner(url), timeout=timeout_seconds or 8.0)
+            return await self._run_with_timeout(self._fetch_page_inner(url), timeout_seconds or 8.0)
 
     async def fetch_links(
         self,
@@ -37,27 +64,30 @@ class PlaywrightBrowserFetcher:
         timeout_seconds: float | None = None,
     ) -> list[str]:
         async with self._semaphore:
-            return await asyncio.wait_for(
+            return await self._run_with_timeout(
                 self._fetch_links_inner(url, url_patterns or []),
-                timeout=timeout_seconds or 8.0,
+                timeout_seconds or 8.0,
             )
+
+    async def _run_with_timeout(self, coroutine: Any, timeout_seconds: float):
+        task = asyncio.create_task(coroutine)
+        try:
+            return await asyncio.wait_for(asyncio.shield(task), timeout=timeout_seconds)
+        except asyncio.TimeoutError as error:
+            task.cancel()
+            task.add_done_callback(_silence_task_exception)
+            raise TimeoutError("browser fetch timed out") from error
 
     async def _fetch_page_inner(self, url: str) -> dict[str, str]:
         try:
             from playwright.async_api import Error as PlaywrightError
-            from playwright.async_api import async_playwright
         except ImportError as error:  # pragma: no cover - environment dependent
             raise BrowserFetchUnavailable("playwright is not installed") from error
 
         try:
-            async with async_playwright() as playwright:
-                launch_options: dict[str, Any] = {"headless": True}
-                if sys.platform == "win32":
-                    launch_options["channel"] = "msedge"
-                browser = await playwright.chromium.launch(**launch_options)
-                page = await browser.new_page()
-                await page.goto(url, wait_until="domcontentloaded", timeout=8000)
-                await page.wait_for_timeout(300)
+            async with self._open_page(url) as page:
+                await self._goto_with_retry(page, url, PlaywrightError)
+                await self._wait_for_page_snapshot(page, url)
 
                 snapshot = BrowserPageSnapshot(
                     **(
@@ -95,6 +125,7 @@ class PlaywrightBrowserFetcher:
                                     body_text: bodyParts.filter(Boolean).join(' ').slice(0, 4000).trim(),
                                     image_url: String(video.pic || imageFromMeta()).trim(),
                                     uploader: String(owner || '').trim(),
+                                    bvid: String(video.bvid || '').trim(),
                                     duration_seconds: Number(video.duration || 0) || 0,
                                     view_count: Number(video.stat?.view || 0) || 0,
                                   };
@@ -106,6 +137,7 @@ class PlaywrightBrowserFetcher:
                                   body_text: text.slice(0, 4000).trim(),
                                   image_url: imageFromMeta(),
                                   uploader: '',
+                                  bvid: '',
                                   duration_seconds: 0,
                                   view_count: 0,
                                 };
@@ -113,13 +145,13 @@ class PlaywrightBrowserFetcher:
                         )
                     ),
                 )
-                await browser.close()
                 return {
                     "title": snapshot.title,
                     "description": snapshot.description,
                     "bodyText": snapshot.body_text,
                     "imageUrl": snapshot.image_url,
                     "uploader": snapshot.uploader,
+                    "bvid": snapshot.bvid,
                     "durationSeconds": snapshot.duration_seconds,
                     "viewCount": snapshot.view_count,
                 }
@@ -129,19 +161,13 @@ class PlaywrightBrowserFetcher:
     async def _fetch_links_inner(self, url: str, url_patterns: list[str]) -> list[str]:
         try:
             from playwright.async_api import Error as PlaywrightError
-            from playwright.async_api import async_playwright
         except ImportError as error:  # pragma: no cover - environment dependent
             raise BrowserFetchUnavailable("playwright is not installed") from error
 
         try:
-            async with async_playwright() as playwright:
-                launch_options: dict[str, Any] = {"headless": True}
-                if sys.platform == "win32":
-                    launch_options["channel"] = "msedge"
-                browser = await playwright.chromium.launch(**launch_options)
-                page = await browser.new_page()
-                await page.goto(url, wait_until="domcontentloaded", timeout=8000)
-                await page.wait_for_timeout(800)
+            async with self._open_page(url) as page:
+                await self._goto_with_retry(page, url, PlaywrightError)
+                await self._wait_for_link_results(page, url)
 
                 links = await page.evaluate(
                     """(patterns) => {
@@ -162,7 +188,151 @@ class PlaywrightBrowserFetcher:
                     }""",
                     url_patterns,
                 )
-                await browser.close()
                 return [str(value).strip() for value in links or [] if str(value or "").strip()]
         except PlaywrightError as error:  # pragma: no cover - environment dependent
             raise BrowserFetchUnavailable(str(error)) from error
+
+    async def aclose(self) -> None:
+        async with self._context_lock:
+            await self._safe_close(self._shared_bilibili_context)
+            self._shared_bilibili_context = None
+        async with self._browser_lock:
+            await self._safe_close(self._browser)
+            self._browser = None
+            with suppress(Exception):
+                if self._playwright is not None:
+                    await self._playwright.stop()
+            self._playwright_manager = None
+            self._playwright = None
+        if self._atexit_registered:
+            with suppress(Exception):
+                atexit.unregister(self._aclose_sync)
+            self._atexit_registered = False
+
+    def _aclose_sync(self) -> None:
+        if self._browser is None and self._shared_bilibili_context is None and self._playwright_manager is None:
+            return
+        with suppress(BaseException):
+            asyncio.run(self.aclose())
+
+    async def _get_browser(self) -> Any:
+        if self._browser is not None:
+            return self._browser
+        async with self._browser_lock:
+            if self._browser is not None:
+                return self._browser
+            try:
+                from playwright.async_api import async_playwright
+            except ImportError as error:  # pragma: no cover - environment dependent
+                raise BrowserFetchUnavailable("playwright is not installed") from error
+            self._playwright_manager = async_playwright()
+            self._playwright = await self._playwright_manager.start()
+            launch_options: dict[str, Any] = {"headless": True}
+            if sys.platform == "win32":
+                launch_options["channel"] = "msedge"
+            self._browser = await self._playwright.chromium.launch(**launch_options)
+            return self._browser
+
+    async def _get_context(self, url: str) -> tuple[Any, bool]:
+        browser = await self._get_browser()
+        if self._should_reuse_shared_context(url):
+            async with self._context_lock:
+                if self._shared_bilibili_context is None:
+                    self._shared_bilibili_context = await browser.new_context(**self._context_options_for_url(url))
+                return self._shared_bilibili_context, True
+        return await browser.new_context(**self._context_options_for_url(url)), False
+
+    @asynccontextmanager
+    async def _open_page(self, url: str):
+        context, shared_context = await self._get_context(url)
+        page = None
+        try:
+            page = await context.new_page()
+            yield page
+        finally:
+            await self._safe_close(page)
+            if not shared_context:
+                await self._safe_close(context)
+
+    def _context_options_for_url(self, url: str) -> dict[str, Any]:
+        host = urlparse(url).netloc.lower()
+        options: dict[str, Any] = {
+            "viewport": {"width": 1440, "height": 960},
+        }
+        if "bilibili.com" not in host and "b23.tv" not in host:
+            return options
+
+        headers = {
+            "Referer": self._bilibili_referer,
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        }
+        if self._bilibili_cookie:
+            headers["Cookie"] = self._bilibili_cookie
+        options["extra_http_headers"] = headers
+        options["locale"] = "zh-CN"
+        if self._bilibili_user_agent:
+            options["user_agent"] = self._bilibili_user_agent
+        if self._bilibili_storage_state_path:
+            storage_state = Path(self._bilibili_storage_state_path)
+            if storage_state.is_file():
+                options["storage_state"] = str(storage_state)
+        return options
+
+    def _should_reuse_shared_context(self, url: str) -> bool:
+        host = urlparse(url).netloc.lower()
+        return "bilibili.com" in host or "b23.tv" in host
+
+    async def _wait_for_page_snapshot(self, page: Any, url: str) -> None:
+        host = urlparse(url).netloc.lower()
+        if "bilibili.com" in host:
+            with suppress(Exception):
+                await page.wait_for_function(
+                    "() => Boolean(window.__INITIAL_STATE__ && window.__INITIAL_STATE__.videoData)",
+                    timeout=4000,
+                )
+            await page.wait_for_timeout(800)
+            return
+        await page.wait_for_timeout(300)
+
+    async def _wait_for_link_results(self, page: Any, url: str) -> None:
+        host = urlparse(url).netloc.lower()
+        if "search.bilibili.com" in host:
+            with suppress(Exception):
+                await page.wait_for_function(
+                    """() => Array.from(document.querySelectorAll('a[href]')).some((node) => {
+                        const href = node?.href || '';
+                        return /\\/video\\/(?:BV[0-9A-Za-z]+|av\\d+)/i.test(href);
+                    })""",
+                    timeout=4500,
+                )
+            await page.wait_for_timeout(700)
+            return
+        await page.wait_for_timeout(800)
+
+    async def _goto_with_retry(self, page: Any, url: str, playwright_error: type[Exception]) -> None:
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=12000)
+            return
+        except playwright_error as error:
+            if not should_retry_navigation_error(str(error), url):
+                raise
+        await page.wait_for_timeout(450)
+        await page.goto(url, wait_until="domcontentloaded", timeout=12000)
+
+    async def _safe_close(self, handle: Any) -> None:
+        with suppress(Exception):
+            if handle is not None:
+                await handle.close()
+
+
+def _silence_task_exception(task: asyncio.Task) -> None:
+    with suppress(BaseException):
+        task.exception()
+
+
+def should_retry_navigation_error(message: str, url: str) -> bool:
+    host = urlparse(url).netloc.lower()
+    if "bilibili.com" not in host and "b23.tv" not in host:
+        return False
+    lowered = (message or "").lower()
+    return "err_aborted" in lowered or "frame was detached" in lowered

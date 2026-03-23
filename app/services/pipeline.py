@@ -142,6 +142,8 @@ class SourceProvider(Protocol):
         profile: RetrievalProfile,
     ) -> list[dict[str, Any]]: ...
 
+    async def aclose(self) -> None: ...
+
 
 class LlmClient(Protocol):
     async def synthesize(
@@ -598,6 +600,11 @@ class RetrievalPipeline:
     def get_access_summary(self) -> dict[str, Any]:
         return dict(getattr(self._source_provider, "get_access_summary", lambda: {})())
 
+    async def aclose(self) -> None:
+        close_source_provider = getattr(self._source_provider, "aclose", None)
+        if callable(close_source_provider):
+            await close_source_provider()
+
     async def retrieve(
         self,
         item: RetrievalItem,
@@ -605,6 +612,9 @@ class RetrievalPipeline:
         cancel_event: Any | None = None,
         deadline: float | None = None,
     ) -> ResultItemResponse:
+        start_request_scope = getattr(self._source_provider, "start_request_scope", None)
+        if callable(start_request_scope):
+            start_request_scope()
         draft = self._normalizer.normalize(item)
         profile = self._profile_resolver.resolve(item)
         logs = [LogEntry(message="draft entry initialized", itemId=item.item_id)]
@@ -849,14 +859,41 @@ class RetrievalPipeline:
         ambiguous_upload_cluster = has_ambiguous_upload_cluster(draft, link_candidates)
         if result.links:
             top_link_confidence = max((candidate.confidence or 0) for candidate in result.links)
-            floor_delta = 0.18 if ambiguous_upload_cluster else 0.08
+            if ambiguous_upload_cluster and not has_explicit_year(draft.performance_date_text):
+                floor_delta = 0.26
+            else:
+                floor_delta = 0.18 if ambiguous_upload_cluster else 0.08
             floor = max(FINAL_LINK_CONFIDENCE_THRESHOLD, top_link_confidence - floor_delta)
             filtered_links = [
                 candidate
                 for candidate in link_candidates
                 if (candidate.confidence or 0) >= floor or compact(candidate.url) in accepted_url_set
             ]
-            filtered_links = sort_link_candidates(draft, filtered_links, record_map)
+            filtered_links = sort_link_candidates(
+                draft,
+                filtered_links,
+                record_map,
+                prefer_exactness=ambiguous_upload_cluster,
+            )
+            reference_year = extract_reference_year(draft)
+            if reference_year:
+                year_matched_links = [
+                    candidate
+                    for candidate in filtered_links
+                    if not extract_conflicting_year(compact(candidate.title).lower(), reference_year)
+                    or compact(candidate.url) in accepted_url_set
+                ]
+                if year_matched_links:
+                    filtered_links = year_matched_links
+            if ambiguous_upload_cluster and len(filtered_links) >= 3:
+                best_exactness = max(candidate_title_quality_score(draft, compact(candidate.title)) for candidate in filtered_links)
+                exactness_floor = max(0.05, best_exactness - 0.05)
+                filtered_links = [
+                    candidate
+                    for candidate in filtered_links
+                    if candidate_title_quality_score(draft, compact(candidate.title)) >= exactness_floor
+                    or compact(candidate.url) in accepted_url_set
+                ]
             result.links = filtered_links[
                 : determine_final_link_limit(
                     draft,
@@ -1050,10 +1087,16 @@ def sort_link_candidates(
     draft: DraftRecordingEntry,
     candidates: list[LinkCandidate],
     record_map: dict[str, SourceRecord],
+    *,
+    prefer_exactness: bool = False,
 ) -> list[LinkCandidate]:
     return sorted(
         candidates,
-        key=lambda candidate: link_candidate_sort_key(draft, candidate, record_map.get(compact(candidate.url))),
+        key=lambda candidate: (
+            ambiguous_link_candidate_sort_key(draft, candidate, record_map.get(compact(candidate.url)))
+            if prefer_exactness
+            else link_candidate_sort_key(draft, candidate, record_map.get(compact(candidate.url)))
+        ),
         reverse=True,
     )
 
@@ -1094,6 +1137,38 @@ def link_candidate_sort_key(
     )
 
 
+def ambiguous_link_candidate_sort_key(
+    draft: DraftRecordingEntry,
+    candidate: LinkCandidate,
+    record: SourceRecord | None,
+) -> tuple[float, float, float, int]:
+    title = compact(candidate.title)
+    exactness = candidate_title_quality_score(draft, title)
+    metadata_support = 0.0
+    if record is not None:
+        if record.duration_seconds > 0:
+            metadata_support += 0.06
+        else:
+            metadata_support -= 0.08
+        if compact(record.uploader):
+            metadata_support += 0.04
+        else:
+            metadata_support -= 0.05
+        if record.view_count >= 8000:
+            metadata_support += 0.06
+        elif record.view_count >= 2000:
+            metadata_support += 0.04
+        elif record.view_count >= 500:
+            metadata_support += 0.02
+    confidence = min(candidate.confidence or 0.0, 0.88)
+    return (
+        round(exactness + metadata_support, 4),
+        round(confidence, 4),
+        round((candidate.confidence or 0.0) + exactness, 4),
+        record.view_count if record is not None else 0,
+    )
+
+
 def candidate_title_quality_score(draft: DraftRecordingEntry, title: str) -> float:
     lowered = compact(title).lower()
     if not lowered:
@@ -1101,17 +1176,41 @@ def candidate_title_quality_score(draft: DraftRecordingEntry, title: str) -> flo
     score = 0.0
     year = extract_reference_year(draft)
     if year and year in lowered:
-        score += 0.03
+        score += 0.05
+    elif year and extract_conflicting_year(lowered, year):
+        score -= 0.05
     work_aliases = build_candidate_work_anchor_terms(draft)
     if any(alias in lowered for alias in work_aliases):
         score += 0.03
+    if title_matches_catalogue(draft, lowered):
+        score += 0.05
+    elif should_require_catalogue_hint(draft, lowered):
+        score -= 0.02
     if candidate_mentions_primary_and_secondary(draft, lowered):
         score += 0.04
     elif candidate_mentions_any_lead(draft, lowered):
         score += 0.01
     if any(marker in lowered for marker in ("new edition", "restored", "remaster", "reissue", "alt take")):
         score -= 0.08
+    if any(marker in lowered for marker in ("blu-ray", "bluray", "bd版", "蓝光", "「bd」", "[bd]", "(bd)")):
+        score -= 0.06
     return score
+
+
+def title_matches_catalogue(draft: DraftRecordingEntry, lowered_title: str) -> bool:
+    catalogue = compact(draft.catalogue).lower()
+    if not catalogue:
+        return False
+    normalized_catalogue = re.sub(r"\s+", "", catalogue)
+    normalized_title = re.sub(r"\s+", "", lowered_title)
+    return catalogue in lowered_title or normalized_catalogue in normalized_title
+
+
+def should_require_catalogue_hint(draft: DraftRecordingEntry, lowered_title: str) -> bool:
+    if not compact(draft.catalogue):
+        return False
+    work_markers = ("concerto", "symphony", "sonata", "quartet", "trio", "op.")
+    return any(marker in lowered_title for marker in work_markers)
 
 
 def build_candidate_work_anchor_terms(draft: DraftRecordingEntry) -> set[str]:
@@ -1170,6 +1269,11 @@ def extract_reference_year(draft: DraftRecordingEntry) -> str:
     return ""
 
 
+def extract_conflicting_year(lowered_title: str, reference_year: str) -> bool:
+    years = set(re.findall(r"(?:17|18|19|20)\d{2}", lowered_title))
+    return bool(years and reference_year not in years)
+
+
 def has_ambiguous_upload_cluster(draft: DraftRecordingEntry, candidates: list[LinkCandidate]) -> bool:
     if len(candidates) < 3:
         return False
@@ -1185,7 +1289,10 @@ def has_ambiguous_upload_cluster(draft: DraftRecordingEntry, candidates: list[Li
     ]
     if len(near_top) < 3:
         return False
-    reference_hits = sum(1 for candidate in near_top if candidate_title_quality_score(draft, compact(candidate.title)) >= 0.05)
+    exactness_scores = [candidate_title_quality_score(draft, compact(candidate.title)) for candidate in near_top]
+    reference_hits = sum(1 for score in exactness_scores if score >= 0.05)
+    if len(near_top) >= 3 and reference_hits >= 2 and (max(exactness_scores, default=0.0) - min(exactness_scores, default=0.0)) >= 0.05:
+        return True
     if len(near_top) >= 4 and reference_hits >= 2:
         return True
     return reference_hits >= 3
@@ -1212,6 +1319,8 @@ def determine_final_link_limit(
     ]
     if not has_explicit_year(draft.performance_date_text) and len(close_ties) > 1:
         return min(4, max(2, len(close_ties)))
+    if len(close_ties) >= 3:
+        return min(4, len(close_ties))
     return 2
 
 

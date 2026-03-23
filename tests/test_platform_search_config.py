@@ -29,6 +29,7 @@ def test_load_platform_search_config_reads_platform_credentials(tmp_path: Path) 
                     "cookie": "SESSDATA=abc; buvid3=def",
                     "userAgent": "TestAgent/1.0",
                     "referer": "https://www.bilibili.com",
+                    "storageStatePath": "config/bilibili-state.json",
                 },
             }
         ),
@@ -46,6 +47,7 @@ def test_load_platform_search_config_reads_platform_credentials(tmp_path: Path) 
     assert config.apple_music.use_itunes_fallback is True
     assert config.bilibili.cookie == "SESSDATA=abc; buvid3=def"
     assert config.bilibili.user_agent == "TestAgent/1.0"
+    assert config.bilibili.storage_state_path == "config/bilibili-state.json"
 
 
 def test_load_platform_search_config_allows_environment_overrides(tmp_path: Path, monkeypatch) -> None:

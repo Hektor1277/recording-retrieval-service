@@ -325,32 +325,37 @@ async def main(
     retriever = build_default_retriever()
     results: list[dict] = []
     scenario_access: dict[str, list[dict]] = {}
-    for scenario in sample_scenarios():
-        if only and scenario.scenario_id not in only:
-            continue
-        recording = recordings[scenario.recording_id]
-        work = works[recording["workId"]]
-        composer = composers[work["composerId"]]
-        results.append(await run_scenario(retriever, recording, work, composer, scenario))
-        scenario_access[scenario.scenario_id] = list(getattr(retriever, "consume_access_events", lambda: [])())
+    try:
+        for scenario in sample_scenarios():
+            if only and scenario.scenario_id not in only:
+                continue
+            recording = recordings[scenario.recording_id]
+            work = works[recording["workId"]]
+            composer = composers[work["composerId"]]
+            results.append(await run_scenario(retriever, recording, work, composer, scenario))
+            scenario_access[scenario.scenario_id] = list(getattr(retriever, "consume_access_events", lambda: [])())
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
-    resolved_access_report = access_report_path or output_path.with_name(f"{output_path.stem}_access_report.json")
-    resolved_access_report.parent.mkdir(parents=True, exist_ok=True)
-    access_payload = build_access_report_payload(
-        scenario_access=scenario_access,
-        host_summary=dict(getattr(retriever, "get_access_summary", lambda: {})().get("hosts", {})),
-    )
-    resolved_access_report.write_text(json.dumps(access_payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    summary = {
-        "total": len(results),
-        "finalHit": sum(1 for item in results if item["finalHit"]),
-        "candidateHit": sum(1 for item in results if item["candidateHit"]),
-    }
-    print(json.dumps(summary, ensure_ascii=False, indent=2))
-    print(str(output_path))
-    print(str(resolved_access_report))
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
+        resolved_access_report = access_report_path or output_path.with_name(f"{output_path.stem}_access_report.json")
+        resolved_access_report.parent.mkdir(parents=True, exist_ok=True)
+        access_payload = build_access_report_payload(
+            scenario_access=scenario_access,
+            host_summary=dict(getattr(retriever, "get_access_summary", lambda: {})().get("hosts", {})),
+        )
+        resolved_access_report.write_text(json.dumps(access_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        summary = {
+            "total": len(results),
+            "finalHit": sum(1 for item in results if item["finalHit"]),
+            "candidateHit": sum(1 for item in results if item["candidateHit"]),
+        }
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+        print(str(output_path))
+        print(str(resolved_access_report))
+    finally:
+        close_retriever = getattr(retriever, "aclose", None)
+        if callable(close_retriever):
+            await close_retriever()
 
 
 if __name__ == "__main__":

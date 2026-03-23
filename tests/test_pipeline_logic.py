@@ -4,6 +4,7 @@ import asyncio
 import time
 
 from app.models.protocol import CreateJobRequest
+from app.services.http_sources import HttpSourceProvider
 from app.services.pipeline import InputNormalizer, ProfileResolver, RetrievalPipeline, build_latin_work_alias, build_queries
 from tests.fixtures import sample_request
 
@@ -131,6 +132,14 @@ class SlowSourceProvider:
     async def search_fallback(self, draft, profile):
         await asyncio.sleep(0.4)
         return []
+
+
+class ClosableSourceProvider(FakeSourceProvider):
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def aclose(self) -> None:
+        self.closed = True
 
 
 def test_pipeline_writes_high_confidence_fields_to_result_and_keeps_candidates() -> None:
@@ -797,3 +806,256 @@ def test_pipeline_skips_llm_synthesis_for_unambiguous_top_candidate() -> None:
     assert result.result.links
     assert result.result.links[0].url == "https://stream.example/exact"
     assert llm.calls == 0
+
+
+def test_pipeline_isolates_access_events_between_concurrent_retrievals() -> None:
+    class IsolatedAccessProvider(HttpSourceProvider):
+        async def inspect_existing_links(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_high_quality(self, draft, profile):
+            del profile
+            self._record_access_event(
+                url=f"https://catalog.example/{draft.item_id}",
+                operation="test-search",
+                ok=True,
+                duration_ms=1.0,
+                source_kind="high-quality",
+                source_label=draft.item_id,
+                query=draft.item_id,
+            )
+            return []
+
+        async def search_streaming(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_fallback(self, draft, profile):
+            del draft, profile
+            return []
+
+    async def run_test() -> tuple[list[dict], list[dict]]:
+        payload = sample_request(item_count=2)
+        payload["items"][0]["itemId"] = "item-a"
+        payload["items"][0]["seed"]["title"] = "Title A"
+        payload["items"][1]["itemId"] = "item-b"
+        payload["items"][1]["seed"]["title"] = "Title B"
+        request = CreateJobRequest.model_validate(payload)
+        pipeline = RetrievalPipeline(source_provider=IsolatedAccessProvider(), llm_client=None)
+        ready = asyncio.Event()
+        completed = 0
+
+        async def run_item(item):
+            nonlocal completed
+            await pipeline.retrieve(item)
+            completed += 1
+            if completed == 2:
+                ready.set()
+            await ready.wait()
+            return pipeline.consume_access_events()
+
+        return await asyncio.gather(*(run_item(item) for item in request.items))
+
+    first_events, second_events = asyncio.run(run_test())
+
+    assert [event["query"] for event in first_events] == ["item-a"]
+    assert [event["query"] for event in second_events] == ["item-b"]
+
+
+def test_pipeline_prefers_canonical_exact_upload_for_sparse_heifetz_query() -> None:
+    class SparseHeifetzProvider:
+        async def inspect_existing_links(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_high_quality(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_streaming(self, draft, profile):
+            del draft, profile
+            return [
+                {
+                    "url": "https://www.youtube.com/watch?v=XazjX-k2aco",
+                    "source_label": "YouTube Search",
+                    "source_kind": "streaming",
+                    "title": "Beethoven Violin Concerto - Heifetz",
+                    "description": "Historic upload",
+                    "platform": "youtube",
+                    "weight": 0.68,
+                    "same_recording_score": 0.97,
+                    "duration_seconds": 0,
+                    "uploader": "",
+                    "view_count": 180,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://www.youtube.com/watch?v=IFBQqw_-W5A",
+                    "source_label": "YouTube Search",
+                    "source_kind": "streaming",
+                    "title": "L. V. Beethoven, Violin Concerto, Op. 61 - J. Heifetz - NBC Symphony Orch. (1940)",
+                    "description": "Complete concerto upload",
+                    "platform": "youtube",
+                    "weight": 0.68,
+                    "same_recording_score": 0.9,
+                    "duration_seconds": 2610,
+                    "uploader": "Historic Vault",
+                    "view_count": 14500,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://www.youtube.com/watch?v=9YWr1UcbZE8",
+                    "source_label": "YouTube Search",
+                    "source_kind": "streaming",
+                    "title": "Beethoven: Violin Concerto, Op.61 - Heifetz / Toscanini",
+                    "description": "Canonical upload title",
+                    "platform": "youtube",
+                    "weight": 0.68,
+                    "same_recording_score": 0.81,
+                    "duration_seconds": 2664,
+                    "uploader": "Classical Archive",
+                    "view_count": 32200,
+                    "fields": {},
+                    "images": [],
+                },
+            ]
+
+        async def search_fallback(self, draft, profile):
+            del draft, profile
+            return []
+
+    payload = sample_request()
+    payload["items"][0]["workTypeHint"] = "concerto"
+    payload["items"][0]["sourceLine"] = "Ludwig van Beethoven | Violin Concerto in D major, Op. 61 | Jascha Heifetz | - | -"
+    payload["items"][0]["seed"]["title"] = "Heifetz"
+    payload["items"][0]["seed"]["composerNameLatin"] = "Ludwig van Beethoven"
+    payload["items"][0]["seed"]["workTitleLatin"] = "Violin Concerto in D major, Op. 61"
+    payload["items"][0]["seed"]["catalogue"] = "Op.61"
+    payload["items"][0]["seed"]["performanceDateText"] = ""
+    payload["items"][0]["seed"]["credits"] = [
+        {"role": "soloist", "displayName": "Jascha Heifetz", "label": "Jascha Heifetz"},
+    ]
+    request = CreateJobRequest.model_validate(payload)
+    pipeline = RetrievalPipeline(source_provider=SparseHeifetzProvider(), llm_client=None)
+
+    result = asyncio.run(pipeline.retrieve(request.items[0]))
+
+    final_urls = [link.url for link in result.result.links]
+    assert final_urls[0] == "https://www.youtube.com/watch?v=9YWr1UcbZE8"
+    assert "https://www.youtube.com/watch?v=9YWr1UcbZE8" in final_urls
+    assert "https://www.youtube.com/watch?v=XazjX-k2aco" not in final_urls
+
+
+def test_pipeline_aclose_closes_source_provider() -> None:
+    provider = ClosableSourceProvider()
+    pipeline = RetrievalPipeline(source_provider=provider, llm_client=None)
+
+    asyncio.run(pipeline.aclose())
+
+    assert provider.closed is True
+
+
+def test_pipeline_keeps_exact_karajan_upload_among_close_year_matched_ties() -> None:
+    class KarajanProvider:
+        async def inspect_existing_links(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_high_quality(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_streaming(self, draft, profile):
+            del draft, profile
+            return [
+                {
+                    "url": "https://www.youtube.com/watch?v=iPQWH7rKlaM",
+                    "source_label": "YouTube Search",
+                    "source_kind": "streaming",
+                    "title": "Richard Strauss - Eine Alpensinfonie / Karajan - Berliner Philharmoniker / Live Recording 1982",
+                    "platform": "youtube",
+                    "weight": 0.68,
+                    "same_recording_score": 0.97,
+                    "duration_seconds": 3060,
+                    "uploader": "Vault",
+                    "view_count": 21000,
+                    "fields": {},
+                    "images": [],
+                    "description": "",
+                },
+                {
+                    "url": "https://www.bilibili.com/video/BV1WV4y1h799/",
+                    "source_label": "Bilibili Search",
+                    "source_kind": "streaming",
+                    "title": "卡拉扬《理查·施特劳斯：阿尔卑斯山交响曲》柏林爱乐「BD」_哔哩哔哩_bilibili",
+                    "platform": "bilibili",
+                    "weight": 0.68,
+                    "same_recording_score": 0.97,
+                    "duration_seconds": 3050,
+                    "uploader": "Uploader",
+                    "view_count": 15000,
+                    "fields": {},
+                    "images": [],
+                    "description": "",
+                },
+                {
+                    "url": "https://www.youtube.com/watch?v=fDi1PSz8mRE",
+                    "source_label": "YouTube Search",
+                    "source_kind": "streaming",
+                    "title": "STRAUSS: ALPINE SYMPHONY / BERLIN  PO / KARAJAN  (1982 live)",
+                    "platform": "youtube",
+                    "weight": 0.68,
+                    "same_recording_score": 0.97,
+                    "duration_seconds": 3058,
+                    "uploader": "Archive",
+                    "view_count": 18800,
+                    "fields": {},
+                    "images": [],
+                    "description": "",
+                },
+                {
+                    "url": "https://www.youtube.com/watch?v=oPpGxrUHLO4",
+                    "source_label": "YouTube Search",
+                    "source_kind": "streaming",
+                    "title": "Richard Strauss – Eine Alpensinfonie – Herbert von Karajan, Berliner Philharmoniker, 1981",
+                    "platform": "youtube",
+                    "weight": 0.68,
+                    "same_recording_score": 0.97,
+                    "duration_seconds": 3042,
+                    "uploader": "Archive",
+                    "view_count": 17000,
+                    "fields": {},
+                    "images": [],
+                    "description": "",
+                },
+            ]
+
+        async def search_fallback(self, draft, profile):
+            del draft, profile
+            return []
+
+    payload = sample_request()
+    payload["items"][0]["workTypeHint"] = "orchestral"
+    payload["items"][0]["sourceLine"] = "Richard Strauss | Eine Alpensinfonie, Op.64 | Herbert von Karajan | Berlin Philharmonic Orchestra | August 28, 1982 Salzburg"
+    payload["items"][0]["seed"]["title"] = "Karajan Alpine 1982"
+    payload["items"][0]["seed"]["composerName"] = "理查·施特劳斯"
+    payload["items"][0]["seed"]["composerNameLatin"] = "Richard Strauss"
+    payload["items"][0]["seed"]["workTitle"] = "阿尔卑斯山交响曲"
+    payload["items"][0]["seed"]["workTitleLatin"] = "Eine Alpensinfonie, Op.64"
+    payload["items"][0]["seed"]["catalogue"] = "Op.64"
+    payload["items"][0]["seed"]["performanceDateText"] = "August 28, 1982 Salzburg"
+    payload["items"][0]["seed"]["credits"] = [
+        {"role": "conductor", "displayName": "Herbert von Karajan", "label": "Herbert von Karajan"},
+        {"role": "orchestra", "displayName": "Berlin Philharmonic Orchestra", "label": "Berlin Philharmonic Orchestra"},
+    ]
+    request = CreateJobRequest.model_validate(payload)
+    pipeline = RetrievalPipeline(source_provider=KarajanProvider(), llm_client=None)
+
+    result = asyncio.run(pipeline.retrieve(request.items[0]))
+
+    final_urls = [link.url for link in result.result.links]
+    assert "https://www.youtube.com/watch?v=fDi1PSz8mRE" in final_urls
+    assert "https://www.youtube.com/watch?v=oPpGxrUHLO4" not in final_urls

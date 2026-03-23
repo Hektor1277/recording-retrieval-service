@@ -8,6 +8,7 @@ import json
 import re
 import threading
 import time
+from contextlib import suppress
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import quote_plus, urljoin, urlparse
@@ -78,16 +79,45 @@ class HttpSourceProvider:
     ) -> None:
         self._profile_loader = profile_loader or SourceProfileLoader(materials_root())
         self._client = client
-        self._browser_fetcher = browser_fetcher or PlaywrightBrowserFetcher()
         self._orchestra_alias_loader = orchestra_alias_loader or OrchestraAliasLoader(default_orchestra_alias_path())
         self._person_alias_loader = person_alias_loader or PersonAliasLoader(default_person_alias_path())
         self._platform_search_config = platform_search_config or load_platform_search_config()
+        self._browser_fetcher = browser_fetcher or PlaywrightBrowserFetcher(
+            bilibili_cookie=self._platform_search_config.bilibili.cookie,
+            bilibili_user_agent=self._platform_search_config.bilibili.user_agent,
+            bilibili_referer=self._platform_search_config.bilibili.referer,
+            bilibili_storage_state_path=self._platform_search_config.bilibili.storage_state_path,
+        )
         self._disabled_platform_apis: set[str] = set()
         self._text_cache: dict[str, str] = {}
         self._thread_local = threading.local()
         self._warning_state: contextvars.ContextVar[list[str] | None] = contextvars.ContextVar("http_source_warnings", default=None)
+        self._request_access_state: contextvars.ContextVar[list[dict[str, Any]] | None] = contextvars.ContextVar(
+            "http_source_access_events",
+            default=None,
+        )
         self._access_events: list[dict[str, Any]] = []
         self._host_stats: dict[str, dict[str, float]] = {}
+        self._state_lock = threading.RLock()
+
+    async def aclose(self) -> None:
+        browser_fetcher = getattr(self._browser_fetcher, "aclose", None)
+        if callable(browser_fetcher):
+            await browser_fetcher()
+        client = self._client
+        if client is not None:
+            with suppress(Exception):
+                await client.aclose()
+        thread_client = getattr(self._thread_local, "client", None)
+        if thread_client is not None and thread_client is not client:
+            with suppress(Exception):
+                await thread_client.aclose()
+        self._thread_local.client = None
+        self._thread_local.client_loop = None
+
+    def start_request_scope(self) -> None:
+        self._warning_state.set([])
+        self._request_access_state.set([])
 
     def consume_warnings(self) -> list[str]:
         warnings = self._warning_state.get() or []
@@ -95,13 +125,22 @@ class HttpSourceProvider:
         return dedupe_text(warnings)
 
     def consume_access_events(self) -> list[dict[str, Any]]:
-        events = list(self._access_events)
-        self._access_events.clear()
+        request_events = self._request_access_state.get()
+        if request_events is not None:
+            events = list(request_events)
+            self._request_access_state.set([])
+            return events
+        with self._state_lock:
+            events = list(self._access_events)
+            self._access_events.clear()
         return events
 
     def get_access_summary(self) -> dict[str, Any]:
         hosts: dict[str, Any] = {}
-        for host, stats in self._host_stats.items():
+        with self._state_lock:
+            host_items = list(self._host_stats.items())
+            fallback_event_count = len(self._access_events)
+        for host, stats in host_items:
             requests = int(stats.get("requests", 0))
             successes = int(stats.get("successes", 0))
             failures = int(stats.get("failures", 0))
@@ -124,7 +163,8 @@ class HttpSourceProvider:
                 "recommendedResultDepth": self._recommended_result_depth(host, STREAMING_RESULT_DEPTH),
                 "status": self._host_health_status(host),
             }
-        return {"hosts": hosts, "eventCount": len(self._access_events)}
+        request_event_count = len(self._request_access_state.get() or [])
+        return {"hosts": hosts, "eventCount": request_event_count or fallback_event_count}
 
     def _reset_warnings(self) -> None:
         self._warning_state.set([])
@@ -166,28 +206,35 @@ class HttpSourceProvider:
             "resultCount": result_count,
             "timeoutSeconds": timeout_seconds,
         }
-        self._access_events.append(event)
+        request_events = self._request_access_state.get()
+        if request_events is not None:
+            request_events.append(event)
+        else:
+            with self._state_lock:
+                self._access_events.append(event)
 
-        stats = self._host_stats.setdefault(
-            host,
-            {
-                "requests": 0.0,
-                "successes": 0.0,
-                "failures": 0.0,
-                "totalLatencyMs": 0.0,
-                "totalResults": 0.0,
-                "cacheHits": 0.0,
-            },
-        )
-        stats["requests"] += 1
-        stats["successes"] += 1 if ok else 0
-        stats["failures"] += 0 if ok else 1
-        stats["totalLatencyMs"] += max(0.0, duration_ms)
-        stats["totalResults"] += max(0, result_count)
-        stats["cacheHits"] += 1 if cache_hit else 0
+        with self._state_lock:
+            stats = self._host_stats.setdefault(
+                host,
+                {
+                    "requests": 0.0,
+                    "successes": 0.0,
+                    "failures": 0.0,
+                    "totalLatencyMs": 0.0,
+                    "totalResults": 0.0,
+                    "cacheHits": 0.0,
+                },
+            )
+            stats["requests"] += 1
+            stats["successes"] += 1 if ok else 0
+            stats["failures"] += 0 if ok else 1
+            stats["totalLatencyMs"] += max(0.0, duration_ms)
+            stats["totalResults"] += max(0, result_count)
+            stats["cacheHits"] += 1 if cache_hit else 0
 
     def _host_health_status(self, host: str) -> str:
-        stats = self._host_stats.get(host, {})
+        with self._state_lock:
+            stats = dict(self._host_stats.get(host, {}))
         requests = float(stats.get("requests", 0.0))
         failures = float(stats.get("failures", 0.0))
         avg_latency = float(stats.get("totalLatencyMs", 0.0)) / requests if requests else 0.0
@@ -198,7 +245,8 @@ class HttpSourceProvider:
         return "observing"
 
     def _recommended_timeout_seconds(self, host: str, base_timeout: float) -> float:
-        stats = self._host_stats.get(host, {})
+        with self._state_lock:
+            stats = dict(self._host_stats.get(host, {}))
         requests = float(stats.get("requests", 0.0))
         failures = float(stats.get("failures", 0.0))
         avg_latency = float(stats.get("totalLatencyMs", 0.0)) / requests if requests else 0.0
@@ -212,7 +260,8 @@ class HttpSourceProvider:
         return round(max(4.0, min(14.0, timeout)), 1)
 
     def _recommended_query_depth(self, host: str, base_depth: int) -> int:
-        stats = self._host_stats.get(host, {})
+        with self._state_lock:
+            stats = dict(self._host_stats.get(host, {}))
         requests = float(stats.get("requests", 0.0))
         failures = float(stats.get("failures", 0.0))
         avg_results = float(stats.get("totalResults", 0.0)) / requests if requests else 0.0
@@ -226,7 +275,8 @@ class HttpSourceProvider:
         return max(2, min(10, depth))
 
     def _recommended_result_depth(self, host: str, base_depth: int) -> int:
-        stats = self._host_stats.get(host, {})
+        with self._state_lock:
+            stats = dict(self._host_stats.get(host, {}))
         requests = float(stats.get("requests", 0.0))
         avg_results = float(stats.get("totalResults", 0.0)) / requests if requests else 0.0
         if requests >= 2 and avg_results >= 4.0:
@@ -236,7 +286,8 @@ class HttpSourceProvider:
         return base_depth
 
     def _should_skip_host(self, host: str, *, min_requests: int = 3) -> bool:
-        stats = self._host_stats.get(host, {})
+        with self._state_lock:
+            stats = dict(self._host_stats.get(host, {}))
         requests = int(stats.get("requests", 0.0))
         successes = int(stats.get("successes", 0.0))
         failures = int(stats.get("failures", 0.0))
@@ -262,13 +313,29 @@ class HttpSourceProvider:
     def _platform_clients(self) -> PlatformSearchClients:
         return PlatformSearchClients(self._platform_search_config, self._get_http_client())
 
+    def _request_headers_for_url(self, url: str) -> dict[str, str] | None:
+        host = urlparse(url).netloc.lower()
+        if "bilibili.com" not in host and "b23.tv" not in host:
+            return None
+        headers = {
+            "referer": self._platform_search_config.bilibili.referer or "https://www.bilibili.com",
+            "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
+        }
+        if compact(self._platform_search_config.bilibili.user_agent):
+            headers["user-agent"] = self._platform_search_config.bilibili.user_agent
+        if compact(self._platform_search_config.bilibili.cookie):
+            headers["cookie"] = self._platform_search_config.bilibili.cookie
+        return headers
+
     def _is_platform_api_disabled(self, api_label: str) -> bool:
-        return compact(api_label).lower() in self._disabled_platform_apis
+        with self._state_lock:
+            return compact(api_label).lower() in self._disabled_platform_apis
 
     def _disable_platform_api(self, api_label: str) -> None:
         normalized = compact(api_label).lower()
         if normalized:
-            self._disabled_platform_apis.add(normalized)
+            with self._state_lock:
+                self._disabled_platform_apis.add(normalized)
 
     def _can_use_youtube_api(self) -> bool:
         return bool(
@@ -295,7 +362,11 @@ class HttpSourceProvider:
         return bool(
             self._platform_search_config.enabled
             and self._platform_search_config.bilibili.enabled
-            and compact(self._platform_search_config.bilibili.cookie)
+            and (
+                compact(self._platform_search_config.bilibili.cookie)
+                or compact(self._platform_search_config.bilibili.user_agent)
+                or compact(self._platform_search_config.bilibili.storage_state_path)
+            )
         )
 
     async def inspect_existing_links(self, draft: DraftRecordingEntry, profile: RetrievalProfile) -> list[dict[str, Any]]:
@@ -317,19 +388,18 @@ class HttpSourceProvider:
         self._reset_warnings()
         self._thread_local.current_draft = draft
         profiles = self._profile_loader.load(category=profile.category, tags=profile.tags)
-        streaming_hosts = profiles.streaming[:HOST_SEARCH_DEPTH]
-        host_row_cap = HYDRATE_DEPTH if len(streaming_hosts) <= 1 else min(6, max(4, HYDRATE_DEPTH // 2))
-        rows: list[dict[str, str]] = []
-        for host in streaming_hosts:
+        streaming_hosts = sorted(profiles.streaming[:HOST_SEARCH_DEPTH], key=lambda host: streaming_host_priority(host.url))
+
+        async def run_host(host: SourceProfileEntry) -> tuple[SourceProfileEntry, list[dict[str, str]]]:
             normalized_host = normalize_host(host.url)
             if self._should_skip_host(normalized_host, min_requests=2):
-                self._warn(f"{normalized_host} 已因连续失败暂时跳过。")
-                continue
-            timeout_seconds = self._recommended_timeout_seconds(normalized_host, 10.0)
+                self._warn(f"{normalized_host} 连续失败，当前请求暂时跳过。")
+                return host, []
+            timeout_seconds = self._streaming_host_timeout_seconds(draft, profile, host)
             try:
                 host_rows = await asyncio.wait_for(self._search_streaming_host(draft, profile, host), timeout=timeout_seconds)
             except asyncio.TimeoutError:
-                self._warn(f"{normalize_host(host.url)} 流媒体搜索超时。")
+                self._warn(f"{normalized_host} 资源平台搜索超时。")
                 self._record_access_event(
                     url=host.url,
                     operation="streaming-host",
@@ -340,14 +410,33 @@ class HttpSourceProvider:
                     error="timeout",
                     timeout_seconds=timeout_seconds,
                 )
-                continue
-            if host_rows:
-                remaining = max(0, HYDRATE_DEPTH - len(rows))
-                rows.extend(host_rows[: min(host_row_cap, remaining)])
-                rows = dedupe_rows(rows)
-            if len(rows) >= HYDRATE_DEPTH:
-                break
+                return host, []
+            return host, host_rows
+
+        primary_hosts = [host for host in streaming_hosts if streaming_host_priority(host.url)[0] == 0]
+        auxiliary_hosts = [host for host in streaming_hosts if streaming_host_priority(host.url)[0] != 0]
+
+        primary_results = await asyncio.gather(*(run_host(host) for host in primary_hosts), return_exceptions=False)
+        host_results = list(primary_results)
+        if should_search_auxiliary_streaming_hosts(primary_results):
+            auxiliary_results = await asyncio.gather(*(run_host(host) for host in auxiliary_hosts), return_exceptions=False)
+            host_results.extend(auxiliary_results)
+
+        rows = merge_streaming_host_rows(host_results)
         return await self._hydrate_results(draft, rows[:HYDRATE_DEPTH], "streaming")
+
+    def _streaming_host_timeout_seconds(
+        self,
+        draft: DraftRecordingEntry,
+        profile: RetrievalProfile,
+        host: SourceProfileEntry,
+    ) -> float:
+        normalized_host = normalize_host(host.url)
+        base_timeout = self._recommended_timeout_seconds(normalized_host, 10.0)
+        query_count = len(self._queries_for_host(draft, profile, host))
+        query_depth = min(query_count, self._recommended_query_depth(normalized_host, HOST_QUERY_DEPTH))
+        timeout_scale = 1.0 + max(0, query_depth - 1) * 0.28
+        return round(min(30.0, max(10.0, base_timeout * timeout_scale)), 1)
 
     async def search_fallback(self, draft: DraftRecordingEntry, profile: RetrievalProfile) -> list[dict[str, Any]]:
         self._reset_warnings()
@@ -471,8 +560,9 @@ class HttpSourceProvider:
         return dedupe_rows(rows)
 
     async def _search_youtube(self, queries: list[str]) -> list[dict[str, str]]:
+        html_query_depth = min(len(queries), self._recommended_query_depth("www.youtube.com", HOST_QUERY_DEPTH) + 1)
         rows = await self._search_streaming_platform(
-            queries=queries,
+            queries=queries[:html_query_depth],
             url_builders=[
                 lambda query: f"https://www.youtube.com/results?search_query={quote_plus(query)}",
                 lambda query: f"https://www.youtube.com/results?sp=EgIQAQ%253D%253D&search_query={quote_plus(query)}",
@@ -485,20 +575,21 @@ class HttpSourceProvider:
         if self._can_use_youtube_api() and not self._is_platform_api_disabled("YouTube API Search"):
             return rows
         engine_rows = await self._search_platform_via_site_engines(
-            queries[:4],
-            site_hosts=["www.youtube.com"],
+            queries[: max(4, html_query_depth)],
+            site_hosts=["www.youtube.com", "youtu.be"],
             source_label="YouTube Search",
         )
         return dedupe_rows([*rows, *engine_rows])[:HYDRATE_DEPTH]
 
     async def _search_bilibili(self, queries: list[str]) -> list[dict[str, str]]:
         prioritized_queries = queries
+        html_query_depth = min(len(prioritized_queries), self._recommended_query_depth("search.bilibili.com", HOST_QUERY_DEPTH) + 1)
         builders = [
             lambda query: f"https://search.bilibili.com/all?keyword={quote_plus(query)}",
             lambda query: f"https://search.bilibili.com/video?keyword={quote_plus(query)}",
         ]
         rows = await self._search_streaming_platform(
-            queries=prioritized_queries[:2],
+            queries=prioritized_queries[:html_query_depth],
             url_builders=builders,
             parser=extract_bilibili_result_links,
             source_label="Bilibili Search",
@@ -506,14 +597,14 @@ class HttpSourceProvider:
             api_source_label="Bilibili API Search",
         )
         browser_rows = await self._search_platform_via_browser_pages(
-            queries=prioritized_queries[:2],
+            queries=prioritized_queries[: min(3, html_query_depth)],
             url_builders=builders,
             source_label="Bilibili Search",
-            url_patterns=[r"https://www\.bilibili\.com/video/BV[0-9A-Za-z]+/?"],
+            url_patterns=[r"https://www\.bilibili\.com/video/(?:BV[0-9A-Za-z]+|av\d+)/?"],
         )
         engine_rows = await self._search_platform_via_site_engines(
-            prioritized_queries[:4],
-            site_hosts=["www.bilibili.com"],
+            prioritized_queries[: max(4, html_query_depth)],
+            site_hosts=["www.bilibili.com", "m.bilibili.com", "b23.tv"],
             source_label="Bilibili Search",
         )
         return dedupe_rows([*rows, *browser_rows, *engine_rows])[:HYDRATE_DEPTH]
@@ -669,7 +760,7 @@ class HttpSourceProvider:
         if "apple" in lowered:
             return f"https://api.music.apple.com/v1/catalog/{self._platform_search_config.apple_music.storefront}/search"
         if "bilibili" in lowered:
-            return "https://api.bilibili.com/x/web-interface/search/type"
+            return "https://api.bilibili.com/x/web-interface/wbi/search/type"
         return "https://api.example.invalid/search"
 
     def _html_budget_boost(self, source_label: str) -> tuple[int, int]:
@@ -839,6 +930,11 @@ class HttpSourceProvider:
             latin_queries = profile.latin_queries or profile.queries
 
         if host.is_chinese:
+            primary_only_queries = self._primary_only_queries_for_host(
+                draft,
+                host,
+                composer_query=compact(draft.composer_name),
+            )
             zh_queries = build_queries(
                 work_query=build_work_query(draft, prefer_latin=False),
                 composer_query=compact(draft.composer_name),
@@ -855,10 +951,9 @@ class HttpSourceProvider:
                 title=draft.title,
                 performance_date_text=draft.performance_date_text,
             )
-            return dedupe_text(
+            generated_queries = prioritize_platform_queries(
                 [
-                    *profile.zh_queries[:2],
-                    *profile.latin_queries[:2],
+                    *primary_only_queries[:4],
                     *zh_queries[:3],
                     *latin_queries[:3],
                     *profile.mixed_queries[:1],
@@ -869,13 +964,25 @@ class HttpSourceProvider:
                         lead_terms=dedupe_text([*zh_leads, *latin_leads]),
                         ensemble_terms=dedupe_text([*zh_ensembles, *latin_ensembles]),
                     )[:2],
-                ]
-            )[:8]
-
-        return dedupe_text(
-            [
-                *profile.queries[:2],
+                ],
+                draft=draft,
+                prefer_cjk=True,
+            )
+            return dedupe_text([
+                *primary_only_queries[:4],
+                *profile.zh_queries[:2],
                 *profile.latin_queries[:2],
+                *generated_queries,
+            ])[:8]
+
+        primary_only_queries = self._primary_only_queries_for_host(
+            draft,
+            host,
+            composer_query=compact(draft.composer_name_latin),
+        )
+        generated_queries = prioritize_platform_queries(
+            [
+                *primary_only_queries[:4],
                 *self._alias_queries_for_host(
                     draft,
                     host,
@@ -883,8 +990,75 @@ class HttpSourceProvider:
                     ensemble_terms=latin_ensembles,
                 )[:4],
                 *latin_queries[:4],
-            ]
-        )[:10]
+            ],
+            draft=draft,
+            prefer_cjk=False,
+        )
+        return dedupe_text([
+            *primary_only_queries[:4],
+            *profile.queries[:2],
+            *profile.latin_queries[:2],
+            *generated_queries,
+        ])[:10]
+
+    def _primary_only_queries_for_host(
+        self,
+        draft: DraftRecordingEntry,
+        host: SourceProfileEntry,
+        *,
+        composer_query: str,
+    ) -> list[str]:
+        work_query = build_work_query(draft, prefer_latin=not host.is_chinese)
+        normalized_work = compact(work_query).lower()
+        if not normalized_work:
+            return []
+        if "concerto" not in normalized_work and "协奏曲" not in work_query:
+            return []
+        if host.is_chinese:
+            primary_terms = dedupe_text([*getattr(draft, "primary_names", []), *getattr(draft, "primary_names_latin", [])])
+        else:
+            primary_terms = dedupe_text([*getattr(draft, "primary_names_latin", []), *getattr(draft, "primary_names", [])])
+        if not primary_terms:
+            return []
+        queries = build_queries(
+            work_query=work_query,
+            composer_query=composer_query,
+            lead_terms=primary_terms[:1],
+            ensemble_terms=[],
+            title=draft.title,
+            performance_date_text=draft.performance_date_text,
+        )
+        alias_values = build_work_aliases(draft.work_title_latin)
+        alias_values.update(build_work_aliases(draft.work_title))
+        for alias in sorted(alias_values):
+            normalized_alias = compact(alias)
+            if not normalized_alias or normalized_alias.lower() == normalized_work:
+                continue
+            if host.is_chinese and not contains_cjk(normalized_alias):
+                continue
+            if not host.is_chinese and not looks_latin(normalized_alias):
+                continue
+            queries.extend(
+                build_queries(
+                    work_query=normalized_alias,
+                    composer_query=composer_query,
+                    lead_terms=primary_terms[:1],
+                    ensemble_terms=[],
+                    title=draft.title,
+                    performance_date_text=draft.performance_date_text,
+                )[:2]
+            )
+        filtered_queries = []
+        required_lead = compact(primary_terms[0]).lower()
+        catalogue = compact(draft.catalogue).lower()
+        for query in dedupe_text(queries):
+            lowered = compact(query).lower()
+            if required_lead and required_lead not in lowered:
+                continue
+            if catalogue and catalogue not in lowered and "concerto" not in lowered and "协奏曲" not in query and "klavierkonzert" not in lowered:
+                continue
+            filtered_queries.append(query)
+        return prioritize_platform_queries(filtered_queries, draft=draft, prefer_cjk=host.is_chinese)
 
     def _alias_queries_for_host(
         self,
@@ -1007,6 +1181,7 @@ class HttpSourceProvider:
                 or compact(bilibili_metadata.get("image_url"))
                 or extract_first_image_src(html_text, url),
             )
+            canonical_url = canonicalize_bilibili_video_url(url, compact(bilibili_metadata.get("bvid")))
             duration_seconds = extract_duration_seconds(html_text) or int(bilibili_metadata.get("duration_seconds", 0) or 0)
             uploader = extract_uploader_name(html_text) or compact(bilibili_metadata.get("uploader"))
             view_count = extract_view_count(html_text) or int(bilibili_metadata.get("view_count", 0) or 0)
@@ -1033,6 +1208,10 @@ class HttpSourceProvider:
                     body_text = compact(browser_payload.get("bodyText")) or body_text
                     image_url = resolve_image_url(url, browser_payload.get("imageUrl") or image_url)
                     uploader = compact(browser_payload.get("uploader")) or uploader
+                    canonical_url = canonicalize_bilibili_video_url(
+                        canonical_url,
+                        compact(browser_payload.get("bvid")),
+                    )
                     duration_seconds = max(
                         duration_seconds,
                         int(browser_payload.get("durationSeconds", browser_payload.get("duration_seconds", 0)) or 0),
@@ -1075,7 +1254,7 @@ class HttpSourceProvider:
             )
 
         return {
-            "url": url,
+            "url": canonical_url,
             "source_label": source_label,
             "source_kind": source_kind,
             "title": title,
@@ -1107,7 +1286,8 @@ class HttpSourceProvider:
         timeout_seconds: float | None = None,
     ) -> str:
         normalized_url = compact(url)
-        cached = self._text_cache.get(normalized_url)
+        with self._state_lock:
+            cached = self._text_cache.get(normalized_url)
         if cached is not None:
             if operation == "fetch-page":
                 self._record_access_event(
@@ -1125,9 +1305,10 @@ class HttpSourceProvider:
             return cached
         client = self._get_http_client()
         started = time.perf_counter()
-        response = await client.get(url, timeout=timeout_seconds)
+        response = await client.get(url, timeout=timeout_seconds, headers=self._request_headers_for_url(url))
         response.raise_for_status()
-        self._text_cache[normalized_url] = response.text
+        with self._state_lock:
+            self._text_cache[normalized_url] = response.text
         if operation == "fetch-page":
             self._record_access_event(
                 url=url,
@@ -1155,16 +1336,82 @@ def should_disable_platform_api(error: Exception) -> bool:
             body = error.response.text.lower()
         except Exception:
             body = ""
-        if status_code in {401, 403, 429}:
+        if status_code in {401, 403, 412, 429}:
             return True
         if "quota" in body or "rate" in body:
             return True
     message = compact(error).lower()
-    return any(token in message for token in ("quota", "rate limit", "403", "429"))
+    return any(token in message for token in ("quota", "rate limit", "403", "412", "429"))
 
 
 def normalize_host(value: str) -> str:
     return compact(value).replace("https://", "").replace("http://", "").strip("/")
+
+
+def canonicalize_bilibili_video_url(url: str, bvid: str = "") -> str:
+    normalized_url = compact(url)
+    normalized_bvid = compact(bvid)
+    host = urlparse(normalized_url).netloc.lower()
+    if "bilibili.com" not in host or not normalized_bvid:
+        return normalized_url
+    return f"https://www.bilibili.com/video/{normalized_bvid}/"
+
+
+def streaming_host_priority(value: str) -> tuple[int, str]:
+    normalized = normalize_host(value).lower()
+    if "youtube.com" in normalized or "youtu.be" in normalized:
+        return (0, normalized)
+    if "bilibili.com" in normalized or "b23.tv" in normalized:
+        return (0, normalized)
+    if "apple.com" in normalized:
+        return (1, normalized)
+    return (2, normalized)
+
+
+def merge_streaming_host_rows(
+    host_results: list[tuple[SourceProfileEntry, list[dict[str, str]]]],
+) -> list[dict[str, str]]:
+    coverage_rows: list[dict[str, str]] = []
+    all_rows: list[dict[str, str]] = []
+    priority_hosts = {host.url for host, _ in host_results if streaming_host_priority(host.url)[0] == 0}
+    for host, rows in host_results:
+        if host.url in priority_hosts:
+            coverage_rows.extend(rows[:2])
+    coverage_rows = dedupe_rows(coverage_rows)
+
+    multiple_hosts = len(host_results) > 1
+    for host, rows in host_results:
+        per_host_cap = HYDRATE_DEPTH if not multiple_hosts else (6 if streaming_host_priority(host.url)[0] == 0 else 4)
+        all_rows.extend(rows[:per_host_cap])
+    return dedupe_rows([*coverage_rows, *all_rows])[:HYDRATE_DEPTH]
+
+
+def should_search_auxiliary_streaming_hosts(
+    host_results: list[tuple[SourceProfileEntry, list[dict[str, str]]]],
+) -> bool:
+    non_empty = [(host, rows) for host, rows in host_results if rows]
+    if len(non_empty) < 2:
+        return True
+    merged = merge_streaming_host_rows(non_empty)
+    return len(merged) < 4
+
+
+def prioritize_platform_queries(values: list[str], *, draft: DraftRecordingEntry, prefer_cjk: bool) -> list[str]:
+    catalogue = compact(draft.catalogue).lower()
+    work_title = compact(draft.work_title_latin or draft.work_title).lower()
+    composer = compact(draft.composer_name_latin or draft.composer_name).lower()
+
+    def sort_key(query: str) -> tuple[int, int, int, int, int]:
+        lowered = compact(query).lower()
+        return (
+            0 if contains_cjk(lowered) == prefer_cjk else 1,
+            0 if catalogue and catalogue in lowered else 1,
+            0 if work_title and work_title in lowered else 1,
+            0 if composer and composer in lowered else 1,
+            len(lowered),
+        )
+
+    return sorted(dedupe_text(values), key=sort_key)
 
 
 def dedupe_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
@@ -1316,6 +1563,7 @@ def extract_bilibili_structured_metadata(html_text: str) -> dict[str, Any]:
         "body_text": compact(" ".join(part for part in [compact(video_data.get("title")), description, compact(owner.get("name")), parts] if part)),
         "image_url": compact(video_data.get("pic")),
         "uploader": compact(owner.get("name")),
+        "bvid": compact(video_data.get("bvid")),
         "duration_seconds": int(video_data.get("duration") or 0),
         "view_count": int(stats.get("view") or 0),
     }

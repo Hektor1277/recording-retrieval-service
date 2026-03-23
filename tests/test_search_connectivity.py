@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from pathlib import Path
 
 import httpx
@@ -10,6 +11,7 @@ from app.services.http_sources import (
     build_work_aliases,
     extract_bing_result_links,
     looks_like_single_movement,
+    normalize_host,
     score_recording_match,
 )
 from app.services.pipeline import DraftRecordingEntry, RetrievalProfile
@@ -204,6 +206,74 @@ class HostSliceAwareProvider(HttpSourceProvider):
         return rows
 
 
+class ParallelHostProvider(HttpSourceProvider):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.host_start_times: dict[str, float] = {}
+
+    async def _search_streaming_host(
+        self,
+        draft: DraftRecordingEntry,
+        profile: RetrievalProfile,
+        host,
+    ) -> list[dict[str, str]]:
+        del draft, profile
+        self.host_start_times[host.url] = time.perf_counter()
+        await asyncio.sleep(0.12)
+        return [
+            {
+                "url": f"{host.url.rstrip('/')}/video/result",
+                "source_label": normalize_host(host.url),
+                "source_kind": "streaming",
+            }
+        ]
+
+    async def _hydrate_results(
+        self,
+        draft: DraftRecordingEntry,
+        rows: list[dict[str, str]],
+        source_kind: str,
+    ) -> list[dict[str, str]]:
+        del draft, source_kind
+        return rows
+
+
+class PriorityCoverageProvider(HttpSourceProvider):
+    async def _search_streaming_host(
+        self,
+        draft: DraftRecordingEntry,
+        profile: RetrievalProfile,
+        host,
+    ) -> list[dict[str, str]]:
+        del draft, profile
+        normalized = normalize_host(host.url)
+        if "youtube.com" in normalized:
+            return [
+                {
+                    "url": f"https://www.youtube.com/watch?v=yt{index:02d}",
+                    "source_label": "YouTube Search",
+                    "source_kind": "streaming",
+                }
+                for index in range(12)
+            ]
+        return [
+            {
+                "url": "https://www.bilibili.com/video/BV1priorityhit1",
+                "source_label": "Bilibili Search",
+                "source_kind": "streaming",
+            }
+        ]
+
+    async def _hydrate_results(
+        self,
+        draft: DraftRecordingEntry,
+        rows: list[dict[str, str]],
+        source_kind: str,
+    ) -> list[dict[str, str]]:
+        del draft, source_kind
+        return rows
+
+
 class FlakyYouTubeTransport(httpx.AsyncBaseTransport):
     def __init__(self) -> None:
         self.call_count = 0
@@ -296,11 +366,28 @@ class ApiFirstTransport(httpx.AsyncBaseTransport):
                     }
                 },
             )
-        if "api.bilibili.com/x/web-interface/search/type" in url:
+        if url.rstrip("/") == "https://www.bilibili.com":
+            return httpx.Response(200, request=request, text="home")
+        if "api.bilibili.com/x/web-interface/nav" in url:
             return httpx.Response(
                 200,
                 request=request,
                 json={
+                    "code": 0,
+                    "data": {
+                        "wbi_img": {
+                            "img_url": "https://i0.hdslb.com/bfs/wbi/abcdefghijklmnopqrstuvwxyz123456.png",
+                            "sub_url": "https://i0.hdslb.com/bfs/wbi/uvwxyzabcdefghijklmnopqrstuvwxyz123456.jpg",
+                        }
+                    },
+                },
+            )
+        if "api.bilibili.com/x/web-interface/wbi/search/type" in url:
+            return httpx.Response(
+                200,
+                request=request,
+                json={
+                    "code": 0,
                     "data": {
                         "result": [
                             {"arcurl": "https://www.bilibili.com/video/BV1apiresult1"}
@@ -341,10 +428,12 @@ class FallbackApiTransport(ApiFirstTransport):
 class HtmlEndpointFallbackTransport(httpx.AsyncBaseTransport):
     def __init__(self) -> None:
         self.urls: list[str] = []
+        self.headers: dict[str, dict[str, str]] = {}
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         url = str(request.url)
         self.urls.append(url)
+        self.headers[url] = {key.decode().lower(): value.decode() for key, value in request.headers.raw}
         if "classical.music.apple.com/search" in url:
             return httpx.Response(200, request=request, text="")
         if "music.apple.com/search" in url:
@@ -555,7 +644,11 @@ def test_provider_keeps_streaming_host_scan_for_deeper_candidates(tmp_path: Path
     (root / "streaming.txt").write_text("#global\nhttps://www.youtube.com\nhttps://www.bilibili.com\n", encoding="utf-8")
     transport = CountingSearchTransport()
     client = httpx.AsyncClient(transport=transport, follow_redirects=True)
-    provider = HttpSourceProvider(profile_loader=SourceProfileLoader(root), client=client)
+    provider = HttpSourceProvider(
+        profile_loader=SourceProfileLoader(root),
+        client=client,
+        browser_fetcher=BrowserResultFetcher({}),
+    )
 
     results = asyncio.run(provider.search_streaming(build_draft(), build_profile()))
 
@@ -906,6 +999,45 @@ def test_provider_expands_title_inferred_chinese_collaborator_into_latin_youtube
     assert any("Arturo Toscanini" in query for query in queries)
 
 
+def test_queries_for_host_keep_soloist_only_work_query_for_concerto_full_draft() -> None:
+    provider = HttpSourceProvider()
+    draft = DraftRecordingEntry(
+        item_id="recording-annie-query-1",
+        title="Annie Fischer & Kletzki",
+        composer_name="舒曼",
+        composer_name_latin="Robert Schumann",
+        work_title="a小调钢琴协奏曲",
+        work_title_latin="Piano Concerto, Op.54",
+        catalogue="Op.54",
+        performance_date_text="",
+        venue_text="",
+        album_title="",
+        label="",
+        release_date="",
+        notes="",
+        source_line="Robert Schumann | Piano Concerto in A Minor, Op.54 | Annie Fischer | Kletzki | Budapest Philharmonic Orchestra | -",
+        raw_text="Robert Schumann | Piano Concerto in A Minor, Op.54 | Annie Fischer | Kletzki | Budapest Philharmonic Orchestra | -",
+        existing_links=[],
+        primary_names=["Annie Fischer"],
+        primary_names_latin=["Annie Fischer"],
+        secondary_names=["Kletzki"],
+        secondary_names_latin=["Kletzki"],
+        query_lead_names=["Annie Fischer", "Kletzki"],
+        query_lead_names_latin=["Annie Fischer", "Kletzki"],
+        lead_names=["Annie Fischer", "Kletzki"],
+        lead_names_latin=["Annie Fischer", "Kletzki"],
+        ensemble_names=["Budapest Philharmonic Orchestra"],
+        ensemble_names_latin=["Budapest Philharmonic Orchestra"],
+    )
+    profile = RetrievalProfile(category="concerto", tags=[], queries=[], latin_queries=[], zh_queries=[], mixed_queries=[])
+    host = next(host for host in provider._profile_loader.load(category="concerto", tags=[]).streaming if "youtube.com" in host.url)
+
+    queries = provider._queries_for_host(draft, profile, host)
+
+    assert "Piano Concerto, Op.54 Annie Fischer" in queries
+    assert any("Annie Fischer" in query and "klavierkonzert" in query.lower() for query in queries)
+
+
 def test_provider_prefers_apple_music_api_when_configured(tmp_path: Path) -> None:
     root = tmp_path / "source-profiles"
     root.mkdir(parents=True)
@@ -938,6 +1070,7 @@ def test_provider_prefers_bilibili_api_when_cookie_configured(tmp_path: Path) ->
     provider = HttpSourceProvider(
         profile_loader=SourceProfileLoader(root),
         client=client,
+        browser_fetcher=BrowserResultFetcher({}),
         platform_search_config=PlatformSearchConfig(
             bilibili=BilibiliSearchConfig(cookie="SESSDATA=abc", user_agent="UA/1.0"),
         ),
@@ -946,9 +1079,38 @@ def test_provider_prefers_bilibili_api_when_cookie_configured(tmp_path: Path) ->
     rows = asyncio.run(provider._search_bilibili(["布鲁克纳 伯姆"]))
 
     assert any(row["url"] == "https://www.bilibili.com/video/BV1apiresult1" for row in rows)
-    bilibili_api_url = next(url for url in transport.urls if "api.bilibili.com/x/web-interface/search/type" in url)
+    bilibili_api_url = next(url for url in transport.urls if "api.bilibili.com/x/web-interface/wbi/search/type" in url)
     assert transport.headers[bilibili_api_url]["cookie"] == "SESSDATA=abc"
     assert transport.headers[bilibili_api_url]["referer"] == "https://www.bilibili.com"
+    assert "w_rid=" in bilibili_api_url
+    assert "wts=" in bilibili_api_url
+    assert any(url.rstrip("/") == "https://www.bilibili.com" for url in transport.urls)
+    assert any("api.bilibili.com/x/web-interface/nav" in url for url in transport.urls)
+
+
+def test_provider_uses_bilibili_public_wbi_search_without_cookie(tmp_path: Path) -> None:
+    root = tmp_path / "source-profiles"
+    root.mkdir(parents=True)
+    (root / "high-quality.txt").write_text("#global\nhttps://catalog.example\n", encoding="utf-8")
+    (root / "streaming.txt").write_text("#global\n[zh] https://www.bilibili.com\n", encoding="utf-8")
+    transport = ApiFirstTransport()
+    client = httpx.AsyncClient(transport=transport, follow_redirects=True)
+    provider = HttpSourceProvider(
+        profile_loader=SourceProfileLoader(root),
+        client=client,
+        browser_fetcher=BrowserResultFetcher({}),
+        platform_search_config=PlatformSearchConfig(
+            bilibili=BilibiliSearchConfig(enabled=True, user_agent="UA/1.0"),
+        ),
+    )
+
+    rows = asyncio.run(provider._search_bilibili(["海菲兹 托斯卡尼尼 1940"]))
+
+    assert any(row["url"] == "https://www.bilibili.com/video/BV1apiresult1" for row in rows)
+    bilibili_api_url = next(url for url in transport.urls if "api.bilibili.com/x/web-interface/wbi/search/type" in url)
+    assert transport.headers[bilibili_api_url]["user-agent"] == "UA/1.0"
+    assert transport.headers[bilibili_api_url]["referer"] == "https://www.bilibili.com"
+    assert not any("search.bilibili.com/all" in url for url in transport.urls)
 
 
 def test_provider_tries_multiple_apple_music_html_endpoints_without_api(tmp_path: Path) -> None:
@@ -994,6 +1156,35 @@ def test_provider_tries_multiple_bilibili_html_endpoints_without_api(tmp_path: P
     assert any(row["url"] == "https://www.bilibili.com/video/BV1fallbackvideo1" for row in rows)
     assert any("search.bilibili.com/all" in url for url in transport.urls)
     assert any("search.bilibili.com/video" in url for url in transport.urls)
+
+
+def test_provider_sends_bilibili_headers_for_html_search_when_configured(tmp_path: Path) -> None:
+    root = tmp_path / "source-profiles"
+    root.mkdir(parents=True)
+    (root / "high-quality.txt").write_text("#global\nhttps://catalog.example\n", encoding="utf-8")
+    (root / "streaming.txt").write_text("#global\n[zh] https://www.bilibili.com\n", encoding="utf-8")
+    transport = HtmlEndpointFallbackTransport()
+    client = httpx.AsyncClient(transport=transport, follow_redirects=True)
+    provider = HttpSourceProvider(
+        profile_loader=SourceProfileLoader(root),
+        client=client,
+        browser_fetcher=BrowserResultFetcher({}),
+        platform_search_config=PlatformSearchConfig(
+            bilibili=BilibiliSearchConfig(
+                enabled=False,
+                cookie="SESSDATA=abc; buvid3=def",
+                user_agent="TestAgent/1.0",
+                referer="https://www.bilibili.com",
+            ),
+        ),
+    )
+
+    asyncio.run(provider._search_bilibili(["布鲁克纳 伯姆"]))
+
+    bilibili_search_url = next(url for url in transport.urls if "search.bilibili.com/all" in url)
+    assert transport.headers[bilibili_search_url]["cookie"] == "SESSDATA=abc; buvid3=def"
+    assert transport.headers[bilibili_search_url]["referer"] == "https://www.bilibili.com"
+    assert transport.headers[bilibili_search_url]["user-agent"] == "TestAgent/1.0"
 
 
 def test_provider_falls_back_to_search_engine_when_bilibili_html_is_empty(tmp_path: Path) -> None:
@@ -1052,6 +1243,34 @@ def test_provider_uses_browser_rendered_bilibili_results_before_search_engine_fa
     assert any("search.bilibili.com/all" in url for url in browser_fetcher.link_calls)
     assert any("bing.com" in url and "site%3Awww.bilibili.com" in url for url in transport.urls)
     assert any(row["url"] == "https://www.bilibili.com/video/BV1enginefallback1" for row in rows)
+
+
+def test_provider_accepts_browser_rendered_bilibili_av_links(tmp_path: Path) -> None:
+    root = tmp_path / "source-profiles"
+    root.mkdir(parents=True)
+    (root / "high-quality.txt").write_text("#global\nhttps://catalog.example\n", encoding="utf-8")
+    (root / "streaming.txt").write_text("#global\n[zh] https://www.bilibili.com\n", encoding="utf-8")
+    transport = PlatformEngineFallbackTransport()
+    client = httpx.AsyncClient(transport=transport, follow_redirects=True)
+    browser_fetcher = BrowserResultFetcher(
+        {
+            "https://search.bilibili.com/all?keyword=%E4%BC%AF%E6%81%A9%E6%96%AF%E5%9D%A6+1977": [
+                "https://www.bilibili.com/video/av317938669",
+            ]
+        }
+    )
+    provider = HttpSourceProvider(
+        profile_loader=SourceProfileLoader(root),
+        client=client,
+        browser_fetcher=browser_fetcher,
+        platform_search_config=PlatformSearchConfig(
+            bilibili=BilibiliSearchConfig(enabled=False),
+        ),
+    )
+
+    rows = asyncio.run(provider._search_bilibili(["伯恩斯坦 1977"]))
+
+    assert any(row["url"] == "https://www.bilibili.com/video/av317938669" for row in rows)
 
 
 def test_provider_uses_browser_metadata_to_enrich_bilibili_video_pages(tmp_path: Path) -> None:
@@ -1137,6 +1356,67 @@ def test_provider_uses_browser_metadata_to_enrich_bilibili_video_pages(tmp_path:
     assert row["same_recording_score"] >= 0.6
 
 
+def test_provider_canonicalizes_bilibili_av_url_to_bv_when_metadata_exposes_bvid(tmp_path: Path) -> None:
+    root = tmp_path / "source-profiles"
+    root.mkdir(parents=True)
+    (root / "high-quality.txt").write_text("#global\nhttps://catalog.example\n", encoding="utf-8")
+    (root / "streaming.txt").write_text("#global\n[zh] https://www.bilibili.com\n", encoding="utf-8")
+
+    class CanonicalBilibiliTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            if "www.bilibili.com/video/av317938669" in str(request.url):
+                return httpx.Response(
+                    200,
+                    request=request,
+                    text=(
+                        '<html><script>window.__INITIAL_STATE__={"videoData":{"title":"Bernstein Fantastique",'
+                        '"bvid":"BV16P411Y7J1","owner":{"name":"uploader"},"stat":{"view":1024},"duration":3010}};</script></html>'
+                    ),
+                )
+            return httpx.Response(404, request=request, text="not found")
+
+    provider = HttpSourceProvider(
+        profile_loader=SourceProfileLoader(root),
+        client=httpx.AsyncClient(transport=CanonicalBilibiliTransport(), follow_redirects=True),
+        browser_fetcher=BrowserResultFetcher({}),
+    )
+    draft = DraftRecordingEntry(
+        item_id="bernstein-bvid",
+        title="Bernstein Fantastique",
+        composer_name="柏辽兹",
+        composer_name_latin="Hector Berlioz",
+        work_title="幻想交响曲",
+        work_title_latin="Symphonie Fantastique",
+        catalogue="",
+        performance_date_text="1977",
+        venue_text="",
+        album_title="",
+        label="",
+        release_date="",
+        notes="",
+        source_line="Berlioz | Symphonie Fantastique | Leonard Bernstein | 1977",
+        raw_text="Berlioz | Symphonie Fantastique | Leonard Bernstein | 1977",
+        existing_links=[],
+        primary_names=["Leonard Bernstein"],
+        primary_names_latin=["Leonard Bernstein"],
+        lead_names=["Leonard Bernstein"],
+        lead_names_latin=["Leonard Bernstein"],
+    )
+
+    row = asyncio.run(
+        provider._fetch_page_record(
+            "https://www.bilibili.com/video/av317938669",
+            "Bilibili Search",
+            "streaming",
+            draft,
+            asyncio.Semaphore(1),
+        )
+    )
+
+    assert row is not None
+    assert row["url"] == "https://www.bilibili.com/video/BV16P411Y7J1/"
+
+
 def test_provider_falls_back_to_search_engine_when_apple_html_is_empty(tmp_path: Path) -> None:
     root = tmp_path / "source-profiles"
     root.mkdir(parents=True)
@@ -1174,6 +1454,7 @@ def test_search_streaming_does_not_let_first_host_starve_youtube_follow_up(tmp_p
     provider = NoHydrateProvider(
         profile_loader=SourceProfileLoader(root),
         client=client,
+        browser_fetcher=BrowserResultFetcher({}),
         platform_search_config=PlatformSearchConfig(
             youtube=YouTubeSearchConfig(api_key="yt-key"),
             bilibili=BilibiliSearchConfig(cookie="SESSDATA=abc", user_agent="UA/1.0"),
@@ -1184,7 +1465,39 @@ def test_search_streaming_does_not_let_first_host_starve_youtube_follow_up(tmp_p
 
     assert rows
     assert any("googleapis.com/youtube/v3/search" in url for url in transport.urls)
-    assert any("api.bilibili.com/x/web-interface/search/type" in url for url in transport.urls)
+    assert any("api.bilibili.com/x/web-interface/wbi/search/type" in url for url in transport.urls)
+
+
+def test_search_streaming_queries_priority_hosts_in_parallel(tmp_path: Path) -> None:
+    root = tmp_path / "source-profiles"
+    root.mkdir(parents=True)
+    (root / "high-quality.txt").write_text("#global\nhttps://catalog.example\n", encoding="utf-8")
+    (root / "streaming.txt").write_text("#global\nhttps://www.youtube.com\n[zh] https://www.bilibili.com\n", encoding="utf-8")
+    provider = ParallelHostProvider(profile_loader=SourceProfileLoader(root))
+
+    started = time.perf_counter()
+    rows = asyncio.run(provider.search_streaming(build_draft(), build_profile()))
+    elapsed = time.perf_counter() - started
+
+    assert len(rows) == 2
+    assert elapsed < 0.2
+    assert len(provider.host_start_times) == 2
+    start_times = sorted(provider.host_start_times.values())
+    assert start_times[-1] - start_times[0] < 0.08
+
+
+def test_search_streaming_keeps_bilibili_coverage_even_when_youtube_fills_budget(tmp_path: Path) -> None:
+    root = tmp_path / "source-profiles"
+    root.mkdir(parents=True)
+    (root / "high-quality.txt").write_text("#global\nhttps://catalog.example\n", encoding="utf-8")
+    (root / "streaming.txt").write_text("#global\nhttps://www.youtube.com\n[zh] https://www.bilibili.com\n", encoding="utf-8")
+    provider = PriorityCoverageProvider(profile_loader=SourceProfileLoader(root))
+
+    rows = asyncio.run(provider.search_streaming(build_draft(), build_profile()))
+
+    urls = [row["url"] for row in rows]
+    assert any("youtube.com/watch" in url for url in urls)
+    assert any("bilibili.com/video/BV1priorityhit1" in url for url in urls)
 
 
 def test_looks_like_single_movement_ignores_complete_tracklist_descriptions() -> None:

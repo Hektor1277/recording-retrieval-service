@@ -16,6 +16,7 @@
     "enabled": true,
     "cookie": "SESSDATA=...; buvid3=...; b_nut=...",
     "userAgent": "Mozilla/5.0",
-    "referer": "https://www.bilibili.com"
+    "referer": "https://www.bilibili.com",
+    "storageStatePath": "config/bilibili-storage-state.json"
   }
 }

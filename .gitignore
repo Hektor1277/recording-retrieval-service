@@ -11,6 +11,7 @@ logs/*
 cache/*
 downloads/*
 config/*.local.json
+config/bilibili-storage-state.json
 
 !cache/.gitkeep
 !downloads/.gitkeep
