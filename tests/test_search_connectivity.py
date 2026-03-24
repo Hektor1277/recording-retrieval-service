@@ -1417,6 +1417,79 @@ def test_provider_canonicalizes_bilibili_av_url_to_bv_when_metadata_exposes_bvid
     assert row["url"] == "https://www.bilibili.com/video/BV16P411Y7J1/"
 
 
+def test_provider_ignores_related_video_year_noise_in_bilibili_metadata(tmp_path: Path) -> None:
+    root = tmp_path / "source-profiles"
+    root.mkdir(parents=True)
+    (root / "high-quality.txt").write_text("#global\nhttps://catalog.example\n", encoding="utf-8")
+    (root / "streaming.txt").write_text("#global\n[zh] https://www.bilibili.com\n", encoding="utf-8")
+
+    class NoisyBilibiliTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            if "www.bilibili.com/video/BV16P411Y7J1" in str(request.url):
+                return httpx.Response(
+                    200,
+                    request=request,
+                    text=(
+                        '<html><script>window.__INITIAL_STATE__={"videoData":{'
+                        '"title":"伯恩斯坦《柏辽兹：幻想交响曲》法国国家管弦乐团「BD」",'
+                        '"desc":"Blu-ray Disc（蓝光碟） - 1080i片源'
+                        ' Hector Louis Berlioz (1803—1869)'
+                        ' Symphonie fantastique, Op. 14'
+                        ' Orchestre National de France'
+                        ' Leonard Bernstein, conductor'
+                        ' 相关视频：卡拉扬《贝多芬：第五交响曲“命运”》柏林爱乐1982「欧盟版」",'
+                        '"bvid":"BV16P411Y7J1",'
+                        '"owner":{"name":"Rigel口袋音乐"},'
+                        '"stat":{"view":6655},'
+                        '"duration":3340'
+                        '}};</script></html>'
+                    ),
+                )
+            return httpx.Response(404, request=request, text="not found")
+
+    provider = HttpSourceProvider(
+        profile_loader=SourceProfileLoader(root),
+        client=httpx.AsyncClient(transport=NoisyBilibiliTransport(), follow_redirects=True),
+        browser_fetcher=BrowserResultFetcher({}),
+    )
+    draft = DraftRecordingEntry(
+        item_id="bernstein-noisy-bvid",
+        title="Bernstein Fantastique 1977",
+        composer_name="柏辽兹",
+        composer_name_latin="Hector Berlioz",
+        work_title="幻想交响曲",
+        work_title_latin="Symphonie Fantastique",
+        catalogue="Op. 14",
+        performance_date_text="",
+        venue_text="",
+        album_title="",
+        label="",
+        release_date="",
+        notes="",
+        source_line="Berlioz | Symphonie Fantastique | Leonard Bernstein | -",
+        raw_text="Berlioz | Symphonie Fantastique | Leonard Bernstein | -",
+        existing_links=[],
+        primary_names=["Leonard Bernstein"],
+        primary_names_latin=["Leonard Bernstein"],
+        lead_names=["Leonard Bernstein"],
+        lead_names_latin=["Leonard Bernstein"],
+    )
+
+    row = asyncio.run(
+        provider._fetch_page_record(
+            "https://www.bilibili.com/video/BV16P411Y7J1/",
+            "Bilibili Search",
+            "streaming",
+            draft,
+            asyncio.Semaphore(1),
+        )
+    )
+
+    assert row is not None
+    assert row["same_recording_score"] >= 0.9
+    assert row["fields"]["releaseDate"] == ""
+
+
 def test_provider_falls_back_to_search_engine_when_apple_html_is_empty(tmp_path: Path) -> None:
     root = tmp_path / "source-profiles"
     root.mkdir(parents=True)

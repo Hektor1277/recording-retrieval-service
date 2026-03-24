@@ -63,6 +63,28 @@ def compact(value: Any) -> str:
     return str(value or "").strip()
 
 
+def sanitize_bilibili_metadata_text(value: str) -> str:
+    cleaned = compact(value)
+    if not cleaned:
+        return ""
+    markers = [
+        "相关视频",
+        "作者简介",
+        "视频作者",
+        "视频播放量",
+        "弹幕量",
+        "点赞数",
+        "投硬币枚数",
+        "收藏人数",
+        "转发人数",
+    ]
+    cut_points = [cleaned.find(marker) for marker in markers if marker in cleaned]
+    if cut_points:
+        cleaned = cleaned[: min(cut_points)]
+    cleaned = re.sub(r"©\s*\d+\s*,?\s*$", "", cleaned, flags=re.I)
+    return compact(cleaned.strip(" ,;|/-\n"))
+
+
 def materials_root() -> Path:
     return Path(__file__).resolve().parents[2] / "materials" / "source-profiles"
 
@@ -1174,6 +1196,9 @@ class HttpSourceProvider:
                 or compact(bilibili_metadata.get("description"))
             )
             body_text = compact(bilibili_metadata.get("body_text")) or (strip_html(html_text)[:4000] if html_text else "")
+            if platform == "bilibili":
+                description = sanitize_bilibili_metadata_text(description)
+                body_text = sanitize_bilibili_metadata_text(body_text)
             image_url = resolve_image_url(
                 url,
                 extract_meta_content(html_text, "og:image")
@@ -1206,6 +1231,9 @@ class HttpSourceProvider:
                     title = compact(browser_payload.get("title")) or title
                     description = compact(browser_payload.get("description")) or description
                     body_text = compact(browser_payload.get("bodyText")) or body_text
+                    if platform == "bilibili":
+                        description = sanitize_bilibili_metadata_text(description)
+                        body_text = sanitize_bilibili_metadata_text(body_text)
                     image_url = resolve_image_url(url, browser_payload.get("imageUrl") or image_url)
                     uploader = compact(browser_payload.get("uploader")) or uploader
                     canonical_url = canonicalize_bilibili_video_url(
