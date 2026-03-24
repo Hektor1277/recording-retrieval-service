@@ -859,7 +859,7 @@ class RetrievalPipeline:
         ambiguous_upload_cluster = has_ambiguous_upload_cluster(draft, link_candidates)
         if result.links:
             top_link_confidence = max((candidate.confidence or 0) for candidate in result.links)
-            if ambiguous_upload_cluster and not has_explicit_year(draft.performance_date_text):
+            if ambiguous_upload_cluster and is_sparse_upload_query(draft):
                 floor_delta = 0.26
             else:
                 floor_delta = 0.18 if ambiguous_upload_cluster else 0.08
@@ -887,7 +887,7 @@ class RetrievalPipeline:
                     filtered_links = year_matched_links
             if ambiguous_upload_cluster and len(filtered_links) >= 3:
                 best_exactness = max(candidate_title_quality_score(draft, compact(candidate.title)) for candidate in filtered_links)
-                exactness_floor = max(0.05, best_exactness - 0.05)
+                exactness_floor = max(0.03 if is_sparse_upload_query(draft) else 0.05, best_exactness - 0.05)
                 filtered_links = [
                     candidate
                     for candidate in filtered_links
@@ -1281,16 +1281,19 @@ def has_ambiguous_upload_cluster(draft: DraftRecordingEntry, candidates: list[Li
     top_platform = compact(candidates[0].platform)
     if top_platform not in {"youtube", "bilibili"}:
         return False
+    sparse_query = is_sparse_upload_query(draft)
+    confidence_window = 0.25 if sparse_query else 0.2
+    reference_floor = 0.04 if sparse_query else 0.05
     near_top = [
         candidate
         for candidate in candidates
         if compact(candidate.platform) == top_platform
-        and (candidate.confidence or 0.0) >= max(FINAL_LINK_CONFIDENCE_THRESHOLD, top_confidence - 0.2)
+        and (candidate.confidence or 0.0) >= max(FINAL_LINK_CONFIDENCE_THRESHOLD, top_confidence - confidence_window)
     ]
     if len(near_top) < 3:
         return False
     exactness_scores = [candidate_title_quality_score(draft, compact(candidate.title)) for candidate in near_top]
-    reference_hits = sum(1 for score in exactness_scores if score >= 0.05)
+    reference_hits = sum(1 for score in exactness_scores if score >= reference_floor)
     if len(near_top) >= 3 and reference_hits >= 2 and (max(exactness_scores, default=0.0) - min(exactness_scores, default=0.0)) >= 0.05:
         return True
     if len(near_top) >= 4 and reference_hits >= 2:
@@ -1351,6 +1354,19 @@ def should_skip_llm_synthesis(records: list[SourceRecord]) -> bool:
 
 def has_explicit_year(value: str) -> bool:
     return bool(re.search(r"(17|18|19|20)\d{2}", compact(value)))
+
+
+def is_sparse_upload_query(draft: DraftRecordingEntry) -> bool:
+    if has_explicit_year(draft.source_line):
+        return False
+    query_leads = dedupe_preserve_order([*draft.query_lead_names_latin, *draft.query_lead_names])
+    if len(query_leads) > 1:
+        return False
+    if draft.secondary_names or draft.secondary_names_latin:
+        return False
+    if draft.ensemble_names or draft.ensemble_names_latin:
+        return False
+    return True
 
 
 def has_result_value(result: ResultPayload, field: str) -> bool:

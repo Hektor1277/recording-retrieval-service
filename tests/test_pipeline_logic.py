@@ -949,6 +949,106 @@ def test_pipeline_prefers_canonical_exact_upload_for_sparse_heifetz_query() -> N
     assert "https://www.youtube.com/watch?v=XazjX-k2aco" not in final_urls
 
 
+def test_pipeline_keeps_wide_heifetz_upload_cluster_when_exact_titles_remain_close() -> None:
+    class WideHeifetzProvider:
+        async def inspect_existing_links(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_high_quality(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_streaming(self, draft, profile):
+            del draft, profile
+            return [
+                {
+                    "url": "https://www.youtube.com/watch?v=8Aclk_O4bSc",
+                    "source_label": "YouTube Search",
+                    "source_kind": "streaming",
+                    "title": "Beethoven: Violin Concerto (Heifetz/Toscanini 1940)",
+                    "description": "Historic upload",
+                    "platform": "youtube",
+                    "weight": 0.68,
+                    "same_recording_score": 0.97,
+                    "duration_seconds": 2307,
+                    "uploader": "Collector A",
+                    "view_count": 1291,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://www.youtube.com/watch?v=XazjX-k2aco",
+                    "source_label": "YouTube Search",
+                    "source_kind": "streaming",
+                    "title": "ベートーヴェン：ヴァイオリン協奏曲 ニ長調 作品61 ハイフェッツ, トスカニーニ 1940",
+                    "description": "Japanese upload",
+                    "platform": "youtube",
+                    "weight": 0.68,
+                    "same_recording_score": 0.97,
+                    "duration_seconds": 2326,
+                    "uploader": "Collector B",
+                    "view_count": 1467,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://www.youtube.com/watch?v=9YWr1UcbZE8",
+                    "source_label": "YouTube Search",
+                    "source_kind": "streaming",
+                    "title": "Beethoven: Violin Concerto (1940) Heifetz/Toscanini",
+                    "description": "Canonical upload title",
+                    "platform": "youtube",
+                    "weight": 0.68,
+                    "same_recording_score": 0.73,
+                    "duration_seconds": 2315,
+                    "uploader": "Classical Archive",
+                    "view_count": 9645,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://www.youtube.com/watch?v=-rUNkiGgJx8",
+                    "source_label": "YouTube Search",
+                    "source_kind": "streaming",
+                    "title": "Beethoven: Violin Concerto (1940) Heifetz/Toscanini NEW EDITION",
+                    "description": "Remaster upload",
+                    "platform": "youtube",
+                    "weight": 0.68,
+                    "same_recording_score": 0.73,
+                    "duration_seconds": 2316,
+                    "uploader": "Archive C",
+                    "view_count": 357,
+                    "fields": {},
+                    "images": [],
+                },
+            ]
+
+        async def search_fallback(self, draft, profile):
+            del draft, profile
+            return []
+
+    payload = sample_request()
+    payload["items"][0]["workTypeHint"] = "concerto"
+    payload["items"][0]["sourceLine"] = "Ludwig van Beethoven | Violin Concerto in D major, Op. 61 | Jascha Heifetz | - | -"
+    payload["items"][0]["seed"]["title"] = "Heifetz 1940"
+    payload["items"][0]["seed"]["composerNameLatin"] = "Ludwig van Beethoven"
+    payload["items"][0]["seed"]["workTitleLatin"] = "Violin Concerto in D major, Op. 61"
+    payload["items"][0]["seed"]["catalogue"] = "Op.61"
+    payload["items"][0]["seed"]["performanceDateText"] = ""
+    payload["items"][0]["seed"]["credits"] = [
+        {"role": "soloist", "displayName": "Jascha Heifetz", "label": "Jascha Heifetz"},
+    ]
+    request = CreateJobRequest.model_validate(payload)
+    pipeline = RetrievalPipeline(source_provider=WideHeifetzProvider(), llm_client=None)
+
+    result = asyncio.run(pipeline.retrieve(request.items[0]))
+
+    final_urls = [link.url for link in result.result.links]
+    assert "https://www.youtube.com/watch?v=9YWr1UcbZE8" in final_urls
+    assert "https://www.youtube.com/watch?v=-rUNkiGgJx8" not in final_urls
+
+
 def test_pipeline_aclose_closes_source_provider() -> None:
     provider = ClosableSourceProvider()
     pipeline = RetrievalPipeline(source_provider=provider, llm_client=None)
