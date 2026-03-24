@@ -1642,6 +1642,102 @@ def test_provider_ignores_related_video_year_noise_in_bilibili_metadata(tmp_path
     assert row["fields"]["releaseDate"] == ""
 
 
+def test_provider_prefers_bilibili_detail_api_before_html_page_fetch(tmp_path: Path) -> None:
+    root = tmp_path / "source-profiles"
+    root.mkdir(parents=True)
+    (root / "high-quality.txt").write_text("#global\nhttps://catalog.example\n", encoding="utf-8")
+    (root / "streaming.txt").write_text("#global\n[zh] https://www.bilibili.com\n", encoding="utf-8")
+
+    class BilibiliDetailApiTransport(httpx.AsyncBaseTransport):
+        def __init__(self) -> None:
+            self.urls: list[str] = []
+
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            self.urls.append(url)
+            if url.rstrip("/") == "https://www.bilibili.com":
+                return httpx.Response(200, request=request, text="home")
+            if "api.bilibili.com/x/web-interface/view" in url and "BV1TE411f7uh" in url:
+                return httpx.Response(
+                    200,
+                    request=request,
+                    json={
+                        "code": 0,
+                        "data": {
+                            "bvid": "BV1TE411f7uh",
+                            "title": "【安妮·费舍尔】舒曼钢协现场视频 Annie Fischer plays Schumann Piano Concerto Op. 54",
+                            "desc": "Annie Fischer Budapest Philharmonic Orchestra Kletzki",
+                            "pic": "https://i0.hdslb.com/demo.jpg",
+                            "duration": 2017,
+                            "owner": {"name": "艾斯路票"},
+                            "stat": {"view": 1748},
+                            "pages": [
+                                {"part": "I. Allegro affettuoso"},
+                                {"part": "II. Intermezzo"},
+                                {"part": "III. Allegro vivace"},
+                            ],
+                        },
+                    },
+                )
+            if "www.bilibili.com/video/BV1TE411f7uh" in url:
+                return httpx.Response(500, request=request, text="html should not be required")
+            return httpx.Response(404, request=request, text="not found")
+
+    transport = BilibiliDetailApiTransport()
+    provider = HttpSourceProvider(
+        profile_loader=SourceProfileLoader(root),
+        client=httpx.AsyncClient(transport=transport, follow_redirects=True),
+        browser_fetcher=BrowserResultFetcher({}),
+        platform_search_config=PlatformSearchConfig(
+            bilibili=BilibiliSearchConfig(enabled=True, user_agent="UA/1.0"),
+        ),
+    )
+    draft = DraftRecordingEntry(
+        item_id="annie-detail-api",
+        title="Annie Fischer & Kletzki",
+        composer_name="舒曼",
+        composer_name_latin="Robert Schumann",
+        work_title="a小调钢琴协奏曲",
+        work_title_latin="Piano Concerto, Op.54",
+        catalogue="Op.54",
+        performance_date_text="",
+        venue_text="",
+        album_title="",
+        label="",
+        release_date="",
+        notes="",
+        source_line="Robert Schumann | Piano Concerto in A Minor, Op.54 | Annie Fischer | Kletzki | Budapest Philharmonic Orchestra | -",
+        raw_text="Robert Schumann | Piano Concerto in A Minor, Op.54 | Annie Fischer | Kletzki | Budapest Philharmonic Orchestra | -",
+        existing_links=[],
+        primary_names=["Annie Fischer"],
+        primary_names_latin=["Annie Fischer"],
+        secondary_names=["Kletzki"],
+        secondary_names_latin=["Kletzki"],
+        lead_names=["Annie Fischer", "Kletzki"],
+        lead_names_latin=["Annie Fischer", "Kletzki"],
+        ensemble_names=["Budapest Philharmonic Orchestra"],
+        ensemble_names_latin=["Budapest Philharmonic Orchestra"],
+    )
+
+    row = asyncio.run(
+        provider._fetch_page_record(
+            "https://www.bilibili.com/video/BV1TE411f7uh/",
+            "Bilibili API Search",
+            "streaming",
+            draft,
+            asyncio.Semaphore(1),
+        )
+    )
+
+    assert row is not None
+    assert row["uploader"] == "艾斯路票"
+    assert row["duration_seconds"] == 2017
+    assert row["view_count"] == 1748
+    assert row["same_recording_score"] >= 0.6
+    assert any("api.bilibili.com/x/web-interface/view" in url for url in transport.urls)
+    assert not any("www.bilibili.com/video/BV1TE411f7uh" in url for url in transport.urls)
+
+
 def test_provider_falls_back_to_search_engine_when_apple_html_is_empty(tmp_path: Path) -> None:
     root = tmp_path / "source-profiles"
     root.mkdir(parents=True)

@@ -17,6 +17,19 @@ class ApiSearchResult:
     links: list[str]
 
 
+@dataclass(slots=True)
+class BilibiliVideoDetail:
+    endpoint_url: str
+    title: str
+    description: str
+    image_url: str
+    uploader: str
+    bvid: str
+    duration_seconds: int
+    view_count: int
+    page_parts: list[str]
+
+
 WBI_MIXIN_KEY_INDEX = [
     46,
     47,
@@ -193,6 +206,47 @@ class PlatformSearchClients:
             if url:
                 links.append(url)
         return ApiSearchResult(endpoint_url=str(response.request.url), links=links)
+
+    async def fetch_bilibili_video_detail(self, url: str) -> BilibiliVideoDetail | None:
+        bvid_match = re.search(r"/(BV[0-9A-Za-z]+)/?", url, re.I)
+        aid_match = re.search(r"/av(\d+)/?", url, re.I)
+        if not bvid_match and not aid_match:
+            return None
+        await self._seed_bilibili_session()
+        endpoint = "https://api.bilibili.com/x/web-interface/view"
+        params: dict[str, str] = {}
+        if bvid_match:
+            params["bvid"] = bvid_match.group(1)
+        elif aid_match:
+            params["aid"] = aid_match.group(1)
+        response = await self._client.get(
+            endpoint,
+            params=params,
+            headers=self._bilibili_headers(),
+        )
+        response.raise_for_status()
+        payload = response.json()
+        code = int(payload.get("code") or 0)
+        if code != 0:
+            message = str(payload.get("message") or payload.get("msg") or "unknown error").strip()
+            raise RuntimeError(f"Bilibili view detail failed with code {code}: {message}")
+        data = payload.get("data") or {}
+        if not isinstance(data, dict):
+            return None
+        owner = data.get("owner") if isinstance(data.get("owner"), dict) else {}
+        stat = data.get("stat") if isinstance(data.get("stat"), dict) else {}
+        pages = data.get("pages") if isinstance(data.get("pages"), list) else []
+        return BilibiliVideoDetail(
+            endpoint_url=str(response.request.url),
+            title=str(data.get("title") or "").strip(),
+            description=str(data.get("desc") or "").strip(),
+            image_url=str(data.get("pic") or "").strip(),
+            uploader=str(owner.get("name") or "").strip(),
+            bvid=str(data.get("bvid") or params.get("bvid") or "").strip(),
+            duration_seconds=int(data.get("duration") or 0),
+            view_count=int(stat.get("view") or 0),
+            page_parts=[str(page.get("part") or "").strip() for page in pages if isinstance(page, dict)],
+        )
 
     def _bilibili_headers(self) -> dict[str, str]:
         headers = {

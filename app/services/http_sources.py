@@ -16,7 +16,7 @@ from urllib.parse import quote_plus, urljoin, urlparse
 import httpx
 
 from app.services.browser_fetcher import BrowserFetchUnavailable, PlaywrightBrowserFetcher
-from app.services.platform_clients import PlatformSearchClients
+from app.services.platform_clients import BilibiliVideoDetail, PlatformSearchClients
 from app.services.platform_search_config import PlatformSearchConfig, load_platform_search_config
 from app.services.pipeline import (
     DraftRecordingEntry,
@@ -88,6 +88,21 @@ def sanitize_bilibili_metadata_text(value: str) -> str:
 
 def materials_root() -> Path:
     return Path(__file__).resolve().parents[2] / "materials" / "source-profiles"
+
+
+def build_bilibili_metadata_from_detail(detail: BilibiliVideoDetail) -> dict[str, Any]:
+    parts = " ".join(compact(part) for part in detail.page_parts[:4] if compact(part))
+    description = compact(detail.description)
+    return {
+        "title": compact(detail.title),
+        "description": description,
+        "body_text": compact(" ".join(part for part in [compact(detail.title), compact(detail.uploader), parts] if part)),
+        "image_url": compact(detail.image_url),
+        "uploader": compact(detail.uploader),
+        "bvid": compact(detail.bvid),
+        "duration_seconds": int(detail.duration_seconds or 0),
+        "view_count": int(detail.view_count or 0),
+    }
 
 
 class HttpSourceProvider:
@@ -1166,34 +1181,77 @@ class HttpSourceProvider:
         async with semaphore:
             platform = detect_platform(url)
             html_text = ""
+            bilibili_metadata: dict[str, Any] = {}
             duration_seconds = 0
             uploader = ""
             view_count = 0
-            started = time.perf_counter()
             fetch_timeout = self._recommended_timeout_seconds(urlparse(url).netloc.lower(), 6.0)
-            try:
-                html_text = await self._fetch_text(
-                    url,
-                    operation="fetch-page",
-                    source_kind=source_kind,
-                    source_label=source_label,
-                    timeout_seconds=fetch_timeout,
-                )
-            except Exception as error:
-                self._warn(f"{normalize_host(url)} 访问失败：{error}")
-                self._record_access_event(
-                    url=url,
-                    operation="fetch-page",
-                    ok=False,
-                    duration_ms=(time.perf_counter() - started) * 1000,
-                    source_kind=source_kind,
-                    source_label=source_label,
-                    error=str(error),
-                    timeout_seconds=fetch_timeout,
-                )
-                html_text = ""
+            if platform == "bilibili" and self._can_use_bilibili_api() and not self._is_platform_api_disabled("Bilibili Detail API"):
+                detail_started = time.perf_counter()
+                try:
+                    detail = await self._platform_clients().fetch_bilibili_video_detail(url)
+                except Exception as error:
+                    if should_disable_platform_api(error):
+                        self._disable_platform_api("Bilibili Detail API")
+                    self._warn(f"Bilibili Detail API 获取失败：{error}")
+                    self._record_access_event(
+                        url=url,
+                        operation="detail-api-fetch",
+                        ok=False,
+                        duration_ms=(time.perf_counter() - detail_started) * 1000,
+                        source_kind=source_kind,
+                        source_label="Bilibili Detail API",
+                        error=str(error),
+                    )
+                else:
+                    if detail is not None:
+                        bilibili_metadata = build_bilibili_metadata_from_detail(detail)
+                    self._record_access_event(
+                        url=detail.endpoint_url if detail is not None else url,
+                        operation="detail-api-fetch",
+                        ok=True,
+                        duration_ms=(time.perf_counter() - detail_started) * 1000,
+                        source_kind=source_kind,
+                        source_label="Bilibili Detail API",
+                    )
 
-            bilibili_metadata = extract_bilibili_structured_metadata(html_text) if platform == "bilibili" else {}
+            detail_ready = platform == "bilibili" and not metadata_is_insufficient(
+                compact(bilibili_metadata.get("title")),
+                compact(bilibili_metadata.get("description")),
+                compact(bilibili_metadata.get("body_text")),
+            ) and int(bilibili_metadata.get("duration_seconds", 0) or 0) > 0 and int(
+                bilibili_metadata.get("view_count", 0) or 0
+            ) > 0 and compact(bilibili_metadata.get("uploader"))
+
+            if not detail_ready:
+                started = time.perf_counter()
+                try:
+                    html_text = await self._fetch_text(
+                        url,
+                        operation="fetch-page",
+                        source_kind=source_kind,
+                        source_label=source_label,
+                        timeout_seconds=fetch_timeout,
+                    )
+                except Exception as error:
+                    self._warn(f"{normalize_host(url)} 访问失败：{error}")
+                    self._record_access_event(
+                        url=url,
+                        operation="fetch-page",
+                        ok=False,
+                        duration_ms=(time.perf_counter() - started) * 1000,
+                        source_kind=source_kind,
+                        source_label=source_label,
+                        error=str(error),
+                        timeout_seconds=fetch_timeout,
+                    )
+                    html_text = ""
+
+                if platform == "bilibili" and html_text:
+                    html_bilibili_metadata = extract_bilibili_structured_metadata(html_text)
+                    for key, value in html_bilibili_metadata.items():
+                        if not compact(bilibili_metadata.get(key)):
+                            bilibili_metadata[key] = value
             title = strip_html(
                 extract_meta_content(html_text, "og:title")
                 or compact(bilibili_metadata.get("title"))
