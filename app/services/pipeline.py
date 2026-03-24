@@ -909,7 +909,7 @@ class RetrievalPipeline:
                 record_map,
             )[:2]
         if not result.links and link_candidates:
-            dominant = pick_dominant_link_candidate(sort_link_candidates(draft, link_candidates, record_map))
+            dominant = pick_dominant_link_candidate(draft, sort_link_candidates(draft, link_candidates, record_map))
             if dominant is not None:
                 result.links = [dominant]
         if not result.images and image_candidates and accepted_url_set:
@@ -1066,7 +1066,7 @@ def pick_final_candidate(candidates: list[FieldCandidate]) -> FieldCandidate | N
     return None
 
 
-def pick_dominant_link_candidate(candidates: list[LinkCandidate]) -> LinkCandidate | None:
+def pick_dominant_link_candidate(draft: DraftRecordingEntry, candidates: list[LinkCandidate]) -> LinkCandidate | None:
     if not candidates:
         return None
     ordered = sorted(candidates, key=lambda candidate: candidate.confidence or 0.0, reverse=True)
@@ -1076,7 +1076,15 @@ def pick_dominant_link_candidate(candidates: list[LinkCandidate]) -> LinkCandida
     is_known_platform = compact(top.platform) in {"youtube", "bilibili", "apple_music", "spotify", "qobuz"}
     if top_confidence >= 0.58:
         return top
+    top_exactness = candidate_title_quality_score(draft, compact(top.title))
+    runner_up_exactness = (
+        max(candidate_title_quality_score(draft, compact(candidate.title)) for candidate in ordered[1:])
+        if len(ordered) > 1
+        else -0.05
+    )
     if top_confidence >= 0.5 and is_known_platform and top_confidence - runner_up_confidence >= 0.08:
+        return top
+    if top_confidence >= 0.5 and is_known_platform and top_exactness >= 0.1 and top_exactness - runner_up_exactness >= 0.03:
         return top
     if top_confidence >= 0.5 and is_known_platform and len(ordered) == 1:
         return top

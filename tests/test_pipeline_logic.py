@@ -1159,3 +1159,82 @@ def test_pipeline_keeps_exact_karajan_upload_among_close_year_matched_ties() -> 
     final_urls = [link.url for link in result.result.links]
     assert "https://www.youtube.com/watch?v=fDi1PSz8mRE" in final_urls
     assert "https://www.youtube.com/watch?v=oPpGxrUHLO4" not in final_urls
+
+
+def test_pipeline_promotes_exact_annie_upload_from_candidate_only_tie() -> None:
+    class AnnieTieProvider:
+        async def inspect_existing_links(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_high_quality(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_streaming(self, draft, profile):
+            del draft, profile
+            return [
+                {
+                    "url": "https://www.youtube.com/watch?v=wkMQ1q4V4Vs",
+                    "source_label": "YouTube Search",
+                    "source_kind": "streaming",
+                    "title": "Robert Schumann Piano Concerto in A minor, Op.54 Annie Fischer Paul Kletzki Budapest Philharmonic Orchestra",
+                    "description": "Exact collaborator set.",
+                    "platform": "youtube",
+                    "weight": 0.68,
+                    "same_recording_score": 0.51,
+                    "duration_seconds": 1904,
+                    "uploader": "Archive",
+                    "view_count": 4200,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://www.youtube.com/watch?v=crIta1ClQeo",
+                    "source_label": "YouTube Search",
+                    "source_kind": "streaming",
+                    "title": "Schumann: Piano Concerto in A minor, Op.54 Annie Fischer / Otto Klemperer",
+                    "description": "Wrong collaborator but similar confidence.",
+                    "platform": "youtube",
+                    "weight": 0.68,
+                    "same_recording_score": 0.49,
+                    "duration_seconds": 1876,
+                    "uploader": "Archive",
+                    "view_count": 3900,
+                    "fields": {},
+                    "images": [],
+                },
+            ]
+
+        async def search_fallback(self, draft, profile):
+            del draft, profile
+            return []
+
+    payload = sample_request()
+    payload["items"][0]["workTypeHint"] = "concerto"
+    payload["items"][0]["sourceLine"] = (
+        "Robert Schumann | Piano Concerto in A minor, Op.54 | Annie Fischer | Kletzki | Budapest Philharmonic Orchestra | -"
+    )
+    payload["items"][0]["seed"]["title"] = "Annie Fischer"
+    payload["items"][0]["seed"]["composerName"] = "舒曼"
+    payload["items"][0]["seed"]["composerNameLatin"] = "Robert Schumann"
+    payload["items"][0]["seed"]["workTitle"] = "a小调钢琴协奏曲"
+    payload["items"][0]["seed"]["workTitleLatin"] = "Piano Concerto in A minor, Op.54"
+    payload["items"][0]["seed"]["catalogue"] = "Op.54"
+    payload["items"][0]["seed"]["performanceDateText"] = ""
+    payload["items"][0]["seed"]["credits"] = [
+        {"role": "soloist", "displayName": "Annie Fischer", "label": "Annie Fischer"},
+        {"role": "conductor", "displayName": "Kletzki", "label": "Kletzki"},
+        {
+            "role": "orchestra",
+            "displayName": "Budapest Philharmonic Orchestra",
+            "label": "Budapest Philharmonic Orchestra",
+        },
+    ]
+    request = CreateJobRequest.model_validate(payload)
+    pipeline = RetrievalPipeline(source_provider=AnnieTieProvider(), llm_client=None)
+
+    result = asyncio.run(pipeline.retrieve(request.items[0]))
+
+    assert result.result.links
+    assert result.result.links[0].url == "https://www.youtube.com/watch?v=wkMQ1q4V4Vs"

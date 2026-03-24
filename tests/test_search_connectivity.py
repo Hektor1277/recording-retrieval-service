@@ -11,7 +11,9 @@ from app.services.http_sources import (
     build_work_aliases,
     extract_bing_result_links,
     looks_like_single_movement,
+    name_matches,
     normalize_host,
+    normalize_text,
     score_recording_match,
 )
 from app.services.pipeline import DraftRecordingEntry, RetrievalProfile
@@ -175,6 +177,27 @@ class DeepResultYouTubeTransport(httpx.AsyncBaseTransport):
             f'{{"videoRenderer":{{"videoId":"deep{i:02d}","title":{{"runs":[{{"text":"deep {i}"}}]}}}}}}'
             for i in range(1, 5)
         )
+        return httpx.Response(200, request=request, text=text)
+
+
+class QueryCoverageYouTubeTransport(httpx.AsyncBaseTransport):
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if "youtube.com/results" not in url:
+            return httpx.Response(404, request=request, text="not found")
+        if "generic-one" in url:
+            text = "".join(
+                f'{{"videoRenderer":{{"videoId":"generica{i:02d}","title":{{"runs":[{{"text":"generic a {i}"}}]}}}}}}'
+                for i in range(1, 13)
+            )
+            return httpx.Response(200, request=request, text=text)
+        if "generic-two" in url:
+            text = "".join(
+                f'{{"videoRenderer":{{"videoId":"genericb{i:02d}","title":{{"runs":[{{"text":"generic b {i}"}}]}}}}}}'
+                for i in range(1, 13)
+            )
+            return httpx.Response(200, request=request, text=text)
+        text = '{"videoRenderer":{"videoId":"alias-hit-01","title":{"runs":[{"text":"alias hit"}]}}}'
         return httpx.Response(200, request=request, text=text)
 
 
@@ -831,6 +854,19 @@ def test_youtube_search_reads_deeper_results_beyond_first_four_links_per_query(t
     rows = asyncio.run(provider._search_youtube(["deep query"]))
 
     assert any(row["url"] == "https://www.youtube.com/watch?v=deep04" for row in rows)
+
+
+def test_youtube_search_keeps_top_result_from_later_alias_query_even_when_earlier_queries_fill_budget(tmp_path: Path) -> None:
+    root = tmp_path / "source-profiles"
+    root.mkdir(parents=True)
+    (root / "high-quality.txt").write_text("#global\nhttps://catalog.example\n", encoding="utf-8")
+    (root / "streaming.txt").write_text("#global\nhttps://www.youtube.com\n", encoding="utf-8")
+    client = httpx.AsyncClient(transport=QueryCoverageYouTubeTransport(), follow_redirects=True)
+    provider = HttpSourceProvider(profile_loader=SourceProfileLoader(root), client=client)
+
+    rows = asyncio.run(provider._search_youtube(["generic one", "generic two", "alias query"]))
+
+    assert any(row["url"] == "https://www.youtube.com/watch?v=alias-hit-01" for row in rows)
 
 
 def test_search_streaming_hydrates_more_than_first_four_rows_from_successful_host(tmp_path: Path) -> None:
@@ -1731,6 +1767,21 @@ def test_looks_like_single_movement_ignores_complete_tracklist_descriptions() ->
     assert looks_like_single_movement(text) is False
 
 
+def test_looks_like_single_movement_detects_hyphen_numbered_heading() -> None:
+    text = "Schumann: Piano Concerto in A Minor, Op.54 - 1. Allegro affettuoso"
+
+    assert looks_like_single_movement(text) is True
+
+
+def test_name_matches_does_not_treat_movement_word_as_person_initials() -> None:
+    haystack = normalize_text(
+        "Robert Schumann - Piano concerto in A minor, Op.54 I: Allegro affettuoso "
+        "II: Intermezzo (Andantino grazioso) III: Allegro Vivace"
+    )
+
+    assert name_matches(haystack, "Annie Fischer") is False
+
+
 def test_provider_uses_chinese_queries_only_for_chinese_platforms_and_expands_abbreviations(tmp_path: Path) -> None:
     root = tmp_path / "source-profiles"
     root.mkdir(parents=True)
@@ -2063,6 +2114,44 @@ def test_score_recording_match_accepts_german_keyed_concerto_alias_from_clean_ch
 
     assert exact_like > wrong_collaborator
     assert exact_like >= 0.4
+
+
+def test_score_recording_match_penalizes_explicit_wrong_collaborator_even_when_title_is_rich() -> None:
+    draft = DraftRecordingEntry(
+        item_id="recording-concerto-2c-klemperer",
+        title="Annie Fischer & Kletzki",
+        composer_name="舒曼",
+        composer_name_latin="Robert Schumann",
+        work_title="a小调钢琴协奏曲",
+        work_title_latin="Piano Concerto, Op.54",
+        catalogue="Op.54",
+        performance_date_text="",
+        venue_text="",
+        album_title="",
+        label="",
+        release_date="",
+        notes="",
+        source_line="",
+        raw_text="",
+        existing_links=[],
+        lead_names=["Annie Fischer", "Paul Kletzki"],
+        lead_names_latin=["Annie Fischer", "Paul Kletzki"],
+        ensemble_names=["Budapest Philharmonic Orchestra"],
+        ensemble_names_latin=["Budapest Philharmonic Orchestra"],
+    )
+
+    exact_like = score_recording_match(
+        "Annie Fischer plays Schumann: Klavierkonzert a-minor video! full!",
+        "https://www.youtube.com/watch?v=wkMQ1q4V4Vs",
+        draft,
+    )
+    wrong_collaborator = score_recording_match(
+        "SCHUMANN - Concerto Piano A minor op. 54 - Annie Fischer - PHILHARMONIA Orch. , Otto Klemperer 1963",
+        "https://www.youtube.com/watch?v=crIta1ClQeo",
+        draft,
+    )
+
+    assert exact_like > wrong_collaborator
 
 
 def test_score_recording_match_accepts_violin_concerto_alias_when_only_soloist_is_visible() -> None:

@@ -1766,6 +1766,8 @@ def score_recording_match(
             if sparse_collaboration_hint and has_collaboration_marker(text) and work_matched and lead_hits >= 1:
                 penalty *= 0.15
             score -= penalty
+        elif has_explicit_collaborator_marker(text):
+            score -= 0.18 * (len(lead_slots) - lead_hits)
     if len(lead_slots) >= 2 and not draft.ensemble_names and not draft.ensemble_names_latin:
         if lead_hits == len(lead_slots):
             score += 0.18
@@ -1905,8 +1907,10 @@ def name_matches(haystack: str, value: str) -> bool:
     if len(surname) >= 4 and surname in haystack:
         return True
     initials = "".join(token[0] for token in tokens if token)
-    if len(initials) >= 2 and initials.lower() in haystack.replace(".", "").replace(" ", ""):
-        return True
+    if len(initials) >= 2:
+        initials_pattern = r"\b" + r"[\.\s]+".join(re.escape(char.lower()) for char in initials) + r"\.?\b"
+        if re.search(initials_pattern, haystack, re.I):
+            return True
     return False
 
 
@@ -1968,6 +1972,11 @@ def has_sparse_title_duo_separator(value: str) -> bool:
         return False
     segments = [segment.strip() for segment in normalized.split(" - ") if compact(segment)]
     return len(segments) >= 2
+
+
+def has_explicit_collaborator_marker(value: str) -> bool:
+    normalized = compact(value).lower()
+    return has_collaboration_marker(normalized) or " - " in normalized or ", " in normalized
 
 
 def build_acronym(tokens: list[str]) -> str:
@@ -2274,7 +2283,7 @@ def looks_like_single_movement(value: str) -> bool:
     }
     arabic_markers = {
         marker
-        for marker in re.findall(r"(?:^|[\s(\\-])([1-9])\.\s", lowered, re.I)
+        for marker in re.findall(r"(?:^|[\s(:\-–—])([1-9])\.\s", lowered, re.I)
     }
     numbered_markers = {
         marker
@@ -2297,6 +2306,8 @@ def looks_like_single_movement(value: str) -> bool:
         return False
     if movement_heading_count >= 1 and re.search(r"\b(full|complete)\b", lowered, re.I):
         return False
+    if movement_heading_count >= 1 and distinct_movement_terms >= 1:
+        return True
 
     patterns = [
         r":\s*i\.\s",
