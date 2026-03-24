@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import time
 from pathlib import Path
+from urllib.parse import quote_plus
 
 import httpx
 
@@ -11,6 +12,7 @@ from app.services.http_sources import (
     build_work_aliases,
     extract_bing_result_links,
     looks_like_single_movement,
+    merge_streaming_host_rows,
     name_matches,
     normalize_host,
     normalize_text,
@@ -23,7 +25,7 @@ from app.services.platform_search_config import (
     PlatformSearchConfig,
     YouTubeSearchConfig,
 )
-from app.services.source_profiles import OrchestraAliasLoader, SourceProfileLoader
+from app.services.source_profiles import OrchestraAliasLoader, SourceProfileEntry, SourceProfileLoader
 from app.services.source_profiles import PersonAliasLoader
 
 
@@ -1850,6 +1852,136 @@ def test_search_streaming_expands_hydration_window_when_initial_slice_has_no_pro
     assert len(provider.hydration_windows) >= 2
     assert len(provider.hydration_windows[0]) == 12
     assert len(provider.hydration_windows[-1]) > 12
+
+
+def test_bilibili_browser_search_keeps_later_query_hit_even_when_first_query_fills_budget() -> None:
+    browser_fetcher = BrowserResultFetcher(
+        {
+            "https://search.bilibili.com/all?keyword=generic+one": [
+                f"https://www.bilibili.com/video/BV1generic{i:02d}/" for i in range(1, 11)
+            ],
+            "https://search.bilibili.com/all?keyword=target+two": [
+                "https://www.bilibili.com/video/BV1targethit1/",
+            ],
+        }
+    )
+    provider = HttpSourceProvider(browser_fetcher=browser_fetcher)
+
+    rows = asyncio.run(
+        provider._search_platform_via_browser_pages(
+            queries=["generic one", "target two"],
+            url_builders=[lambda query: f"https://search.bilibili.com/all?keyword={quote_plus(query)}"],
+            source_label="Bilibili Search",
+            url_patterns=[r"https://www\.bilibili\.com/video/(?:BV[0-9A-Za-z]+|av\d+)/?"],
+        )
+    )
+
+    assert any(row["url"] == "https://www.bilibili.com/video/BV1targethit1/" for row in rows)
+
+
+def test_search_bilibili_keeps_browser_coverage_when_api_rows_fill_budget() -> None:
+    class BilibiliMergeCoverageProvider(HttpSourceProvider):
+        async def _search_streaming_platform(self, **kwargs):
+            del kwargs
+            return [
+                {
+                    "url": f"https://www.bilibili.com/video/BV1api{i:02d}/",
+                    "source_label": "Bilibili API Search",
+                    "source_kind": "streaming",
+                }
+                for i in range(1, 15)
+            ]
+
+        async def _search_platform_via_browser_pages(self, **kwargs):
+            del kwargs
+            return [
+                {
+                    "url": "https://www.bilibili.com/video/BV1browserhit1/",
+                    "source_label": "Bilibili Search Browser Search",
+                    "source_kind": "streaming",
+                },
+                {
+                    "url": "https://www.bilibili.com/video/BV1browserhit2/",
+                    "source_label": "Bilibili Search Browser Search",
+                    "source_kind": "streaming",
+                },
+            ]
+
+        async def _search_platform_via_site_engines(self, *args, **kwargs):
+            del args, kwargs
+            return []
+
+    provider = BilibiliMergeCoverageProvider(browser_fetcher=BrowserResultFetcher({}))
+
+    rows = asyncio.run(provider._search_bilibili(["generic one", "target two"]))
+
+    urls = [row["url"] for row in rows]
+    assert "https://www.bilibili.com/video/BV1browserhit1/" in urls
+
+
+def test_search_bilibili_samples_precise_browser_queries_beyond_first_three() -> None:
+    class BilibiliBrowserQuerySelectionProvider(HttpSourceProvider):
+        def __init__(self) -> None:
+            super().__init__(browser_fetcher=BrowserResultFetcher({}))
+            self.browser_queries: list[str] = []
+
+        async def _search_streaming_platform(self, **kwargs):
+            del kwargs
+            return []
+
+        async def _search_platform_via_browser_pages(self, **kwargs):
+            self.browser_queries = list(kwargs["queries"])
+            return []
+
+        async def _search_platform_via_site_engines(self, *args, **kwargs):
+            del args, kwargs
+            return []
+
+    provider = BilibiliBrowserQuerySelectionProvider()
+    queries = [
+        "q1 generic",
+        "q2 generic",
+        "q3 generic",
+        "q4 medium specificity",
+        "q5 ensemble date exact",
+        "q6 exact latin query",
+        "q7 longer exact latin query",
+        "q8 final exact latin query",
+    ]
+
+    asyncio.run(provider._search_bilibili(queries))
+
+    assert len(provider.browser_queries) > 3
+    assert "q8 final exact latin query" in provider.browser_queries
+
+
+def test_merge_streaming_host_rows_preserves_deeper_bilibili_slice_when_multiple_hosts() -> None:
+    bilibili_rows = [
+        {
+            "url": f"https://www.bilibili.com/video/BV1row{i:02d}/",
+            "source_label": "Bilibili Search",
+            "source_kind": "streaming",
+        }
+        for i in range(1, 7)
+    ]
+    youtube_rows = [
+        {
+            "url": f"https://www.youtube.com/watch?v=yt{i:02d}",
+            "source_label": "YouTube Search",
+            "source_kind": "streaming",
+        }
+        for i in range(1, 3)
+    ]
+
+    merged = merge_streaming_host_rows(
+        [
+            (SourceProfileEntry(url="https://www.bilibili.com", is_chinese=True), bilibili_rows),
+            (SourceProfileEntry(url="https://www.youtube.com", is_chinese=False), youtube_rows),
+        ]
+    )
+
+    urls = [row["url"] for row in merged]
+    assert "https://www.bilibili.com/video/BV1row06/" in urls
 
 
 def test_looks_like_single_movement_ignores_complete_tracklist_descriptions() -> None:

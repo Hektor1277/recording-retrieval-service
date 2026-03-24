@@ -632,6 +632,7 @@ class HttpSourceProvider:
             lambda query: f"https://search.bilibili.com/all?keyword={quote_plus(query)}",
             lambda query: f"https://search.bilibili.com/video?keyword={quote_plus(query)}",
         ]
+        browser_queries = select_bilibili_browser_queries(prioritized_queries)
         rows = await self._search_streaming_platform(
             queries=prioritized_queries[:html_query_depth],
             url_builders=builders,
@@ -641,7 +642,7 @@ class HttpSourceProvider:
             api_source_label="Bilibili API Search",
         )
         browser_rows = await self._search_platform_via_browser_pages(
-            queries=prioritized_queries[: min(3, html_query_depth)],
+            queries=browser_queries,
             url_builders=builders,
             source_label="Bilibili Search",
             url_patterns=[r"https://www\.bilibili\.com/video/(?:BV[0-9A-Za-z]+|av\d+)/?"],
@@ -651,7 +652,7 @@ class HttpSourceProvider:
             site_hosts=["www.bilibili.com", "m.bilibili.com", "b23.tv"],
             source_label="Bilibili Search",
         )
-        return dedupe_rows([*rows, *browser_rows, *engine_rows])[:HYDRATE_DEPTH]
+        return merge_bilibili_search_rows(rows, browser_rows, engine_rows)
 
     async def _search_apple_music(self, queries: list[str]) -> list[dict[str, str]]:
         rows = await self._search_streaming_platform(
@@ -858,10 +859,65 @@ class HttpSourceProvider:
         sample_url = url_builders[0](queries[0])
         host = urlparse(sample_url).netloc.lower()
         lowered_label = compact(source_label).lower()
-        query_depth = 2 if "bilibili" in lowered_label else 1
+        bilibili_search = "bilibili" in lowered_label
+        query_depth = len(queries) if bilibili_search else 1
         result_depth = min(HYDRATE_DEPTH, self._recommended_result_depth(host, STREAMING_RESULT_DEPTH) + 2)
+        if bilibili_search:
+            query_rows_list: list[list[dict[str, str]]] = []
+            for query in queries[:query_depth]:
+                query_rows: list[dict[str, str]] = []
+                for build_url in url_builders[:2]:
+                    search_url = build_url(query)
+                    started = time.perf_counter()
+                    try:
+                        links = await self._browser_fetcher.fetch_links(
+                            search_url,
+                            url_patterns=url_patterns,
+                            timeout_seconds=min(
+                                4.0,
+                                self._recommended_timeout_seconds(urlparse(search_url).netloc.lower(), 4.0),
+                            ),
+                        )
+                    except (AttributeError, BrowserFetchUnavailable, RuntimeError, TimeoutError) as error:
+                        self._warn(f"{source_label} 浏览器搜索回退失败: {error}")
+                        self._record_access_event(
+                            url=search_url,
+                            operation="browser-search",
+                            ok=False,
+                            duration_ms=(time.perf_counter() - started) * 1000,
+                            source_kind="streaming",
+                            source_label=f"{source_label} Browser Search",
+                            query=query,
+                            error=str(error),
+                        )
+                        continue
+                    self._record_access_event(
+                        url=search_url,
+                        operation="browser-search",
+                        ok=True,
+                        duration_ms=(time.perf_counter() - started) * 1000,
+                        source_kind="streaming",
+                        source_label=f"{source_label} Browser Search",
+                        query=query,
+                        result_count=len(links[:result_depth]),
+                    )
+                    query_rows.extend(
+                        {
+                            "url": link,
+                            "source_label": f"{source_label} Browser Search",
+                            "source_kind": "streaming",
+                        }
+                        for link in links[:result_depth]
+                    )
+                    query_rows = dedupe_rows(query_rows)
+                    if links:
+                        break
+                if query_rows:
+                    query_rows_list.append(query_rows[:result_depth])
+            return merge_bilibili_browser_query_rows(query_rows_list, result_depth=result_depth)
+
         for query in queries[:query_depth]:
-            builders_to_use = url_builders[:2] if "bilibili" in lowered_label else url_builders[:1]
+            builders_to_use = url_builders[:1]
             for build_url in builders_to_use:
                 search_url = build_url(query)
                 started = time.perf_counter()
@@ -1482,11 +1538,69 @@ def merge_streaming_host_rows(
         elif "youtube.com" in normalized_host or "youtu.be" in normalized_host:
             per_host_cap = 10
         elif "bilibili.com" in normalized_host or "b23.tv" in normalized_host:
-            per_host_cap = 4
+            per_host_cap = 6
         else:
             per_host_cap = 4
         all_rows.extend(rows[:per_host_cap])
     return dedupe_rows([*coverage_rows, *all_rows])
+
+
+def merge_bilibili_search_rows(
+    api_rows: list[dict[str, str]],
+    browser_rows: list[dict[str, str]],
+    engine_rows: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    return dedupe_rows([*browser_rows, *api_rows, *engine_rows])[:HYDRATE_DEPTH]
+
+
+def merge_bilibili_browser_query_rows(
+    query_rows_list: list[list[dict[str, str]]],
+    *,
+    result_depth: int,
+) -> list[dict[str, str]]:
+    coverage_rows: list[dict[str, str]] = []
+    all_rows: list[dict[str, str]] = []
+    for rows in query_rows_list:
+        coverage_rows.extend(rows[:3])
+        all_rows.extend(rows)
+    return dedupe_rows([*coverage_rows, *all_rows])[:result_depth]
+
+
+def bilibili_query_specificity(query: str) -> tuple[int, int, int]:
+    normalized = compact(query)
+    return (
+        sum(character.isdigit() for character in normalized),
+        len(normalized.split()),
+        len(normalized),
+    )
+
+
+def select_bilibili_browser_queries(queries: list[str], *, max_queries: int = 5) -> list[str]:
+    candidates = dedupe_text([compact(query) for query in queries if compact(query)])
+    if len(candidates) <= max_queries:
+        return candidates
+    if max_queries <= 0:
+        return []
+
+    head_count = min(2, len(candidates), max_queries)
+    selected_indices: set[int] = set(range(head_count))
+
+    tail_capacity = max_queries - len(selected_indices)
+    tail_count = min(2, tail_capacity, max(0, len(candidates) - head_count))
+    if tail_count:
+        selected_indices.update(range(len(candidates) - tail_count, len(candidates)))
+
+    remaining_slots = max_queries - len(selected_indices)
+    if remaining_slots > 0:
+        middle_indices = [index for index in range(head_count, len(candidates) - tail_count) if index not in selected_indices]
+        ranked_middle = sorted(
+            middle_indices,
+            key=lambda index: (bilibili_query_specificity(candidates[index]), -index),
+            reverse=True,
+        )
+        selected_indices.update(ranked_middle[:remaining_slots])
+
+    return [candidates[index] for index in sorted(selected_indices)]
 
 
 def should_search_auxiliary_streaming_hosts(
