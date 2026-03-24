@@ -17,6 +17,7 @@ from app.services.http_sources import (
     normalize_host,
     normalize_text,
     score_recording_match,
+    select_bilibili_browser_queries,
 )
 from app.services.pipeline import DraftRecordingEntry, RetrievalProfile
 from app.services.platform_search_config import (
@@ -413,6 +414,73 @@ class AdaptiveHydrationProvider(HttpSourceProvider):
                 }
             )
         return hydrated
+
+
+class DeepBilibiliMultiHostProvider(HttpSourceProvider):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.hydration_windows: list[list[str]] = []
+
+    async def _search_streaming_host(
+        self,
+        draft: DraftRecordingEntry,
+        profile: RetrievalProfile,
+        host,
+    ) -> list[dict[str, str]]:
+        del draft, profile
+        normalized = normalize_host(host.url)
+        if "youtube.com" in normalized:
+            return [
+                {
+                    "url": "https://www.youtube.com/watch?v=yt01",
+                    "source_label": "YouTube Search",
+                    "source_kind": "streaming",
+                },
+                {
+                    "url": "https://www.youtube.com/watch?v=yt02",
+                    "source_label": "YouTube Search",
+                    "source_kind": "streaming",
+                },
+                {
+                    "url": "https://www.youtube.com/watch?v=bohm-target-hit",
+                    "source_label": "YouTube Search",
+                    "source_kind": "streaming",
+                },
+                {
+                    "url": "https://www.youtube.com/watch?v=yt04",
+                    "source_label": "YouTube Search",
+                    "source_kind": "streaming",
+                },
+            ]
+        return [
+            {
+                "url": f"https://www.bilibili.com/video/BV1deep{i:02d}/",
+                "source_label": "Bilibili Search",
+                "source_kind": "streaming",
+            }
+            for i in range(1, 11)
+        ]
+
+    async def _hydrate_results(
+        self,
+        draft: DraftRecordingEntry,
+        rows: list[dict[str, str]],
+        source_kind: str,
+    ) -> list[dict[str, str]]:
+        del draft, source_kind
+        self.hydration_windows.append([row["url"] for row in rows])
+        return [
+            {
+                **row,
+                "title": row["url"],
+                "platform": "youtube" if "youtube.com" in row["url"] else "bilibili",
+                "weight": 0.6,
+                "same_recording_score": 0.7,
+                "fields": {},
+                "images": [],
+            }
+            for row in rows
+        ]
 
 
 class FlakyYouTubeTransport(httpx.AsyncBaseTransport):
@@ -1854,6 +1922,21 @@ def test_search_streaming_expands_hydration_window_when_initial_slice_has_no_pro
     assert len(provider.hydration_windows[-1]) > 12
 
 
+def test_search_streaming_broadens_initial_window_for_deep_bilibili_multi_host_mix(tmp_path: Path) -> None:
+    root = tmp_path / "source-profiles"
+    root.mkdir(parents=True)
+    (root / "high-quality.txt").write_text("#global\nhttps://catalog.example\n", encoding="utf-8")
+    (root / "streaming.txt").write_text("#global\n[zh] https://www.bilibili.com\nhttps://www.youtube.com\n", encoding="utf-8")
+    provider = DeepBilibiliMultiHostProvider(profile_loader=SourceProfileLoader(root))
+
+    rows = asyncio.run(provider.search_streaming(build_draft(), build_profile()))
+
+    urls = [row["url"] for row in rows]
+    assert "https://www.youtube.com/watch?v=bohm-target-hit" in urls
+    assert len(provider.hydration_windows) >= 1
+    assert len(provider.hydration_windows[0]) > 12
+
+
 def test_bilibili_browser_search_keeps_later_query_hit_even_when_first_query_fills_budget() -> None:
     browser_fetcher = BrowserResultFetcher(
         {
@@ -1951,7 +2034,8 @@ def test_search_bilibili_samples_precise_browser_queries_beyond_first_three() ->
 
     asyncio.run(provider._search_bilibili(queries))
 
-    assert len(provider.browser_queries) > 3
+    assert len(provider.browser_queries) > 5
+    assert "q5 ensemble date exact" in provider.browser_queries
     assert "q8 final exact latin query" in provider.browser_queries
 
 
@@ -1962,7 +2046,7 @@ def test_merge_streaming_host_rows_preserves_deeper_bilibili_slice_when_multiple
             "source_label": "Bilibili Search",
             "source_kind": "streaming",
         }
-        for i in range(1, 7)
+        for i in range(1, 11)
     ]
     youtube_rows = [
         {
@@ -1981,7 +2065,26 @@ def test_merge_streaming_host_rows_preserves_deeper_bilibili_slice_when_multiple
     )
 
     urls = [row["url"] for row in merged]
-    assert "https://www.bilibili.com/video/BV1row06/" in urls
+    assert "https://www.bilibili.com/video/BV1row09/" in urls
+
+
+def test_select_bilibili_browser_queries_keeps_precise_middle_conductor_query() -> None:
+    queries = [
+        "吉泽金",
+        "罗伯特·舒曼 a小调钢琴协奏曲 吉泽金",
+        "吉泽金 March 3, 1942 Berlin",
+        "a小调钢琴协奏曲 吉泽金 March 3, 1942 Berlin",
+        "a小调钢琴协奏曲 吉泽金 富特文格勒 柏林爱乐乐团 March 3, 1942 Berlin",
+        "a小调钢琴协奏曲 吉泽金 / 富特文格勒 柏林爱乐乐团 March 3, 1942 Berlin",
+        "Piano Concerto, Op.54 Walter Gieseking Wilhelm Furtwangler Berlin Philharmonic Orchestra March 3, 1942 Berlin",
+        "Piano Concerto, Op.54 Walter Gieseking / Wilhelm Furtwangler Berlin Philharmonic Orchestra March 3, 1942 Berlin",
+    ]
+
+    selected = select_bilibili_browser_queries(queries)
+
+    assert len(selected) == 6
+    assert "a小调钢琴协奏曲 吉泽金 富特文格勒 柏林爱乐乐团 March 3, 1942 Berlin" in selected
+    assert "Piano Concerto, Op.54 Walter Gieseking / Wilhelm Furtwangler Berlin Philharmonic Orchestra March 3, 1942 Berlin" in selected
 
 
 def test_looks_like_single_movement_ignores_complete_tracklist_descriptions() -> None:

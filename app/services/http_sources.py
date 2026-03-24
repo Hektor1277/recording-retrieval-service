@@ -461,11 +461,14 @@ class HttpSourceProvider:
             host_results.extend(auxiliary_results)
 
         rows = merge_streaming_host_rows(host_results)
-        hydrated_rows = await self._hydrate_results(draft, rows[:HYDRATE_DEPTH], "streaming")
-        if len(rows) > HYDRATE_DEPTH and not any(
+        initial_depth = HYDRATE_DEPTH
+        if should_expand_initial_streaming_window(host_results):
+            initial_depth = min(len(rows), HYDRATE_DEPTH + 4)
+        hydrated_rows = await self._hydrate_results(draft, rows[:initial_depth], "streaming")
+        if len(rows) > initial_depth and not any(
             float(row.get("same_recording_score", 0.0) or 0.0) >= LOW_CONFIDENCE_THRESHOLD for row in hydrated_rows
         ):
-            extended_depth = min(len(rows), HYDRATE_DEPTH + 6)
+            extended_depth = min(len(rows), initial_depth + 6)
             hydrated_rows = await self._hydrate_results(draft, rows[:extended_depth], "streaming")
         return hydrated_rows
 
@@ -1538,7 +1541,7 @@ def merge_streaming_host_rows(
         elif "youtube.com" in normalized_host or "youtu.be" in normalized_host:
             per_host_cap = 10
         elif "bilibili.com" in normalized_host or "b23.tv" in normalized_host:
-            per_host_cap = 6
+            per_host_cap = 10
         else:
             per_host_cap = 4
         all_rows.extend(rows[:per_host_cap])
@@ -1575,7 +1578,7 @@ def bilibili_query_specificity(query: str) -> tuple[int, int, int]:
     )
 
 
-def select_bilibili_browser_queries(queries: list[str], *, max_queries: int = 5) -> list[str]:
+def select_bilibili_browser_queries(queries: list[str], *, max_queries: int = 6) -> list[str]:
     candidates = dedupe_text([compact(query) for query in queries if compact(query)])
     if len(candidates) <= max_queries:
         return candidates
@@ -1611,6 +1614,23 @@ def should_search_auxiliary_streaming_hosts(
         return True
     merged = merge_streaming_host_rows(non_empty)
     return len(merged) < 4
+
+
+def should_expand_initial_streaming_window(
+    host_results: list[tuple[SourceProfileEntry, list[dict[str, str]]]],
+) -> bool:
+    priority_non_empty = [
+        (host, rows)
+        for host, rows in host_results
+        if rows and streaming_host_priority(host.url)[0] == 0
+    ]
+    if len(priority_non_empty) < 2:
+        return False
+    for host, rows in priority_non_empty:
+        normalized_host = normalize_host(host.url)
+        if ("bilibili.com" in normalized_host or "b23.tv" in normalized_host) and len(rows) >= 9:
+            return True
+    return False
 
 
 def prioritize_platform_queries(values: list[str], *, draft: DraftRecordingEntry, prefer_cjk: bool) -> list[str]:
