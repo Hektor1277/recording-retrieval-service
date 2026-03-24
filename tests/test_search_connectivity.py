@@ -274,6 +274,122 @@ class PriorityCoverageProvider(HttpSourceProvider):
         return rows
 
 
+class MultiHostDeepSliceAwareProvider(HttpSourceProvider):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.hydrated_urls: list[str] = []
+
+    async def _search_streaming_host(
+        self,
+        draft: DraftRecordingEntry,
+        profile: RetrievalProfile,
+        host,
+    ) -> list[dict[str, str]]:
+        del draft, profile
+        normalized = normalize_host(host.url)
+        if "youtube.com" in normalized:
+            return [
+                {
+                    "url": f"https://www.youtube.com/watch?v=yt{index:02d}",
+                    "source_label": "YouTube Search",
+                    "source_kind": "streaming",
+                }
+                for index in range(1, 7)
+            ] + [
+                {
+                    "url": "https://www.youtube.com/watch?v=annie-deep-hit",
+                    "source_label": "YouTube Search",
+                    "source_kind": "streaming",
+                },
+                {
+                    "url": "https://www.youtube.com/watch?v=yt08",
+                    "source_label": "YouTube Search",
+                    "source_kind": "streaming",
+                },
+            ]
+        return [
+            {
+                "url": "https://www.bilibili.com/video/BV1coverage01/",
+                "source_label": "Bilibili Search",
+                "source_kind": "streaming",
+            },
+            {
+                "url": "https://www.bilibili.com/video/BV1coverage02/",
+                "source_label": "Bilibili Search",
+                "source_kind": "streaming",
+            },
+        ]
+
+    async def _hydrate_results(
+        self,
+        draft: DraftRecordingEntry,
+        rows: list[dict[str, str]],
+        source_kind: str,
+    ) -> list[dict[str, str]]:
+        del draft, source_kind
+        self.hydrated_urls = [row["url"] for row in rows]
+        return rows
+
+
+class AdaptiveHydrationProvider(HttpSourceProvider):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.hydration_windows: list[list[str]] = []
+
+    async def _search_streaming_host(
+        self,
+        draft: DraftRecordingEntry,
+        profile: RetrievalProfile,
+        host,
+    ) -> list[dict[str, str]]:
+        del draft, profile
+        normalized = normalize_host(host.url)
+        if "youtube.com" in normalized:
+            return [
+                {
+                    "url": f"https://www.youtube.com/watch?v=yt{index:02d}",
+                    "source_label": "YouTube Search",
+                    "source_kind": "streaming",
+                }
+                for index in range(1, 15)
+            ]
+        return [
+            {
+                "url": f"https://www.bilibili.com/video/BV1adaptive{index:02d}/",
+                "source_label": "Bilibili Search",
+                "source_kind": "streaming",
+            }
+            for index in range(1, 5)
+        ]
+
+    async def _hydrate_results(
+        self,
+        draft: DraftRecordingEntry,
+        rows: list[dict[str, str]],
+        source_kind: str,
+    ) -> list[dict[str, str]]:
+        del draft, source_kind
+        urls = [row["url"] for row in rows]
+        self.hydration_windows.append(urls)
+        hydrated: list[dict[str, str]] = []
+        for row in rows:
+            score = 0.1
+            if row["url"] == "https://www.youtube.com/watch?v=yt09":
+                score = 0.72
+            hydrated.append(
+                {
+                    **row,
+                    "title": row["url"].rsplit("=", 1)[-1],
+                    "platform": "youtube" if "youtube.com" in row["url"] else "bilibili",
+                    "weight": 0.6,
+                    "same_recording_score": score,
+                    "fields": {},
+                    "images": [],
+                }
+            )
+        return hydrated
+
+
 class FlakyYouTubeTransport(httpx.AsyncBaseTransport):
     def __init__(self) -> None:
         self.call_count = 0
@@ -1573,6 +1689,37 @@ def test_search_streaming_keeps_bilibili_coverage_even_when_youtube_fills_budget
     assert any("bilibili.com/video/BV1priorityhit1" in url for url in urls)
 
 
+def test_search_streaming_keeps_deeper_youtube_hit_when_multiple_priority_hosts_share_budget(tmp_path: Path) -> None:
+    root = tmp_path / "source-profiles"
+    root.mkdir(parents=True)
+    (root / "high-quality.txt").write_text("#global\nhttps://catalog.example\n", encoding="utf-8")
+    (root / "streaming.txt").write_text("#global\nhttps://www.youtube.com\n[zh] https://www.bilibili.com\n", encoding="utf-8")
+    provider = MultiHostDeepSliceAwareProvider(profile_loader=SourceProfileLoader(root))
+
+    rows = asyncio.run(provider.search_streaming(build_draft(), build_profile()))
+
+    urls = [row["url"] for row in rows]
+    assert "https://www.youtube.com/watch?v=annie-deep-hit" in urls
+    assert "https://www.youtube.com/watch?v=annie-deep-hit" in provider.hydrated_urls
+    assert any("bilibili.com/video/BV1coverage01/" in url for url in urls)
+
+
+def test_search_streaming_expands_hydration_window_when_initial_slice_has_no_promising_hits(tmp_path: Path) -> None:
+    root = tmp_path / "source-profiles"
+    root.mkdir(parents=True)
+    (root / "high-quality.txt").write_text("#global\nhttps://catalog.example\n", encoding="utf-8")
+    (root / "streaming.txt").write_text("#global\nhttps://www.youtube.com\n[zh] https://www.bilibili.com\n", encoding="utf-8")
+    provider = AdaptiveHydrationProvider(profile_loader=SourceProfileLoader(root))
+
+    rows = asyncio.run(provider.search_streaming(build_draft(), build_profile()))
+
+    urls = [row["url"] for row in rows]
+    assert "https://www.youtube.com/watch?v=yt09" in urls
+    assert len(provider.hydration_windows) >= 2
+    assert len(provider.hydration_windows[0]) == 12
+    assert len(provider.hydration_windows[-1]) > 12
+
+
 def test_looks_like_single_movement_ignores_complete_tracklist_descriptions() -> None:
     text = (
         'Jean Fournier & Ginette Doyen play Beethoven "Spring" Sonata '
@@ -1640,6 +1787,38 @@ def test_provider_uses_chinese_queries_only_for_chinese_platforms_and_expands_ab
     assert any("%E6%9F%B4%E5%8F%AF%E5%A4%AB%E6%96%AF%E5%9F%BA" in url for url in bilibili_urls)
     assert any("Boston+Symphony+Orchestra" in url for url in youtube_urls)
     assert not any("%E6%9F%B4%E5%8F%AF%E5%A4%AB%E6%96%AF%E5%9F%BA" in url for url in youtube_urls)
+
+
+def test_non_chinese_platform_queries_promote_named_concerto_aliases_into_executed_budget(tmp_path: Path) -> None:
+    root = tmp_path / "source-profiles"
+    root.mkdir(parents=True)
+    (root / "high-quality.txt").write_text("#global\nhttps://catalog.example\n", encoding="utf-8")
+    (root / "streaming.txt").write_text("#global\nhttps://www.youtube.com\n", encoding="utf-8")
+    provider = HttpSourceProvider(profile_loader=SourceProfileLoader(root))
+    draft = build_annie_draft()
+    item_profile = RetrievalProfile(
+        category="concerto",
+        tags=[],
+        queries=[
+            "Robert Schumann Piano Concerto, Op.54 Annie Fischer",
+            "Piano Concerto, Op.54 Annie Fischer",
+            "Robert Schumann piano concerto Annie Fischer",
+            "Robert Schumann concerto a minor Annie Fischer",
+            "Piano Concerto, Op.54 Annie Fischer Kletzki Budapest Philharmonic Orchestra",
+            "Piano Concerto, Op.54 Annie Fischer / Kletzki Budapest Philharmonic Orchestra",
+        ],
+        latin_queries=[
+            "Robert Schumann Piano Concerto, Op.54 Annie Fischer",
+            "Piano Concerto, Op.54 Annie Fischer",
+            "Robert Schumann piano concerto Annie Fischer",
+            "Robert Schumann concerto a minor Annie Fischer",
+        ],
+    )
+    youtube_host = SourceProfileLoader(root).load(category="concerto", tags=[]).streaming[0]
+
+    queries = provider._queries_for_host(draft, item_profile, youtube_host)
+
+    assert any("klavierkonzert" in query.lower() for query in queries[:8])
 
 
 def test_non_chinese_platform_queries_include_named_work_aliases_for_solo_repertoire(tmp_path: Path) -> None:

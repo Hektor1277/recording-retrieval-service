@@ -20,6 +20,7 @@ from app.services.platform_clients import PlatformSearchClients
 from app.services.platform_search_config import PlatformSearchConfig, load_platform_search_config
 from app.services.pipeline import (
     DraftRecordingEntry,
+    LOW_CONFIDENCE_THRESHOLD,
     RetrievalProfile,
     build_queries,
     build_work_query,
@@ -445,7 +446,13 @@ class HttpSourceProvider:
             host_results.extend(auxiliary_results)
 
         rows = merge_streaming_host_rows(host_results)
-        return await self._hydrate_results(draft, rows[:HYDRATE_DEPTH], "streaming")
+        hydrated_rows = await self._hydrate_results(draft, rows[:HYDRATE_DEPTH], "streaming")
+        if len(rows) > HYDRATE_DEPTH and not any(
+            float(row.get("same_recording_score", 0.0) or 0.0) >= LOW_CONFIDENCE_THRESHOLD for row in hydrated_rows
+        ):
+            extended_depth = min(len(rows), HYDRATE_DEPTH + 6)
+            hydrated_rows = await self._hydrate_results(draft, rows[:extended_depth], "streaming")
+        return hydrated_rows
 
     def _streaming_host_timeout_seconds(
         self,
@@ -1002,15 +1009,16 @@ class HttpSourceProvider:
             host,
             composer_query=compact(draft.composer_name_latin),
         )
+        alias_queries = self._alias_queries_for_host(
+            draft,
+            host,
+            lead_terms=latin_leads,
+            ensemble_terms=latin_ensembles,
+        )
         generated_queries = prioritize_platform_queries(
             [
                 *primary_only_queries[:4],
-                *self._alias_queries_for_host(
-                    draft,
-                    host,
-                    lead_terms=latin_leads,
-                    ensemble_terms=latin_ensembles,
-                )[:4],
+                *alias_queries[:4],
                 *latin_queries[:4],
             ],
             draft=draft,
@@ -1018,6 +1026,7 @@ class HttpSourceProvider:
         )
         return dedupe_text([
             *primary_only_queries[:4],
+            *alias_queries[:1],
             *profile.queries[:2],
             *profile.latin_queries[:2],
             *generated_queries,
@@ -1409,9 +1418,17 @@ def merge_streaming_host_rows(
 
     multiple_hosts = len(host_results) > 1
     for host, rows in host_results:
-        per_host_cap = HYDRATE_DEPTH if not multiple_hosts else (6 if streaming_host_priority(host.url)[0] == 0 else 4)
+        normalized_host = normalize_host(host.url)
+        if not multiple_hosts:
+            per_host_cap = HYDRATE_DEPTH
+        elif "youtube.com" in normalized_host or "youtu.be" in normalized_host:
+            per_host_cap = 10
+        elif "bilibili.com" in normalized_host or "b23.tv" in normalized_host:
+            per_host_cap = 4
+        else:
+            per_host_cap = 4
         all_rows.extend(rows[:per_host_cap])
-    return dedupe_rows([*coverage_rows, *all_rows])[:HYDRATE_DEPTH]
+    return dedupe_rows([*coverage_rows, *all_rows])
 
 
 def should_search_auxiliary_streaming_hosts(
