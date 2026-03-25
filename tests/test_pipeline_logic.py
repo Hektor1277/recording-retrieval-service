@@ -385,6 +385,27 @@ def test_input_normalizer_recovers_concerto_collaborator_group_and_date_from_tit
     assert draft.performance_date_text == "March 11, 1940"
 
 
+def test_input_normalizer_keeps_title_performance_context_for_sparse_chamber_solo_title() -> None:
+    payload = sample_request()
+    payload["items"][0]["workTypeHint"] = "chamber_solo"
+    payload["items"][0]["sourceLine"] = "Beethoven | Piano Sonata No.23, Op.57 | Claudio Arrau | -"
+    payload["items"][0]["seed"]["title"] = "阿劳 - Beethovenfest Bonn 1970"
+    payload["items"][0]["seed"]["composerName"] = "贝多芬"
+    payload["items"][0]["seed"]["composerNameLatin"] = "Ludwig van Beethoven"
+    payload["items"][0]["seed"]["workTitle"] = "第二十三号奏鸣曲，热情"
+    payload["items"][0]["seed"]["workTitleLatin"] = "Piano Sonata No.23, Op.57"
+    payload["items"][0]["seed"]["catalogue"] = "Op.57"
+    payload["items"][0]["seed"]["performanceDateText"] = ""
+    payload["items"][0]["seed"]["credits"] = [
+        {"role": "soloist", "displayName": "Claudio Arrau", "label": "Claudio Arrau"},
+    ]
+    request = CreateJobRequest.model_validate(payload)
+
+    draft = InputNormalizer().normalize(request.items[0])
+
+    assert draft.performance_date_text == "Beethovenfest Bonn 1970"
+
+
 def test_build_queries_keeps_composer_work_lead_date_combo_for_sparse_html_search() -> None:
     queries = build_queries(
         work_query="spring",

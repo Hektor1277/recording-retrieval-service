@@ -204,6 +204,28 @@ class QueryCoverageYouTubeTransport(httpx.AsyncBaseTransport):
         return httpx.Response(200, request=request, text=text)
 
 
+class RankedLaterQueryYouTubeTransport(httpx.AsyncBaseTransport):
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if "youtube.com/results" not in url:
+            return httpx.Response(404, request=request, text="not found")
+        if "generic+query" in url:
+            text = "".join(
+                f'{{"videoRenderer":{{"videoId":"generic{i:02d}","title":{{"runs":[{{"text":"generic {i}"}}]}}}}}}'
+                for i in range(1, 9)
+            )
+            return httpx.Response(200, request=request, text=text)
+        if "exact+query" in url:
+            text = '{"videoRenderer":{"videoId":"exact-hit-01","title":{"runs":[{"text":"exact hit"}]}}}'
+            text += "".join(
+                f'{{"videoRenderer":{{"videoId":"exactf{i:02d}","title":{{"runs":[{{"text":"exact filler {i}"}}]}}}}}}'
+                for i in range(1, 8)
+            )
+            return httpx.Response(200, request=request, text=text)
+        text = '{"videoRenderer":{"videoId":"fallback-late-01","title":{"runs":[{"text":"fallback late"}]}}}'
+        return httpx.Response(200, request=request, text=text)
+
+
 class HostSliceAwareProvider(HttpSourceProvider):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -937,6 +959,23 @@ def test_youtube_search_keeps_top_result_from_later_alias_query_even_when_earlie
     rows = asyncio.run(provider._search_youtube(["generic one", "generic two", "alias query"]))
 
     assert any(row["url"] == "https://www.youtube.com/watch?v=alias-hit-01" for row in rows)
+
+
+def test_youtube_search_promotes_exact_later_query_hit_ahead_of_early_generic_fill(tmp_path: Path) -> None:
+    root = tmp_path / "source-profiles"
+    root.mkdir(parents=True)
+    (root / "high-quality.txt").write_text("#global\nhttps://catalog.example\n", encoding="utf-8")
+    (root / "streaming.txt").write_text("#global\nhttps://www.youtube.com\n", encoding="utf-8")
+    client = httpx.AsyncClient(transport=RankedLaterQueryYouTubeTransport(), follow_redirects=True)
+    provider = HttpSourceProvider(profile_loader=SourceProfileLoader(root), client=client)
+
+    rows = asyncio.run(provider._search_youtube(["generic query", "exact query"]))
+
+    urls = [row["url"] for row in rows]
+    assert "https://www.youtube.com/watch?v=exact-hit-01" in urls
+    assert urls.index("https://www.youtube.com/watch?v=exact-hit-01") < urls.index(
+        "https://www.youtube.com/watch?v=generic05"
+    )
 
 
 def test_search_streaming_hydrates_more_than_first_four_rows_from_successful_host(tmp_path: Path) -> None:

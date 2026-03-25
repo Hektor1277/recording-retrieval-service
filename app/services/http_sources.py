@@ -793,6 +793,8 @@ class HttpSourceProvider:
                     break
             return rows[:result_depth]
         groups = await asyncio.gather(*(run_query(query) for query in queries[:query_depth]), return_exceptions=False)
+        if should_merge_streaming_query_coverage(source_label):
+            return merge_streaming_query_groups(groups, limit=HYDRATE_DEPTH)
         rows: list[dict[str, str]] = []
         for group in groups:
             rows.extend(group)
@@ -1567,6 +1569,25 @@ def merge_bilibili_browser_query_rows(
         coverage_rows.extend(rows[:3])
         all_rows.extend(rows)
     return dedupe_rows([*coverage_rows, *all_rows])[:result_depth]
+
+
+def merge_streaming_query_groups(
+    groups: list[list[dict[str, str]]],
+    *,
+    limit: int,
+    coverage_per_query: int = 2,
+) -> list[dict[str, str]]:
+    coverage_rows: list[dict[str, str]] = []
+    all_rows: list[dict[str, str]] = []
+    for group in groups:
+        coverage_rows.extend(group[:coverage_per_query])
+        all_rows.extend(group)
+    return dedupe_rows([*coverage_rows, *all_rows])[:limit]
+
+
+def should_merge_streaming_query_coverage(source_label: str) -> bool:
+    lowered = compact(source_label).lower()
+    return "youtube" in lowered
 
 
 def bilibili_query_specificity(query: str) -> tuple[int, int, int]:

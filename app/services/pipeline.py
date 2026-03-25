@@ -270,7 +270,13 @@ class InputNormalizer:
                 if looks_latin(inferred_group):
                     ensembles_latin.append(inferred_group)
 
-        performance_date_text = compact(item.seed.performance_date_text) or title_date_hint
+        title_performance_context = extract_title_performance_context(item.seed.title)
+        performance_date_text = compact(item.seed.performance_date_text)
+        if not performance_date_text:
+            if work_type == "chamber_solo" and title_performance_context:
+                performance_date_text = title_performance_context
+            else:
+                performance_date_text = title_date_hint
 
         leads = dedupe_preserve_order([*primary_names, *secondary_names])
         leads_latin = dedupe_preserve_order([*primary_names_latin, *secondary_names_latin])
@@ -1494,6 +1500,21 @@ def extract_title_date_hint(title: str) -> str:
         match = re.search(pattern, normalized, flags=re.I)
         if match:
             return compact(match.group(0))
+    return ""
+
+
+def extract_title_performance_context(title: str) -> str:
+    normalized = compact(title)
+    if not normalized:
+        return ""
+    for part in split_title_segments(normalized):
+        value = compact(part.strip(" ,;|"))
+        if not value:
+            continue
+        year_hint = extract_title_date_hint(value)
+        if not year_hint or compact(value) == year_hint:
+            continue
+        return value
     return ""
 
 
