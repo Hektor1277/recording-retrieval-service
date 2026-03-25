@@ -8,7 +8,9 @@ from pathlib import Path
 
 from app.services.parent_work_eval import (
     build_work_dataset,
+    categorize_result_reason,
     canonicalize_url,
+    evaluate_hit_metrics,
     find_work_id,
     load_library_indices,
     scenario_to_dict,
@@ -61,13 +63,39 @@ async def run_scenario(retriever, scenario) -> dict[str, object]:
             "candidateLinks": [],
             "finalHit": False,
             "candidateHit": False,
+            "relaxedFinalHit": False,
+            "relaxedCandidateHit": False,
+            "finalMatchType": "none",
+            "candidateMatchType": "none",
+            "strictMissReason": "timeout",
             "warnings": ["scenario timeout after internal 55s / external 70s"],
         }
-    final_urls = [canonicalize_url(link.url) for link in result.result.links]
-    candidate_urls = [canonicalize_url(link.url) for link in result.link_candidates]
-    final_hit = scenario.evaluable and any(url in scenario.target_urls for url in final_urls if url)
-    candidate_hit = scenario.evaluable and any(url in scenario.target_urls for url in candidate_urls if url)
-    return {
+    final_link_details = [
+        {
+            "canonical": canonicalize_url(link.url),
+            "url": link.url,
+            "title": link.title or "",
+            "confidence": float(link.confidence or 0.0),
+            "platform": link.platform or "",
+        }
+        for link in result.result.links
+    ]
+    candidate_link_details = [
+        {
+            "canonical": canonicalize_url(link.url),
+            "url": link.url,
+            "title": link.title or "",
+            "confidence": float(link.confidence or 0.0),
+            "platform": link.platform or "",
+        }
+        for link in result.link_candidates
+    ]
+    hit_metrics = evaluate_hit_metrics(
+        targets=scenario.target_urls,
+        final_links=final_link_details,
+        candidate_links=candidate_link_details,
+    )
+    payload = {
         "itemId": scenario.item.item_id,
         "recordingId": scenario.recording_id,
         "variant": scenario.variant,
@@ -77,12 +105,15 @@ async def run_scenario(retriever, scenario) -> dict[str, object]:
         "targets": scenario.target_urls,
         "status": result.status,
         "confidence": result.confidence,
-        "finalLinks": final_urls,
-        "candidateLinks": candidate_urls,
-        "finalHit": final_hit,
-        "candidateHit": candidate_hit,
+        "finalLinks": [item["canonical"] for item in final_link_details if item["canonical"]],
+        "candidateLinks": [item["canonical"] for item in candidate_link_details if item["canonical"]],
+        "finalLinkDetails": final_link_details,
+        "candidateLinkDetails": candidate_link_details,
         "warnings": result.warnings,
     }
+    payload.update(hit_metrics)
+    payload["strictMissReason"] = categorize_result_reason(payload)
+    return payload
 
 
 async def main(args: argparse.Namespace) -> None:

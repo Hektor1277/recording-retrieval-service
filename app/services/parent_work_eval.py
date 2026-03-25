@@ -41,6 +41,10 @@ class GeneratedScenario:
     evaluable: bool
 
 
+def compact(value: object) -> str:
+    return str(value or "").strip()
+
+
 def workspace_root() -> Path:
     current = Path(__file__).resolve()
     for parent in current.parents:
@@ -80,6 +84,15 @@ def canonicalize_url(url: str) -> str:
         if len(parts) >= 2 and parts[0] == "video":
             return f"bilibili:{parts[1]}"
     return normalized.split("#", 1)[0].split("?", 1)[0]
+
+
+def platform_from_canonical_url(value: str) -> str:
+    normalized = compact(value)
+    if normalized.startswith("youtube:"):
+        return "youtube"
+    if normalized.startswith("bilibili:"):
+        return "bilibili"
+    return ""
 
 
 def find_work_id(*, works: dict[str, dict], work_id: str = "", title_latin: str = "", title: str = "") -> str:
@@ -331,10 +344,25 @@ def scenario_to_dict(scenario: GeneratedScenario) -> dict[str, object]:
 
 
 def summarize_results(results: list[dict]) -> dict[str, dict[str, int]]:
-    overall = {"total": 0, "evaluable": 0, "finalHit": 0, "candidateHit": 0}
+    overall = {
+        "total": 0,
+        "evaluable": 0,
+        "finalHit": 0,
+        "candidateHit": 0,
+        "relaxedFinalHit": 0,
+        "relaxedCandidateHit": 0,
+    }
     by_variant: dict[str, dict[str, int]] = defaultdict(
-        lambda: {"total": 0, "evaluable": 0, "finalHit": 0, "candidateHit": 0}
+        lambda: {
+            "total": 0,
+            "evaluable": 0,
+            "finalHit": 0,
+            "candidateHit": 0,
+            "relaxedFinalHit": 0,
+            "relaxedCandidateHit": 0,
+        }
     )
+    strict_miss_reasons: dict[str, int] = defaultdict(int)
     for result in results:
         variant = str(result.get("variant") or "unknown")
         evaluable = bool(result.get("evaluable"))
@@ -350,4 +378,77 @@ def summarize_results(results: list[dict]) -> dict[str, dict[str, int]]:
         if bool(result.get("candidateHit")):
             overall["candidateHit"] += 1
             by_variant[variant]["candidateHit"] += 1
-    return {"overall": overall, "byVariant": dict(by_variant)}
+        if bool(result.get("relaxedFinalHit")):
+            overall["relaxedFinalHit"] += 1
+            by_variant[variant]["relaxedFinalHit"] += 1
+        if bool(result.get("relaxedCandidateHit")):
+            overall["relaxedCandidateHit"] += 1
+            by_variant[variant]["relaxedCandidateHit"] += 1
+        miss_reason = compact(result.get("strictMissReason"))
+        if miss_reason and miss_reason not in {"none", "not_evaluable"}:
+            strict_miss_reasons[miss_reason] += 1
+    return {
+        "overall": overall,
+        "byVariant": dict(by_variant),
+        "strictMissReasons": dict(strict_miss_reasons),
+    }
+
+
+def classify_link_match(
+    *,
+    targets: list[str],
+    links: list[dict[str, object]],
+    alt_upload_confidence_threshold: float = 0.75,
+) -> tuple[bool, str]:
+    target_set = {compact(value) for value in targets if compact(value)}
+    if not target_set:
+        return False, "none"
+    for link in links:
+        canonical = compact(link.get("canonical"))
+        if canonical and canonical in target_set:
+            return True, "strict"
+    target_platforms = {platform_from_canonical_url(value) for value in target_set if platform_from_canonical_url(value)}
+    for link in links:
+        canonical = compact(link.get("canonical"))
+        platform = compact(link.get("platform")) or platform_from_canonical_url(canonical)
+        confidence = float(link.get("confidence", 0.0) or 0.0)
+        if platform and platform in target_platforms and confidence >= alt_upload_confidence_threshold:
+            return True, "same_platform_alt_upload"
+    return False, "none"
+
+
+def evaluate_hit_metrics(
+    *,
+    targets: list[str],
+    final_links: list[dict[str, object]],
+    candidate_links: list[dict[str, object]],
+) -> dict[str, object]:
+    final_hit, final_match_type = classify_link_match(targets=targets, links=final_links)
+    candidate_hit, candidate_match_type = classify_link_match(
+        targets=targets,
+        links=[*final_links, *candidate_links],
+    )
+    return {
+        "finalHit": final_match_type == "strict",
+        "candidateHit": candidate_match_type == "strict",
+        "relaxedFinalHit": final_hit,
+        "relaxedCandidateHit": candidate_hit,
+        "finalMatchType": final_match_type,
+        "candidateMatchType": candidate_match_type,
+    }
+
+
+def categorize_result_reason(result: dict[str, object]) -> str:
+    if not bool(result.get("evaluable")):
+        return "not_evaluable"
+    if bool(result.get("finalHit")):
+        return "none"
+    if bool(result.get("relaxedFinalHit")):
+        return "same_platform_alt_upload"
+    if bool(result.get("candidateHit")):
+        if any("LLM 归并超时" in compact(warning) for warning in result.get("warnings") or []):
+            return "final_selection_after_llm_timeout"
+        return "final_selection_miss"
+    if bool(result.get("relaxedCandidateHit")):
+        return "same_platform_alt_candidate_only"
+    return "recall_miss"

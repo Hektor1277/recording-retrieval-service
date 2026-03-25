@@ -73,6 +73,39 @@
   - 指标与第二轮持平
   - 说明本轮增益已收敛，当前剩余问题不再主要是“拉丁名缺失”
 
+### Relaxed Evaluation
+
+- 新增 `relaxed hit`（宽松命中）口径：
+  - 保留原有 `strict URL hit`（严格 URL 命中）
+  - 额外统计“同平台 + 高置信候选 + 不同上传链接”的 `same_platform_alt_upload`
+- 第四轮结果：
+  - `overall`
+    - `strict`: `8/28 finalHit`, `10/28 candidateHit`
+    - `relaxed`: `11/28 finalHit`, `12/28 candidateHit`
+  - `full`
+    - `strict`: `5/14 finalHit`, `5/14 candidateHit`
+    - `relaxed`: `6/14 finalHit`, `6/14 candidateHit`
+  - `partial`
+    - `strict`: `3/14 finalHit`, `5/14 candidateHit`
+    - `relaxed`: `5/14 finalHit`, `6/14 candidateHit`
+
+- `strict miss` 归因：
+  - `same_platform_alt_upload`: `3`
+  - `final_selection_after_llm_timeout`: `1`
+  - `recall_miss`: `16`
+
+- 代表性 `same_platform_alt_upload` 样本：
+  - `Radu Lupu / Giulini 1980`
+    - 真值：`BV1RiZJYAEBD`
+    - 最终命中：`BV1vM4m1D7Br`
+    - 候选标题直接写明 `Schumann: Piano Concerto, Op.54 / Radu Lupu`
+    - `confidence=0.97`
+  - `Cortot / Fricsay 1951`
+    - 真值：`BV1Pr4y1Q74W`
+    - 最终命中：`BV1vL5ozzEyp`
+    - 候选为同平台合集上传，描述中明确标注 `Schumann: Piano Concerto in A Minor, Op.54` 与 `1951.5.15`
+    - `confidence=0.81`
+
 ## Current Interpretation
 
 - 本轮修复已经把问题从“系统性查不到”拉回到“部分场景能召回，但仍存在精确真值与最终筛选缺口”
