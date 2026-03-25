@@ -3,7 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from app.models.protocol import CreateJobRequest
-from app.services.pipeline import ProfileResolver
+from app.services.http_sources import HttpSourceProvider
+from app.services.pipeline import InputNormalizer, ProfileResolver
 from app.services.source_profiles import OrchestraAliasLoader, PersonAliasLoader, SourceProfileLoader
 from tests.fixtures import sample_request
 
@@ -134,3 +135,34 @@ def test_profile_resolver_adds_live_and_piano_tags() -> None:
     assert "piano" in profile.tags
     assert "live" in profile.tags
     assert any("Argerich" in query for query in profile.queries)
+
+
+def test_youtube_host_queries_promote_title_inferred_collaboration_query_into_execution_window(tmp_path: Path) -> None:
+    root = tmp_path / "source-profiles"
+    write_profile(root / "high-quality.txt", "#global\nhttps://catalog.example\n")
+    write_profile(root / "streaming.txt", "#global\nhttps://www.youtube.com\n")
+
+    payload = sample_request()
+    payload["items"][0]["workTypeHint"] = "concerto"
+    payload["items"][0]["sourceLine"] = "Ludwig van Beethoven | Violin Concerto in D major, Op. 61 | Jascha Heifetz | -"
+    payload["items"][0]["seed"]["title"] = "Toscanini - Heifetz - NBC Symphony Orchestra - March 11, 1940, in Studio 8H, Radio City"
+    payload["items"][0]["seed"]["composerName"] = "贝多芬"
+    payload["items"][0]["seed"]["composerNameLatin"] = "Ludwig van Beethoven"
+    payload["items"][0]["seed"]["workTitle"] = "小提琴协奏曲"
+    payload["items"][0]["seed"]["workTitleLatin"] = "Violin Concerto in D major, Op. 61"
+    payload["items"][0]["seed"]["catalogue"] = "Op.61"
+    payload["items"][0]["seed"]["performanceDateText"] = "March 11, 1940"
+    payload["items"][0]["seed"]["credits"] = [
+        {"role": "soloist", "displayName": "Jascha Heifetz", "label": "Jascha Heifetz"},
+        {"role": "orchestra", "displayName": "NBC Symphony Orchestra", "label": "NBC Symphony Orchestra"},
+    ]
+    request = CreateJobRequest.model_validate(payload)
+    item = request.items[0]
+    draft = InputNormalizer().normalize(item)
+    profile = ProfileResolver().resolve(item)
+    provider = HttpSourceProvider(profile_loader=SourceProfileLoader(root))
+    host = provider._profile_loader.load(category=profile.category, tags=profile.tags).streaming[0]
+
+    queries = provider._queries_for_host(draft, profile, host)
+
+    assert any("Toscanini" in query for query in queries[:6])

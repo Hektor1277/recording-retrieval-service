@@ -1847,6 +1847,79 @@ def test_provider_prefers_bilibili_detail_api_before_html_page_fetch(tmp_path: P
     assert not any("www.bilibili.com/video/BV1TE411f7uh" in url for url in transport.urls)
 
 
+def test_provider_uses_page_body_text_to_score_sparse_collaboration_upload(tmp_path: Path) -> None:
+    root = tmp_path / "source-profiles"
+    root.mkdir(parents=True)
+    (root / "high-quality.txt").write_text("#global\nhttps://catalog.example\n", encoding="utf-8")
+    (root / "streaming.txt").write_text("#global\nhttps://www.youtube.com\n", encoding="utf-8")
+
+    class SparseYouTubeTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if "www.youtube.com/watch?v=9YWr1UcbZE8" in url:
+                return httpx.Response(
+                    200,
+                    request=request,
+                    text=(
+                        "<html>"
+                        '<meta property="og:title" content="Beethoven: Violin Concerto (1940) Heifetz">'
+                        '<meta property="og:description" content="Historic upload.">'
+                        "<body>"
+                        "Ludwig van Beethoven Violin Concerto in D, Op. 61 "
+                        "1. Allegro ma non troppo 2. Larghetto 3. Rondo "
+                        "Jascha Heifetz violin Arturo Toscanini conductor"
+                        "</body>"
+                        "</html>"
+                    ),
+                )
+            return httpx.Response(404, request=request, text="not found")
+
+    provider = HttpSourceProvider(
+        profile_loader=SourceProfileLoader(root),
+        client=httpx.AsyncClient(transport=SparseYouTubeTransport(), follow_redirects=True),
+        browser_fetcher=BrowserResultFetcher({}),
+    )
+    draft = DraftRecordingEntry(
+        item_id="heifetz-body-score",
+        title="托斯卡尼尼 - 海菲兹 - NBC Symphony Orchestra - March 11, 1940, in Studio 8H, Radio City",
+        composer_name="路德维希·凡·贝多芬",
+        composer_name_latin="Ludwig van Beethoven",
+        work_title="D大调小提琴协奏曲",
+        work_title_latin="Violin Concerto in D major, Op. 61",
+        catalogue="Op.61",
+        performance_date_text="March 11, 1940",
+        venue_text="",
+        album_title="",
+        label="",
+        release_date="",
+        notes="",
+        source_line="Ludwig van Beethoven | Violin Concerto in D major, Op. 61 | Jascha Heifetz | -",
+        raw_text="Ludwig van Beethoven | Violin Concerto in D major, Op. 61 | Jascha Heifetz | -",
+        existing_links=[],
+        primary_names=["亚莎·海菲兹"],
+        primary_names_latin=["Jascha Heifetz"],
+        secondary_names=["托斯卡尼尼"],
+        secondary_names_latin=[],
+        lead_names=["亚莎·海菲兹", "托斯卡尼尼"],
+        lead_names_latin=["Jascha Heifetz"],
+        ensemble_names=["NBC Symphony Orchestra"],
+        ensemble_names_latin=["NBC Symphony Orchestra"],
+    )
+
+    row = asyncio.run(
+        provider._fetch_page_record(
+            "https://www.youtube.com/watch?v=9YWr1UcbZE8",
+            "YouTube Search",
+            "streaming",
+            draft,
+            asyncio.Semaphore(1),
+        )
+    )
+
+    assert row is not None
+    assert row["same_recording_score"] >= 0.75
+
+
 def test_provider_falls_back_to_search_engine_when_apple_html_is_empty(tmp_path: Path) -> None:
     root = tmp_path / "source-profiles"
     root.mkdir(parents=True)

@@ -865,7 +865,10 @@ class RetrievalPipeline:
         ambiguous_upload_cluster = has_ambiguous_upload_cluster(draft, link_candidates)
         if result.links:
             top_link_confidence = max((candidate.confidence or 0) for candidate in result.links)
-            if ambiguous_upload_cluster and is_sparse_upload_query(draft):
+            title_only_collaboration_hint = has_title_only_collaboration_hint(draft)
+            if title_only_collaboration_hint and len(result.links) >= 5:
+                floor_delta = 0.32
+            elif ambiguous_upload_cluster and is_sparse_upload_query(draft):
                 floor_delta = 0.26
             else:
                 floor_delta = 0.18 if ambiguous_upload_cluster else 0.08
@@ -1324,9 +1327,14 @@ def determine_final_link_limit(
 ) -> int:
     if not candidates:
         return 2
+    collaboration_hint = has_title_only_collaboration_hint(draft)
     if accepted_url_count >= 2:
+        if collaboration_hint and len(candidates) >= 5:
+            return 5
         return min(4, max(2, accepted_url_count))
     if ambiguous_upload_cluster:
+        if is_sparse_upload_query(draft):
+            return 5
         return 4
     top_confidence = candidates[0].confidence or 0.0
     close_ties = [
@@ -1334,6 +1342,8 @@ def determine_final_link_limit(
         for candidate in candidates
         if abs((candidate.confidence or 0.0) - top_confidence) <= 0.01
     ]
+    if collaboration_hint and len(candidates) >= 5 and len(close_ties) >= 3:
+        return 5
     if not has_explicit_year(draft.performance_date_text) and len(close_ties) > 1:
         return min(4, max(2, len(close_ties)))
     if len(close_ties) >= 3:
@@ -1381,6 +1391,14 @@ def is_sparse_upload_query(draft: DraftRecordingEntry) -> bool:
     if draft.ensemble_names or draft.ensemble_names_latin:
         return False
     return True
+
+
+def has_title_only_collaboration_hint(draft: DraftRecordingEntry) -> bool:
+    if has_explicit_year(draft.source_line):
+        return False
+    if not (has_collaboration_marker(draft.title) or " - " in compact(draft.title)):
+        return False
+    return bool(draft.primary_names or draft.primary_names_latin or draft.lead_names or draft.lead_names_latin)
 
 
 def has_result_value(result: ResultPayload, field: str) -> bool:

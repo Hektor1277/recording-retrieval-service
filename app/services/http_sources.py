@@ -1390,12 +1390,19 @@ class HttpSourceProvider:
 
         summary_text = " ".join(part for part in [title, description] if part)
         combined = " ".join(part for part in [summary_text, body_text] if part)
-        match_score = score_recording_match(
-            summary_text or combined,
-            url,
-            draft,
-            duration_seconds=duration_seconds,
-            uploader=uploader,
+        score_inputs = dedupe_text([summary_text, combined])
+        match_score = max(
+            (
+                score_recording_match(
+                    candidate_text,
+                    url,
+                    draft,
+                    duration_seconds=duration_seconds,
+                    uploader=uploader,
+                )
+                for candidate_text in score_inputs
+            ),
+            default=0.0,
         )
         source_images = []
         if image_url:
@@ -1658,10 +1665,16 @@ def prioritize_platform_queries(values: list[str], *, draft: DraftRecordingEntry
     catalogue = compact(draft.catalogue).lower()
     work_title = compact(draft.work_title_latin or draft.work_title).lower()
     composer = compact(draft.composer_name_latin or draft.composer_name).lower()
+    lead_slots = build_lead_slots(draft)
+    prefer_collaboration = has_sparse_collaboration_hint(draft, lead_slots)
 
     def sort_key(query: str) -> tuple[int, int, int, int, int]:
         lowered = compact(query).lower()
+        collaboration_rank = 1
+        if prefer_collaboration and count_query_lead_slot_hits(lowered, lead_slots) >= 2:
+            collaboration_rank = 0
         return (
+            collaboration_rank,
             0 if contains_cjk(lowered) == prefer_cjk else 1,
             0 if catalogue and catalogue in lowered else 1,
             0 if work_title and work_title in lowered else 1,
@@ -1670,6 +1683,15 @@ def prioritize_platform_queries(values: list[str], *, draft: DraftRecordingEntry
         )
 
     return sorted(dedupe_text(values), key=sort_key)
+
+
+def count_query_lead_slot_hits(query: str, lead_slots: list[list[str]]) -> int:
+    normalized_query = normalize_text(query)
+    hits = 0
+    for slot in lead_slots:
+        if any(normalize_text(value) in normalized_query for value in slot if compact(value)):
+            hits += 1
+    return hits
 
 
 def dedupe_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
@@ -2018,6 +2040,10 @@ def score_recording_match(
     performance_context_tokens = extract_performance_context_tokens(draft.performance_date_text)
     if performance_context_tokens and contains_tokens(haystack, performance_context_tokens):
         score += 0.1
+    if sparse_collaboration_hint and work_matched and lead_hits >= 1 and has_complete_work_tracklist(haystack):
+        score += 0.08
+        if year and year in haystack:
+            score += 0.04
     score += score_catalogue_fit(draft, haystack)
 
     if looks_like_single_movement(haystack):

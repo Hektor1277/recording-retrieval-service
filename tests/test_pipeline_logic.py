@@ -366,7 +366,7 @@ def test_input_normalizer_recovers_concerto_collaborator_group_and_date_from_tit
     payload = sample_request()
     payload["items"][0]["workTypeHint"] = "concerto"
     payload["items"][0]["sourceLine"] = "Ludwig van Beethoven | Violin Concerto in D major, Op.61 | Jascha Heifetz | -"
-    payload["items"][0]["seed"]["title"] = "托斯卡尼尼 - 海菲兹 - NBC Symphony Orchestra - March 11, 1940, in Studio 8H, Radio City"
+    payload["items"][0]["seed"]["title"] = "Toscanini - Heifetz - NBC Symphony Orchestra - March 11, 1940, in Studio 8H, Radio City"
     payload["items"][0]["seed"]["composerName"] = "贝多芬"
     payload["items"][0]["seed"]["composerNameLatin"] = "Ludwig van Beethoven"
     payload["items"][0]["seed"]["workTitle"] = "D大调小提琴协奏曲"
@@ -380,7 +380,7 @@ def test_input_normalizer_recovers_concerto_collaborator_group_and_date_from_tit
 
     draft = InputNormalizer().normalize(request.items[0])
 
-    assert "托斯卡尼尼" in draft.secondary_names
+    assert "Toscanini" in draft.secondary_names
     assert "NBC Symphony Orchestra" in draft.ensemble_names_latin
     assert draft.performance_date_text == "March 11, 1940"
 
@@ -1068,6 +1068,257 @@ def test_pipeline_keeps_wide_heifetz_upload_cluster_when_exact_titles_remain_clo
     final_urls = [link.url for link in result.result.links]
     assert "https://www.youtube.com/watch?v=9YWr1UcbZE8" in final_urls
     assert "https://www.youtube.com/watch?v=-rUNkiGgJx8" not in final_urls
+
+
+def test_pipeline_keeps_sparse_heifetz_canonical_alternate_upload_when_cluster_stays_ambiguous() -> None:
+    class SparseHeifetzAltProvider:
+        async def inspect_existing_links(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_high_quality(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_streaming(self, draft, profile):
+            del draft, profile
+            return [
+                {
+                    "url": "https://www.bilibili.com/video/BV1vp421U7kw/",
+                    "source_label": "Bilibili Search",
+                    "source_kind": "streaming",
+                    "title": "Beethoven Violin Concerto in D Major Heifetz Toscanini NBC 1940",
+                    "description": "Chinese exact upload",
+                    "platform": "bilibili",
+                    "weight": 0.68,
+                    "same_recording_score": 0.97,
+                    "duration_seconds": 2312,
+                    "uploader": "Uploader A",
+                    "view_count": 2000,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://www.bilibili.com/video/BV1QF411s79n/",
+                    "source_label": "Bilibili Search",
+                    "source_kind": "streaming",
+                    "title": "Heifetz Toscanini Beethoven Violin Concerto Op.61",
+                    "description": "Chinese exact upload",
+                    "platform": "bilibili",
+                    "weight": 0.68,
+                    "same_recording_score": 0.97,
+                    "duration_seconds": 2316,
+                    "uploader": "Uploader B",
+                    "view_count": 1800,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://www.youtube.com/watch?v=XazjX-k2aco",
+                    "source_label": "YouTube Search",
+                    "source_kind": "streaming",
+                    "title": "Beethoven Violin Concerto Heifetz Toscanini 1940",
+                    "description": "Japanese exact upload",
+                    "platform": "youtube",
+                    "weight": 0.68,
+                    "same_recording_score": 0.97,
+                    "duration_seconds": 2326,
+                    "uploader": "Uploader C",
+                    "view_count": 2200,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://www.youtube.com/watch?v=8Aclk_O4bSc",
+                    "source_label": "YouTube Search",
+                    "source_kind": "streaming",
+                    "title": "Beethoven: Violin Concerto (Heifetz/Toscanini 1940)",
+                    "description": "Historic upload",
+                    "platform": "youtube",
+                    "weight": 0.68,
+                    "same_recording_score": 0.84,
+                    "duration_seconds": 2307,
+                    "uploader": "Collector A",
+                    "view_count": 1291,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://www.youtube.com/watch?v=9YWr1UcbZE8",
+                    "source_label": "YouTube Search",
+                    "source_kind": "streaming",
+                    "title": "Beethoven: Violin Concerto (1940) Heifetz/Toscanini",
+                    "description": (
+                        "Ludwig van Beethoven Violin Concerto in D, Op. 61 "
+                        "1. Allegro ma non troppo 2. Larghetto 3. Rondo "
+                        "Jascha Heifetz violin Arturo Toscanini conductor"
+                    ),
+                    "platform": "youtube",
+                    "weight": 0.68,
+                    "same_recording_score": 0.67,
+                    "duration_seconds": 2315,
+                    "uploader": "Private Reserve",
+                    "view_count": 1600,
+                    "fields": {},
+                    "images": [],
+                },
+            ]
+
+        async def search_fallback(self, draft, profile):
+            del draft, profile
+            return []
+
+    payload = sample_request()
+    payload["items"][0]["workTypeHint"] = "concerto"
+    payload["items"][0]["sourceLine"] = "Ludwig van Beethoven | Violin Concerto in D major, Op. 61 | Jascha Heifetz | - | -"
+    payload["items"][0]["seed"]["title"] = "托斯卡尼尼 - 海菲兹 - NBC Symphony Orchestra - March 11, 1940, in Studio 8H, Radio City"
+    payload["items"][0]["seed"]["composerNameLatin"] = "Ludwig van Beethoven"
+    payload["items"][0]["seed"]["workTitleLatin"] = "Violin Concerto in D major, Op. 61"
+    payload["items"][0]["seed"]["catalogue"] = "Op.61"
+    payload["items"][0]["seed"]["performanceDateText"] = ""
+    payload["items"][0]["seed"]["credits"] = [
+        {"role": "soloist", "displayName": "Jascha Heifetz", "label": "Jascha Heifetz"},
+    ]
+    request = CreateJobRequest.model_validate(payload)
+    pipeline = RetrievalPipeline(source_provider=SparseHeifetzAltProvider(), llm_client=None)
+
+    result = asyncio.run(pipeline.retrieve(request.items[0]))
+
+    final_urls = [link.url for link in result.result.links]
+    assert "https://www.youtube.com/watch?v=9YWr1UcbZE8" in final_urls
+
+
+def test_pipeline_keeps_sparse_heifetz_alternate_upload_even_when_llm_accepts_only_top_four() -> None:
+    class SparseHeifetzAltProvider:
+        async def inspect_existing_links(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_high_quality(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_streaming(self, draft, profile):
+            del draft, profile
+            return [
+                {
+                    "url": "https://www.bilibili.com/video/BV1vp421U7kw/",
+                    "source_label": "Bilibili Search",
+                    "source_kind": "streaming",
+                    "title": "Beethoven Violin Concerto in D Major Heifetz Toscanini NBC 1940",
+                    "description": "Chinese exact upload",
+                    "platform": "bilibili",
+                    "weight": 0.68,
+                    "same_recording_score": 0.97,
+                    "duration_seconds": 2312,
+                    "uploader": "Uploader A",
+                    "view_count": 2000,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://www.bilibili.com/video/BV1QF411s79n/",
+                    "source_label": "Bilibili Search",
+                    "source_kind": "streaming",
+                    "title": "Heifetz Toscanini Beethoven Violin Concerto Op.61",
+                    "description": "Chinese exact upload",
+                    "platform": "bilibili",
+                    "weight": 0.68,
+                    "same_recording_score": 0.97,
+                    "duration_seconds": 2316,
+                    "uploader": "Uploader B",
+                    "view_count": 1800,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://www.youtube.com/watch?v=XazjX-k2aco",
+                    "source_label": "YouTube Search",
+                    "source_kind": "streaming",
+                    "title": "Beethoven Violin Concerto Heifetz Toscanini 1940",
+                    "description": "Japanese exact upload",
+                    "platform": "youtube",
+                    "weight": 0.68,
+                    "same_recording_score": 0.97,
+                    "duration_seconds": 2326,
+                    "uploader": "Uploader C",
+                    "view_count": 2200,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://www.youtube.com/watch?v=8Aclk_O4bSc",
+                    "source_label": "YouTube Search",
+                    "source_kind": "streaming",
+                    "title": "Beethoven: Violin Concerto (Heifetz/Toscanini 1940)",
+                    "description": "Historic upload",
+                    "platform": "youtube",
+                    "weight": 0.68,
+                    "same_recording_score": 0.84,
+                    "duration_seconds": 2307,
+                    "uploader": "Collector A",
+                    "view_count": 1291,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://www.youtube.com/watch?v=9YWr1UcbZE8",
+                    "source_label": "YouTube Search",
+                    "source_kind": "streaming",
+                    "title": "Beethoven: Violin Concerto (1940) Heifetz/Toscanini",
+                    "description": (
+                        "Ludwig van Beethoven Violin Concerto in D, Op. 61 "
+                        "1. Allegro ma non troppo 2. Larghetto 3. Rondo "
+                        "Jascha Heifetz violin Arturo Toscanini conductor"
+                    ),
+                    "platform": "youtube",
+                    "weight": 0.68,
+                    "same_recording_score": 0.67,
+                    "duration_seconds": 2315,
+                    "uploader": "Private Reserve",
+                    "view_count": 1600,
+                    "fields": {},
+                    "images": [],
+                },
+            ]
+
+        async def search_fallback(self, draft, profile):
+            del draft, profile
+            return []
+
+    class FourUrlLlm:
+        async def synthesize(self, draft, profile, records):
+            del draft, profile, records
+            return {
+                "summary": "",
+                "notes": "",
+                "warnings": [],
+                "acceptedUrls": [
+                    "https://www.bilibili.com/video/BV1vp421U7kw/",
+                    "https://www.bilibili.com/video/BV1QF411s79n/",
+                    "https://www.youtube.com/watch?v=XazjX-k2aco",
+                    "https://www.youtube.com/watch?v=8Aclk_O4bSc",
+                ],
+            }
+
+    payload = sample_request()
+    payload["items"][0]["workTypeHint"] = "concerto"
+    payload["items"][0]["sourceLine"] = "Ludwig van Beethoven | Violin Concerto in D major, Op. 61 | Jascha Heifetz | - | -"
+    payload["items"][0]["seed"]["title"] = "Toscanini - Heifetz - NBC Symphony Orchestra - March 11, 1940, in Studio 8H, Radio City"
+    payload["items"][0]["seed"]["composerNameLatin"] = "Ludwig van Beethoven"
+    payload["items"][0]["seed"]["workTitleLatin"] = "Violin Concerto in D major, Op. 61"
+    payload["items"][0]["seed"]["catalogue"] = "Op.61"
+    payload["items"][0]["seed"]["performanceDateText"] = ""
+    payload["items"][0]["seed"]["credits"] = [
+        {"role": "soloist", "displayName": "Jascha Heifetz", "label": "Jascha Heifetz"},
+    ]
+    request = CreateJobRequest.model_validate(payload)
+    pipeline = RetrievalPipeline(source_provider=SparseHeifetzAltProvider(), llm_client=FourUrlLlm())
+
+    result = asyncio.run(pipeline.retrieve(request.items[0]))
+
+    final_urls = [link.url for link in result.result.links]
+    assert "https://www.youtube.com/watch?v=9YWr1UcbZE8" in final_urls
 
 
 def test_pipeline_aclose_closes_source_provider() -> None:
