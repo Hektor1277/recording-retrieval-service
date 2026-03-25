@@ -3,9 +3,11 @@ from __future__ import annotations
 import atexit
 import asyncio
 import sys
+import weakref
 from contextlib import asynccontextmanager
 from contextlib import suppress
 from dataclasses import dataclass
+from dataclasses import field
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -27,6 +29,16 @@ class BrowserPageSnapshot:
     view_count: int
 
 
+@dataclass(slots=True)
+class _LoopBrowserState:
+    browser: Any = None
+    playwright: Any = None
+    playwright_manager: Any = None
+    shared_bilibili_context: Any = None
+    browser_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    context_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+
 class PlaywrightBrowserFetcher:
     def __init__(
         self,
@@ -42,12 +54,7 @@ class PlaywrightBrowserFetcher:
         self._bilibili_user_agent = bilibili_user_agent.strip()
         self._bilibili_referer = bilibili_referer.strip() or "https://www.bilibili.com"
         self._bilibili_storage_state_path = bilibili_storage_state_path.strip()
-        self._playwright = None
-        self._playwright_manager = None
-        self._browser = None
-        self._shared_bilibili_context = None
-        self._browser_lock = asyncio.Lock()
-        self._context_lock = asyncio.Lock()
+        self._loop_states: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, _LoopBrowserState] = weakref.WeakKeyDictionary()
         self._atexit_registered = False
         atexit.register(self._aclose_sync)
         self._atexit_registered = True
@@ -193,53 +200,68 @@ class PlaywrightBrowserFetcher:
             raise BrowserFetchUnavailable(str(error)) from error
 
     async def aclose(self) -> None:
-        async with self._context_lock:
-            await self._safe_close(self._shared_bilibili_context)
-            self._shared_bilibili_context = None
-        async with self._browser_lock:
-            await self._safe_close(self._browser)
-            self._browser = None
-            with suppress(Exception):
-                if self._playwright is not None:
-                    await self._playwright.stop()
-            self._playwright_manager = None
-            self._playwright = None
+        for state in list(self._loop_states.values()):
+            async with state.context_lock:
+                await self._safe_close(state.shared_bilibili_context)
+                state.shared_bilibili_context = None
+            async with state.browser_lock:
+                await self._safe_close(state.browser)
+                state.browser = None
+                with suppress(Exception):
+                    if state.playwright is not None:
+                        await state.playwright.stop()
+                state.playwright_manager = None
+                state.playwright = None
+        self._loop_states = weakref.WeakKeyDictionary()
         if self._atexit_registered:
             with suppress(Exception):
                 atexit.unregister(self._aclose_sync)
             self._atexit_registered = False
 
     def _aclose_sync(self) -> None:
-        if self._browser is None and self._shared_bilibili_context is None and self._playwright_manager is None:
+        if all(
+            state.browser is None and state.shared_bilibili_context is None and state.playwright_manager is None
+            for state in self._loop_states.values()
+        ):
             return
         with suppress(BaseException):
             asyncio.run(self.aclose())
 
+    def _get_loop_state(self) -> _LoopBrowserState:
+        loop = asyncio.get_running_loop()
+        state = self._loop_states.get(loop)
+        if state is None:
+            state = _LoopBrowserState()
+            self._loop_states[loop] = state
+        return state
+
     async def _get_browser(self) -> Any:
-        if self._browser is not None:
-            return self._browser
-        async with self._browser_lock:
-            if self._browser is not None:
-                return self._browser
+        state = self._get_loop_state()
+        if state.browser is not None:
+            return state.browser
+        async with state.browser_lock:
+            if state.browser is not None:
+                return state.browser
             try:
                 from playwright.async_api import async_playwright
             except ImportError as error:  # pragma: no cover - environment dependent
                 raise BrowserFetchUnavailable("playwright is not installed") from error
-            self._playwright_manager = async_playwright()
-            self._playwright = await self._playwright_manager.start()
+            state.playwright_manager = async_playwright()
+            state.playwright = await state.playwright_manager.start()
             launch_options: dict[str, Any] = {"headless": True}
             if sys.platform == "win32":
                 launch_options["channel"] = "msedge"
-            self._browser = await self._playwright.chromium.launch(**launch_options)
-            return self._browser
+            state.browser = await state.playwright.chromium.launch(**launch_options)
+            return state.browser
 
     async def _get_context(self, url: str) -> tuple[Any, bool]:
         browser = await self._get_browser()
         if self._should_reuse_shared_context(url):
-            async with self._context_lock:
-                if self._shared_bilibili_context is None:
-                    self._shared_bilibili_context = await browser.new_context(**self._context_options_for_url(url))
-                return self._shared_bilibili_context, True
+            state = self._get_loop_state()
+            async with state.context_lock:
+                if state.shared_bilibili_context is None:
+                    state.shared_bilibili_context = await browser.new_context(**self._context_options_for_url(url))
+                return state.shared_bilibili_context, True
         return await browser.new_context(**self._context_options_for_url(url)), False
 
     @asynccontextmanager
