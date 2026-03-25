@@ -91,7 +91,7 @@ def materials_root() -> Path:
 
 
 def build_bilibili_metadata_from_detail(detail: BilibiliVideoDetail) -> dict[str, Any]:
-    parts = " ".join(compact(part) for part in detail.page_parts[:4] if compact(part))
+    parts = " ".join(compact(part) for part in detail.page_parts[:16] if compact(part))
     description = compact(detail.description)
     return {
         "title": compact(detail.title),
@@ -2048,10 +2048,12 @@ def score_recording_match(
             score += 0.04
     score += score_catalogue_fit(draft, haystack)
 
-    if looks_like_single_movement(haystack):
-        score -= 0.34
-    if looks_like_multi_work_compilation(haystack):
-        score -= 0.34
+    score += score_recording_container_preference(
+        haystack=haystack,
+        url=url,
+        work_matched=work_matched,
+        lead_hits=lead_hits,
+    )
     if "provided to youtube by" in haystack:
         score -= 0.1
     score += score_duration_fit(draft, haystack, duration_seconds)
@@ -2105,6 +2107,33 @@ def score_catalogue_fit(draft: DraftRecordingEntry, haystack: str) -> float:
     if seen_numbers and requested_numbers.isdisjoint(seen_numbers):
         return -0.2
     return 0.0
+
+
+def score_recording_container_preference(
+    *,
+    haystack: str,
+    url: str,
+    work_matched: bool,
+    lead_hits: int,
+) -> float:
+    lowered = haystack.lower()
+    score = 0.0
+    if looks_like_single_movement(haystack):
+        if looks_like_first_chapter_extract(f"{haystack} {url}") and work_matched and lead_hits >= 1:
+            score -= 0.16
+        else:
+            score -= 0.34
+    elif looks_like_multi_work_compilation(haystack):
+        if work_matched and lead_hits >= 1:
+            score -= 0.12
+        else:
+            score -= 0.34
+    elif has_complete_work_tracklist(haystack) or any(marker in lowered for marker in ("full", "complete", "full performance")):
+        score += 0.04
+
+    if re.search(r"[?&]p=\d+", url, re.I):
+        score -= 0.04
+    return score
 
 
 def has_complete_work_tracklist(haystack: str) -> bool:
@@ -2582,6 +2611,16 @@ def looks_like_single_movement(value: str) -> bool:
         r"\baria\b",
     ]
     return any(re.search(pattern, value, re.I) for pattern in patterns)
+
+
+def looks_like_first_chapter_extract(value: str) -> bool:
+    patterns = [
+        r"(?:^|[\s(:\-–—])(i|1)\.\s",
+        r"\b1st movement\b",
+        r"\bfirst movement\b",
+        r"[?&]p=1\b",
+    ]
+    return any(re.search(pattern, value or "", re.I) for pattern in patterns)
 
 
 def looks_like_multi_work_compilation(value: str) -> bool:

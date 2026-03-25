@@ -5,7 +5,17 @@ import time
 
 from app.models.protocol import CreateJobRequest
 from app.services.http_sources import HttpSourceProvider
-from app.services.pipeline import InputNormalizer, ProfileResolver, RetrievalPipeline, build_latin_work_alias, build_queries
+from app.services.pipeline import (
+    DraftRecordingEntry,
+    InputNormalizer,
+    LinkCandidate,
+    ProfileResolver,
+    RetrievalPipeline,
+    SourceRecord,
+    build_latin_work_alias,
+    build_queries,
+    sort_link_candidates,
+)
 from tests.fixtures import sample_request
 
 
@@ -881,6 +891,94 @@ def test_pipeline_promotes_clean_same_recording_upload_variant_into_final_links(
     final_urls = [link.url for link in result.result.links]
     assert "https://www.youtube.com/watch?v=9YWr1UcbZE8" in final_urls
     assert "https://www.youtube.com/watch?v=-rUNkiGgJx8" not in final_urls
+
+
+def test_sort_link_candidates_prefers_standalone_then_collection_then_first_movement() -> None:
+    draft = DraftRecordingEntry(
+        item_id="recording-larrocha-priority",
+        title="萨瓦利施 - 拉罗查 - 瑞士罗曼德管弦乐团 - January 12, 1977",
+        composer_name="罗伯特·舒曼",
+        composer_name_latin="Robert Schumann",
+        work_title="a小调钢琴协奏曲",
+        work_title_latin="Piano Concerto, Op.54",
+        catalogue="Op.54",
+        performance_date_text="January 12, 1977",
+        venue_text="",
+        album_title="",
+        label="",
+        release_date="",
+        notes="",
+        source_line="Robert Schumann | Piano Concerto in A minor, Op.54 | Alicia de Larrocha | Wolfgang Sawallisch | Orchestre de la Suisse Romande | January 12, 1977",
+        raw_text="",
+        existing_links=[],
+        primary_names=["阿利西亚·德·拉罗查"],
+        primary_names_latin=["Alicia de Larrocha"],
+        secondary_names=["沃尔夫冈·萨瓦利施"],
+        secondary_names_latin=["Wolfgang Sawallisch"],
+        lead_names=["阿利西亚·德·拉罗查", "沃尔夫冈·萨瓦利施"],
+        lead_names_latin=["Alicia de Larrocha", "Wolfgang Sawallisch"],
+        ensemble_names=["瑞士罗曼德管弦乐团"],
+        ensemble_names_latin=["Orchestre de la Suisse Romande"],
+    )
+    record_map = {
+        "https://www.youtube.com/watch?v=standalone": SourceRecord(
+            url="https://www.youtube.com/watch?v=standalone",
+            source_label="YouTube Search",
+            source_kind="streaming",
+            title="Schumann Piano Concerto in A minor, Op.54 Alicia de Larrocha Sawallisch complete live",
+            description="Full standalone performance 1977",
+            platform="youtube",
+            weight=0.68,
+            same_recording_score=0.78,
+            duration_seconds=1880,
+            uploader="Official Archive",
+            view_count=1000,
+        ),
+        "https://www.bilibili.com/video/BV1collection?p=12": SourceRecord(
+            url="https://www.bilibili.com/video/BV1collection?p=12",
+            source_label="Bilibili Search",
+            source_kind="streaming",
+            title="Alicia de Larrocha live 1977 Brahms and Schumann concertos",
+            description="Collection upload including Schumann Piano Concerto Op.54 with Sawallisch",
+            platform="bilibili",
+            weight=0.68,
+            same_recording_score=0.78,
+            duration_seconds=5400,
+            uploader="Archive Channel",
+            view_count=1000,
+        ),
+        "https://www.youtube.com/watch?v=movement1": SourceRecord(
+            url="https://www.youtube.com/watch?v=movement1",
+            source_label="YouTube Search",
+            source_kind="streaming",
+            title="Schumann Piano Concerto in A minor, Op.54 I. Allegro affettuoso Alicia de Larrocha",
+            description="Single movement upload from the same concert",
+            platform="youtube",
+            weight=0.68,
+            same_recording_score=0.78,
+            duration_seconds=620,
+            uploader="Archive Channel",
+            view_count=1000,
+        ),
+    }
+    candidates = [
+        LinkCandidate(
+            platform=record.platform,
+            url=record.url,
+            title=record.title,
+            sourceLabel=record.source_label,
+            confidence=round(record.same_recording_score, 2),
+        )
+        for record in record_map.values()
+    ]
+
+    ordered = sort_link_candidates(draft, candidates, record_map)
+
+    assert [candidate.url for candidate in ordered] == [
+        "https://www.youtube.com/watch?v=standalone",
+        "https://www.bilibili.com/video/BV1collection?p=12",
+        "https://www.youtube.com/watch?v=movement1",
+    ]
 
 
 def test_pipeline_skips_llm_synthesis_for_unambiguous_top_candidate() -> None:

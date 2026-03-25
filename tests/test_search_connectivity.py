@@ -9,6 +9,7 @@ import httpx
 
 from app.services.http_sources import (
     HttpSourceProvider,
+    build_bilibili_metadata_from_detail,
     build_work_aliases,
     extract_bing_result_links,
     looks_like_single_movement,
@@ -20,6 +21,7 @@ from app.services.http_sources import (
     select_bilibili_browser_queries,
 )
 from app.services.pipeline import DraftRecordingEntry, RetrievalProfile
+from app.services.platform_clients import BilibiliVideoDetail
 from app.services.platform_search_config import (
     AppleMusicSearchConfig,
     BilibiliSearchConfig,
@@ -1965,6 +1967,30 @@ def test_provider_uses_page_body_text_to_score_sparse_collaboration_upload(tmp_p
     assert row["same_recording_score"] >= 0.75
 
 
+def test_build_bilibili_metadata_from_detail_keeps_late_page_parts_for_multi_p_target() -> None:
+    detail = BilibiliVideoDetail(
+        endpoint_url="https://api.bilibili.com/x/web-interface/view?bvid=BV1lateparts",
+        title="Larrocha拉罗查现场录音③勃拉姆斯、舒曼 Brahms Schumann",
+        description="Alicia de Larrocha live collection",
+        image_url="https://img.example/cover.jpg",
+        uploader="天霁通明",
+        bvid="BV1lateparts",
+        duration_seconds=5400,
+        view_count=1200,
+        page_parts=[
+            "Brahms Concerto",
+            "Interview",
+            "Encore",
+            "Credits",
+            "Schumann Piano Concerto Op.54",
+        ],
+    )
+
+    metadata = build_bilibili_metadata_from_detail(detail)
+
+    assert "Schumann Piano Concerto Op.54" in metadata["body_text"]
+
+
 def test_provider_falls_back_to_search_engine_when_apple_html_is_empty(tmp_path: Path) -> None:
     root = tmp_path / "source-profiles"
     root.mkdir(parents=True)
@@ -3005,6 +3031,57 @@ def test_score_recording_match_penalizes_wrong_year_and_multi_work_compilations(
     )
 
     assert exact_hit > wrong_year
+
+
+def test_score_recording_match_keeps_collection_above_first_movement_when_both_match_version() -> None:
+    draft = DraftRecordingEntry(
+        item_id="recording-larrocha-priority",
+        title="萨瓦利施 - 拉罗查 - 瑞士罗曼德管弦乐团 - January 12, 1977",
+        composer_name="罗伯特·舒曼",
+        composer_name_latin="Robert Schumann",
+        work_title="a小调钢琴协奏曲",
+        work_title_latin="Piano Concerto, Op.54",
+        catalogue="Op.54",
+        performance_date_text="January 12, 1977",
+        venue_text="",
+        album_title="",
+        label="",
+        release_date="",
+        notes="",
+        source_line="Robert Schumann | Piano Concerto in A minor, Op.54 | Alicia de Larrocha | Wolfgang Sawallisch | Orchestre de la Suisse Romande | January 12, 1977",
+        raw_text="",
+        existing_links=[],
+        primary_names=["阿利西亚·德·拉罗查"],
+        primary_names_latin=["Alicia de Larrocha"],
+        secondary_names=["沃尔夫冈·萨瓦利施"],
+        secondary_names_latin=["Wolfgang Sawallisch"],
+        lead_names=["阿利西亚·德·拉罗查", "沃尔夫冈·萨瓦利施"],
+        lead_names_latin=["Alicia de Larrocha", "Wolfgang Sawallisch"],
+        ensemble_names=["瑞士罗曼德管弦乐团"],
+        ensemble_names_latin=["Orchestre de la Suisse Romande"],
+    )
+
+    standalone = score_recording_match(
+        "Schumann Piano Concerto in A minor, Op.54 Alicia de Larrocha Wolfgang Sawallisch Orchestre de la Suisse Romande 1977 complete live Full standalone performance",
+        "https://www.youtube.com/watch?v=standalone",
+        draft,
+        duration_seconds=1880,
+    )
+    collection = score_recording_match(
+        "Alicia de Larrocha live 1977 Brahms and Schumann concertos complete collection Sawallisch including Schumann Piano Concerto Op.54 Wolfgang Sawallisch Orchestre de la Suisse Romande",
+        "https://www.bilibili.com/video/BV1collection?p=12",
+        draft,
+        duration_seconds=5400,
+    )
+    first_movement = score_recording_match(
+        "Schumann Piano Concerto in A minor, Op.54 I. Allegro affettuoso Alicia de Larrocha Sawallisch 1977",
+        "https://www.youtube.com/watch?v=movement1",
+        draft,
+        duration_seconds=620,
+    )
+
+    assert standalone >= collection
+    assert collection > first_movement
 
 
 def test_score_recording_match_penalizes_chamber_multi_sonata_compilations() -> None:

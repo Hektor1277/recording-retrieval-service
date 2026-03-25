@@ -1198,6 +1198,7 @@ def link_candidate_sort_key(
     title = compact(candidate.title)
     lowered = title.lower()
     exactness = candidate_title_quality_score(draft, title)
+    packaging = candidate_packaging_priority_score(candidate, record)
     if record is not None:
         if record.duration_seconds > 0:
             exactness += 0.03
@@ -1218,7 +1219,8 @@ def link_candidate_sort_key(
     if "provided to youtube by" in lowered:
         exactness -= 0.08
     return (
-        round(confidence + exactness, 4),
+        round(confidence + exactness + packaging, 4),
+        round(packaging, 4),
         round(exactness, 4),
         record.view_count if record is not None else 0,
         -len(title),
@@ -1232,6 +1234,7 @@ def ambiguous_link_candidate_sort_key(
 ) -> tuple[float, float, float, int]:
     title = compact(candidate.title)
     exactness = candidate_title_quality_score(draft, title)
+    packaging = candidate_packaging_priority_score(candidate, record)
     metadata_support = 0.0
     if record is not None:
         if record.duration_seconds > 0:
@@ -1250,11 +1253,78 @@ def ambiguous_link_candidate_sort_key(
             metadata_support += 0.02
     confidence = min(candidate.confidence or 0.0, 0.88)
     return (
-        round(exactness + metadata_support, 4),
+        round(exactness + metadata_support + packaging, 4),
+        round(packaging, 4),
         round(confidence, 4),
         round((candidate.confidence or 0.0) + exactness, 4),
         record.view_count if record is not None else 0,
     )
+
+
+def candidate_packaging_priority_score(candidate: LinkCandidate, record: SourceRecord | None) -> float:
+    text = " ".join(
+        part
+        for part in [
+            compact(candidate.title),
+            compact(record.description) if record is not None else "",
+            compact(candidate.url),
+        ]
+        if compact(part)
+    )
+    lowered = text.lower()
+    score = 0.0
+    if re.search(r"[?&]p=\d+", candidate.url, re.I):
+        score -= 0.04
+    if looks_like_title_single_movement(text):
+        if looks_like_title_first_chapter(text):
+            score -= 0.22
+        else:
+            score -= 0.28
+    elif looks_like_title_multi_work_compilation(text):
+        score -= 0.06
+    elif any(marker in lowered for marker in ("full", "complete", "full performance")):
+        score += 0.04
+    return score
+
+
+def looks_like_title_single_movement(value: str) -> bool:
+    patterns = [
+        r"(?:^|[\s(:\-–—])(i{1,3}|iv|v)\.\s",
+        r"(?:^|[\s(:\-–—])([1-9])\.\s",
+        r"\b(?:1st|2nd|3rd|4th|first|second|third|fourth)\s+movement\b",
+        r"\ballegro\b",
+        r"\badagio\b",
+        r"\bandante\b",
+        r"\bscherzo\b",
+        r"\brondo\b",
+    ]
+    return any(re.search(pattern, value or "", re.I) for pattern in patterns)
+
+
+def looks_like_title_first_chapter(value: str) -> bool:
+    patterns = [
+        r"(?:^|[\s(:\-–—])(i|1)\.\s",
+        r"\b1st movement\b",
+        r"\bfirst movement\b",
+        r"[?&]p=1\b",
+    ]
+    return any(re.search(pattern, value or "", re.I) for pattern in patterns)
+
+
+def looks_like_title_multi_work_compilation(value: str) -> bool:
+    patterns = [
+        r"nos?\.\s*\d+\s*(?:and|&)\s*\d+",
+        r"\bnos?\s*\d+\s*,\s*\d+",
+        r"\bnos?\s*\d+\s*/\s*\d+",
+        r"\bconcertos\b",
+        r"\bsonatas\b",
+        r" overture",
+        r" overtures",
+        r" works /",
+        r" works by",
+        r"\bbrahms\b.+\bschumann\b",
+    ]
+    return any(re.search(pattern, value or "", re.I) for pattern in patterns)
 
 
 def candidate_title_quality_score(draft: DraftRecordingEntry, title: str) -> float:

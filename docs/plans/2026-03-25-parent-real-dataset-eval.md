@@ -211,14 +211,76 @@
   - 更像是少数父项目历史真值本身就偏宽、偏合集或缺少唯一性
   - 下一轮如果要进一步提高评估可信度，应该优先把这些 `available_but_suspicious` 原始链接单独标注，而不是先放宽检索口径
 
+## Parent Priority Rule
+
+- 用户补充确认了父项目历史收录规则，优先级固定为：
+  - `独立且仅相关内容的全量视频`
+  - `含其他内容的多分P视频`（如完整专辑中的目标曲目）
+  - `合集`
+  - `单章节视频`
+    - 仅允许 `首章节/第一乐章`
+    - 不会把中间乐章当作真值
+- 同时约束也很强：
+  - 这些链接可能不是最理想包装
+  - 但不会是“错误版本链接”
+
+## Optimization 4
+
+- 针对这条收录规则，本轮把“同版判定”和“包装优先级”显式拆开：
+  - `Bilibili detail hydration`（Bilibili 详情补水）不再只保留前 `4` 个 `page_parts`
+    - 改为保留前 `16` 个
+    - 这样 `p=12` 这类后段目标曲目也能进入 `body_text`
+  - `score_recording_match` 不再把以下情况一刀切当作“错误链接”：
+    - `multi-work compilation`（合集）
+    - `first chapter / first movement`（首章节/第一乐章）
+  - 现在策略改成：
+    - 独立全量：最高优先级
+    - 合法合集/多分P：仍可作为同版命中
+    - 第一乐章：保留为最后优先级，不再和“中间乐章/错误章节”混为一谈
+  - `sort_link_candidates` 增加了 `packaging priority`（包装优先级）排序因子
+    - 在同版分接近时，稳定优先：
+      - `standalone full`
+      - `collection / multi-p`
+      - `first movement`
+
+### Deterministic Regression
+
+- 新增确定性回归测试覆盖：
+  - `Bilibili` 后段分P标题进入 `body_text`
+  - `collection > first movement` 的同版分顺序
+  - `standalone > collection > first movement` 的最终链接排序
+
+### Sixth Run
+
+- 第六轮舒曼整部作品 live 结果：
+  - `overall`
+    - `strict`: `9/28 finalHit`, `12/28 candidateHit`
+    - `relaxed`: `11/28 finalHit`, `13/28 candidateHit`
+  - `strict miss`：
+    - `final_selection_miss`: `2`
+    - `same_platform_alt_upload`: `2`
+    - `recall_miss`: `15`
+
+- 和第五轮相比，这轮 live 盘面没有整体上扬，主要仍受外部检索波动影响：
+  - `strict finalHit / candidateHit` 持平
+  - `relaxed` 口径略回落
+  - 代表性波动样本是 `Cortot partial`
+
+- 当前判断：
+  - 这轮改动的价值主要体现在“逻辑与父项目收录规则对齐”
+  - 以及“确定性排序行为”稳定，而不是立即体现在单次 live 盘面的总分数
+  - 下一轮若继续看真实集，应重点区分：
+    - `policy-aligned fallback`（符合父项目规则的降级链接）
+    - `actual recall miss`（真正召回不到）
+
 ## Artifact Paths
 
 - 数据集：
   - `output/parent_work_eval_schumann_op54_dataset_v5.json`
 - 结果：
-  - `output/parent_work_eval_schumann_op54_results_v5.json`
+  - `output/parent_work_eval_schumann_op54_results_v6.json`
 - 访问报告：
-  - `output/parent_work_eval_schumann_op54_access_v5.json`
+  - `output/parent_work_eval_schumann_op54_access_v6.json`
 - 链接审计：
   - `output/parent_work_eval_schumann_op54_link_audit_v2.json`
 
