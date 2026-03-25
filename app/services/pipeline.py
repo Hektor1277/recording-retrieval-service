@@ -538,6 +538,9 @@ def build_latin_credit_variants(primary_value: str, aliases: list[str]) -> list[
     for candidate in candidates:
         if not candidate:
             continue
+        explicit_latin = extract_explicit_latin_alias(candidate)
+        if explicit_latin:
+            variants.append(explicit_latin)
         cleaned = strip_alias_annotations(candidate)
         if not looks_latin(cleaned):
             continue

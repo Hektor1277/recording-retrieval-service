@@ -117,18 +117,77 @@
   - 真值口径偏严
     - 某些结果是同一演出版本的其他上传链接，但不等于父项目当前保存链接
 
+## Follow-up Optimization
+
+### Optimization 3
+
+- 继续沿 `recall_miss`（召回缺失）排查，发现父项目真实失败样本中有一批目标视频标题直接使用中文简写：
+  - `舒曼钢协`
+  - `a小调钢协`
+- 旧链路虽然能生成 `piano concerto / klavierkonzert` 等拉丁别名，但不会把 `钢协` 这类中文短别名送进 Bilibili 实际查询列表。
+- 本轮补了两处：
+  - `build_work_aliases` 新增中文 `piano concerto`（钢琴协奏曲）短别名：
+    - `钢协`
+    - `a小调钢协`
+  - 中文 host 的 `_queries_for_host` 保底保留 `1` 条最短 `alias query`（别名查询），避免被较长的 `primary / zh / latin` 查询全部挤掉
+
+### Fifth Run
+
+- 第五轮结果：
+  - `overall`
+    - `strict`: `9/28 finalHit`, `12/28 candidateHit`
+    - `relaxed`: `12/28 finalHit`, `14/28 candidateHit`
+  - `full`
+    - `strict`: `5/14 finalHit`, `6/14 candidateHit`
+    - `relaxed`: `6/14 finalHit`, `7/14 candidateHit`
+  - `partial`
+    - `strict`: `4/14 finalHit`, `6/14 candidateHit`
+    - `relaxed`: `6/14 finalHit`, `7/14 candidateHit`
+
+- 与第四轮相比：
+  - `strict finalHit`: `8 -> 9`
+  - `strict candidateHit`: `10 -> 12`
+  - `relaxed finalHit`: `11 -> 12`
+  - `relaxed candidateHit`: `12 -> 14`
+  - `recall_miss`: `16 -> 14`
+
+- 这轮直接拉回的样本包括：
+  - `Annie Fischer / Christoph Perick 1985 full`
+  - `Benno Moiseiwitsch partial`
+
+### Remaining Failure Shape
+
+- 剩余 `relaxed final miss` 仍以 `recall_miss` 为主，但失败画像已经更清晰：
+  - `full miss`
+    - `Grinberg / Eliasberg 1958`
+    - `Kempff / Dorati 1959`
+    - `de Lara / Whyte 1951`
+    - `Richter / Ferencsik 1954`
+  - `cross-platform same performance`
+    - `Gieseking / Furtwängler 1942`
+    - `Claudio Arrau / Jochum 1977`
+    - 当前结果能找到高置信 `YouTube` 版本，但不属于现有“同平台替代上传”宽松口径
+  - `final selection gap`
+    - `Virsaladze / Rudin full`
+    - `Alicia de Larrocha partial` 仍有 `final_selection_after_llm_timeout`
+
+- 说明下一轮如果继续提升真实命中率，优先级应从“再加更多短 query”切到两类：
+  - 长尾人名/俄语转写的 `recall`（召回）增强
+  - 是否引入“跨平台同版”辅助评估口径，但不能覆盖现有严格口径
+
 ## Artifact Paths
 
 - 数据集：
-  - `output/parent_work_eval_schumann_op54_dataset_v3.json`
+  - `output/parent_work_eval_schumann_op54_dataset_v5.json`
 - 结果：
-  - `output/parent_work_eval_schumann_op54_results_v3.json`
+  - `output/parent_work_eval_schumann_op54_results_v5.json`
 - 访问报告：
-  - `output/parent_work_eval_schumann_op54_access_v3.json`
+  - `output/parent_work_eval_schumann_op54_access_v5.json`
 
 ## Next Candidates
 
 - 优先继续看：
   - `candidateHit=true && finalHit=false`
   - `LLM timeout`（LLM 超时）导致的最终链接漏采纳
+  - 长尾钢琴家/指挥的 `query enrichment`（查询富化）
   - 同演出跨平台/多上传的“严格真值”判定口径

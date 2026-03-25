@@ -1150,6 +1150,13 @@ def test_build_work_aliases_infers_violin_concerto_from_chinese_title() -> None:
     assert "violin concerto in d major" in aliases
 
 
+def test_build_work_aliases_adds_chinese_piano_concerto_shorthand() -> None:
+    aliases = build_work_aliases("a小调钢琴协奏曲")
+
+    assert "钢协" in aliases
+    assert "a小调钢协" in aliases
+
+
 def test_provider_prefers_youtube_api_when_configured(tmp_path: Path) -> None:
     root = tmp_path / "source-profiles"
     root.mkdir(parents=True)
@@ -1297,6 +1304,44 @@ def test_queries_for_host_keep_soloist_only_work_query_for_concerto_full_draft()
 
     assert "Piano Concerto, Op.54 Annie Fischer" in queries
     assert any("Annie Fischer" in query and "klavierkonzert" in query.lower() for query in queries)
+
+
+def test_queries_for_host_add_bilibili_chinese_shorthand_alias_for_concerto() -> None:
+    provider = HttpSourceProvider()
+    draft = DraftRecordingEntry(
+        item_id="recording-annie-query-zh-1",
+        title="Annie Fischer & Kletzki",
+        composer_name="舒曼",
+        composer_name_latin="Robert Schumann",
+        work_title="a小调钢琴协奏曲",
+        work_title_latin="Piano Concerto, Op.54",
+        catalogue="Op.54",
+        performance_date_text="",
+        venue_text="",
+        album_title="",
+        label="",
+        release_date="",
+        notes="",
+        source_line="Robert Schumann | Piano Concerto in A Minor, Op.54 | Annie Fischer | Kletzki | Budapest Philharmonic Orchestra | -",
+        raw_text="Robert Schumann | Piano Concerto in A Minor, Op.54 | Annie Fischer | Kletzki | Budapest Philharmonic Orchestra | -",
+        existing_links=[],
+        primary_names=["Annie Fischer"],
+        primary_names_latin=["Annie Fischer"],
+        secondary_names=["Kletzki"],
+        secondary_names_latin=["Kletzki"],
+        query_lead_names=["安妮·费舍尔", "Annie Fischer", "凯莱茨基", "Kletzki"],
+        query_lead_names_latin=["Annie Fischer", "Kletzki"],
+        lead_names=["安妮·费舍尔", "Annie Fischer", "凯莱茨基", "Kletzki"],
+        lead_names_latin=["Annie Fischer", "Kletzki"],
+        ensemble_names=["布达佩斯爱乐乐团", "Budapest Philharmonic Orchestra"],
+        ensemble_names_latin=["Budapest Philharmonic Orchestra"],
+    )
+    profile = RetrievalProfile(category="concerto", tags=[], queries=[], latin_queries=[], zh_queries=[], mixed_queries=[])
+    host = next(host for host in provider._profile_loader.load(category="concerto", tags=[]).streaming if "bilibili.com" in host.url)
+
+    queries = provider._queries_for_host(draft, profile, host)
+
+    assert any("钢协" in query and ("Annie Fischer" in query or "安妮" in query) for query in queries)
 
 
 def test_provider_prefers_apple_music_api_when_configured(tmp_path: Path) -> None:

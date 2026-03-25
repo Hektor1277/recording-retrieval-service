@@ -439,6 +439,41 @@ def test_input_normalizer_adds_person_lookup_latin_aliases_for_query_generation(
     assert any("Walter Gieseking Wilhelm Furtwangler" in query for query in draft.query_lead_names_latin)
 
 
+def test_input_normalizer_extracts_english_alias_from_person_lookup_name_latin_payload() -> None:
+    class FakePersonNameLookup:
+        def resolve(self, person_id: str):
+            mapping = {
+                "person-solo": {
+                    "name": "斯维亚托斯拉夫·特奥菲洛维奇·里赫特",
+                    "nameLatin": "Святослав Теофилович Рихтер, EN: Sviatoslav Teofilovich Richter",
+                    "aliases": ["里赫特", "斯维亚托斯拉夫·里赫特"],
+                },
+            }
+            return mapping.get(person_id)
+
+    payload = sample_request()
+    payload["items"][0]["workTypeHint"] = "concerto"
+    payload["items"][0]["seed"]["composerName"] = "罗伯特·舒曼"
+    payload["items"][0]["seed"]["composerNameLatin"] = "Robert Schumann"
+    payload["items"][0]["seed"]["workTitle"] = "a小调钢琴协奏曲"
+    payload["items"][0]["seed"]["workTitleLatin"] = "Piano Concerto, Op.54"
+    payload["items"][0]["seed"]["catalogue"] = "Op.54"
+    payload["items"][0]["seed"]["credits"] = [
+        {
+            "role": "soloist",
+            "personId": "person-solo",
+            "displayName": "斯维亚托斯拉夫·特奥菲洛维奇·里赫特",
+            "label": "",
+        },
+    ]
+    request = CreateJobRequest.model_validate(payload)
+
+    draft = InputNormalizer(person_name_lookup=FakePersonNameLookup()).normalize(request.items[0])
+
+    assert "Sviatoslav Teofilovich Richter" in draft.primary_names_latin
+    assert any("Sviatoslav Teofilovich Richter" in query for query in draft.query_lead_names_latin)
+
+
 def test_input_normalizer_recovers_concerto_collaborator_group_and_date_from_title() -> None:
     payload = sample_request()
     payload["items"][0]["workTypeHint"] = "concerto"

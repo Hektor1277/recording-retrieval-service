@@ -1056,6 +1056,12 @@ class HttpSourceProvider:
                 title=draft.title,
                 performance_date_text=draft.performance_date_text,
             )
+            alias_queries = self._alias_queries_for_host(
+                draft,
+                host,
+                lead_terms=dedupe_text([*zh_leads, *latin_leads]),
+                ensemble_terms=dedupe_text([*zh_ensembles, *latin_ensembles]),
+            )
             generated_queries = prioritize_platform_queries(
                 [
                     *primary_only_queries[:4],
@@ -1063,18 +1069,14 @@ class HttpSourceProvider:
                     *latin_queries[:3],
                     *profile.mixed_queries[:1],
                     *mixed_queries[:2],
-                    *self._alias_queries_for_host(
-                        draft,
-                        host,
-                        lead_terms=dedupe_text([*zh_leads, *latin_leads]),
-                        ensemble_terms=dedupe_text([*zh_ensembles, *latin_ensembles]),
-                    )[:2],
+                    *alias_queries[:2],
                 ],
                 draft=draft,
                 prefer_cjk=True,
             )
             return dedupe_text([
                 *primary_only_queries[:4],
+                *alias_queries[:1],
                 *profile.zh_queries[:2],
                 *profile.latin_queries[:2],
                 *generated_queries,
@@ -2255,6 +2257,7 @@ def build_work_aliases(value: str) -> set[str]:
     stripped = normalize_text(strip_catalogue_text(text))
     if stripped:
         aliases.add(stripped)
+    aliases.update(build_chinese_work_shorthand_aliases(text, normalized))
     aliases.update(build_keyed_work_aliases(text))
     aliases.update(build_named_work_aliases(text))
 
@@ -2291,6 +2294,19 @@ def build_work_aliases(value: str) -> set[str]:
     if english_form == "symphony":
         aliases.add(f"sym {number}")
         aliases.add(f"sym{number}")
+    return aliases
+
+
+def build_chinese_work_shorthand_aliases(text: str, normalized: str) -> set[str]:
+    aliases: set[str] = set()
+    if "协奏曲" not in text:
+        return aliases
+    if "piano" not in infer_concerto_instruments(text, normalized):
+        return aliases
+    aliases.add("钢协")
+    cn_match = re.search(r"([A-Ga-g])\s*(大调|小调)", text)
+    if cn_match:
+        aliases.add(f"{cn_match.group(1).lower()}{cn_match.group(2)}钢协")
     return aliases
 
 
