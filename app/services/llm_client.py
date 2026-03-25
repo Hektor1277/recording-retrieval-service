@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import threading
+import weakref
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 
@@ -156,9 +159,16 @@ def is_llm_configured(config: LlmConfigBundle | None) -> bool:
 
 
 class OpenAiCompatibleLlmClient:
-    def __init__(self, config: ModelConfig, client: httpx.AsyncClient | None = None) -> None:
+    def __init__(
+        self,
+        config: ModelConfig,
+        client: httpx.AsyncClient | None = None,
+        client_factory: Callable[[], httpx.AsyncClient] | None = None,
+    ) -> None:
         self._config = config
-        self._client = client or httpx.AsyncClient(timeout=config.timeout_ms / 1000)
+        self._client_factory = client_factory or (lambda: client or httpx.AsyncClient(timeout=config.timeout_ms / 1000))
+        self._loop_clients: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, httpx.AsyncClient] = weakref.WeakKeyDictionary()
+        self._loop_clients_lock = threading.Lock()
 
     @property
     def minimum_synthesis_timeout_seconds(self) -> float:
@@ -227,7 +237,7 @@ class OpenAiCompatibleLlmClient:
         return await self._chat_json(messages)
 
     async def _chat_json(self, messages: list[dict[str, str]]) -> dict[str, Any]:
-        response = await self._client.post(
+        response = await self._get_client().post(
             f"{self._config.base_url}/chat/completions",
             headers={
                 "content-type": "application/json",
@@ -245,6 +255,15 @@ class OpenAiCompatibleLlmClient:
         payload = response.json()
         content = str(payload.get("choices", [{}])[0].get("message", {}).get("content", "")).strip()
         return normalize_llm_payload(parse_json_object(content))
+
+    def _get_client(self) -> httpx.AsyncClient:
+        loop = asyncio.get_running_loop()
+        with self._loop_clients_lock:
+            client = self._loop_clients.get(loop)
+            if client is None:
+                client = self._client_factory()
+                self._loop_clients[loop] = client
+            return client
 
 
 class DualModelLlmClient:
