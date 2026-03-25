@@ -362,6 +362,83 @@ def test_input_normalizer_infers_missing_chamber_collaborator_from_title() -> No
     assert "Jean Fournier Ginette Doyen" in draft.query_lead_names_latin
 
 
+def test_input_normalizer_uses_person_id_lookup_for_missing_latin_credit_names() -> None:
+    class FakePersonNameLookup:
+        def resolve(self, person_id: str):
+            mapping = {
+                "person-solo": {"name": "安妮·费舍尔", "nameLatin": "Annie Fischer"},
+                "person-cond": {"name": "保罗·克列茨基", "nameLatin": "Paul Kletzki"},
+                "person-orch": {"name": "布达佩斯爱乐乐团", "nameLatin": "Budapest Philharmonic Orchestra"},
+            }
+            return mapping.get(person_id)
+
+    payload = sample_request()
+    payload["items"][0]["workTypeHint"] = "concerto"
+    payload["items"][0]["sourceLine"] = "舒曼 | a小调钢琴协奏曲 | 安妮·费舍尔 | 保罗·克列茨基 | 布达佩斯爱乐乐团 | -"
+    payload["items"][0]["seed"]["title"] = "克列茨基 - 安妮 - 布达佩斯爱乐乐团"
+    payload["items"][0]["seed"]["composerName"] = "罗伯特·舒曼"
+    payload["items"][0]["seed"]["composerNameLatin"] = "Robert Schumann"
+    payload["items"][0]["seed"]["workTitle"] = "a小调钢琴协奏曲"
+    payload["items"][0]["seed"]["workTitleLatin"] = "Piano Concerto, Op.54"
+    payload["items"][0]["seed"]["catalogue"] = "Op.54"
+    payload["items"][0]["seed"]["credits"] = [
+        {"role": "soloist", "personId": "person-solo", "displayName": "安妮·费舍尔", "label": ""},
+        {"role": "conductor", "personId": "person-cond", "displayName": "保罗·克列茨基", "label": ""},
+        {"role": "orchestra", "personId": "person-orch", "displayName": "布达佩斯爱乐乐团", "label": ""},
+    ]
+    request = CreateJobRequest.model_validate(payload)
+
+    draft = InputNormalizer(person_name_lookup=FakePersonNameLookup()).normalize(request.items[0])
+
+    assert draft.primary_names_latin[0] == "Annie Fischer"
+    assert draft.secondary_names_latin[0] == "Paul Kletzki"
+    assert "Budapest Philharmonic Orchestra" in draft.ensemble_names_latin
+    assert "Annie Fischer Paul Kletzki" in draft.query_lead_names_latin
+
+
+def test_input_normalizer_adds_person_lookup_latin_aliases_for_query_generation() -> None:
+    class FakePersonNameLookup:
+        def resolve(self, person_id: str):
+            mapping = {
+                "person-solo": {
+                    "name": "瓦尔特·吉泽金",
+                    "nameLatin": "Walter Gieseking",
+                    "aliases": ["吉泽金"],
+                },
+                "person-cond": {
+                    "name": "威尔海姆·富特文格勒",
+                    "nameLatin": "Wilhelm Furtwängler",
+                    "aliases": ["Wilhelm Furtwangler", "富特文格勒"],
+                },
+                "person-orch": {
+                    "name": "柏林爱乐乐团",
+                    "nameLatin": "Berliner Philharmoniker",
+                    "aliases": ["Berlin Philharmonic Orchestra", "BPO"],
+                },
+            }
+            return mapping.get(person_id)
+
+    payload = sample_request()
+    payload["items"][0]["workTypeHint"] = "concerto"
+    payload["items"][0]["seed"]["composerName"] = "罗伯特·舒曼"
+    payload["items"][0]["seed"]["composerNameLatin"] = "Robert Schumann"
+    payload["items"][0]["seed"]["workTitle"] = "a小调钢琴协奏曲"
+    payload["items"][0]["seed"]["workTitleLatin"] = "Piano Concerto, Op.54"
+    payload["items"][0]["seed"]["catalogue"] = "Op.54"
+    payload["items"][0]["seed"]["credits"] = [
+        {"role": "soloist", "personId": "person-solo", "displayName": "瓦尔特·吉泽金", "label": ""},
+        {"role": "conductor", "personId": "person-cond", "displayName": "威尔海姆·富特文格勒", "label": ""},
+        {"role": "orchestra", "personId": "person-orch", "displayName": "柏林爱乐乐团", "label": ""},
+    ]
+    request = CreateJobRequest.model_validate(payload)
+
+    draft = InputNormalizer(person_name_lookup=FakePersonNameLookup()).normalize(request.items[0])
+
+    assert "Wilhelm Furtwangler" in draft.secondary_names_latin
+    assert "Berlin Philharmonic Orchestra" in draft.ensemble_names_latin
+    assert any("Walter Gieseking Wilhelm Furtwangler" in query for query in draft.query_lead_names_latin)
+
+
 def test_input_normalizer_recovers_concerto_collaborator_group_and_date_from_title() -> None:
     payload = sample_request()
     payload["items"][0]["workTypeHint"] = "concerto"

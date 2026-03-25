@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import time
+import unicodedata
 from collections import defaultdict
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Protocol
 
 from app.models.protocol import (
@@ -193,17 +196,59 @@ def build_query_lead_terms(
     prefer_collaboration: bool = False,
 ) -> list[str]:
     if primary_values and secondary_values:
-        combined = [
-            " ".join([primary_values[0], secondary_values[0]]).strip(),
-            " / ".join([primary_values[0], secondary_values[0]]).strip(),
-        ]
+        combined: list[str] = []
+        for primary_value in primary_values[:2]:
+            for secondary_value in secondary_values[:2]:
+                combined.extend(
+                    [
+                        " ".join([primary_value, secondary_value]).strip(),
+                        " / ".join([primary_value, secondary_value]).strip(),
+                    ]
+                )
         if prefer_collaboration:
             return dedupe_preserve_order([*combined, *primary_values, *secondary_values])
         return dedupe_preserve_order([*primary_values, combined[0], *secondary_values, combined[1]])
     return dedupe_preserve_order([*primary_values, *secondary_values])
 
 
+class PersonNameLookup(Protocol):
+    def resolve(self, person_id: str) -> dict[str, Any] | None: ...
+
+
+def locate_parent_people_path() -> Path | None:
+    current = Path(__file__).resolve()
+    for parent in current.parents:
+        candidate = parent / "data" / "library" / "people.json"
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+class LibraryPersonNameLookup:
+    def __init__(self, people_path: Path | None = None) -> None:
+        self._people_path = people_path or locate_parent_people_path()
+        self._people_by_id: dict[str, dict[str, Any]] | None = None
+
+    def resolve(self, person_id: str) -> dict[str, Any] | None:
+        normalized_id = compact(person_id)
+        if not normalized_id or self._people_path is None:
+            return None
+        if self._people_by_id is None:
+            try:
+                payload = json.loads(self._people_path.read_text(encoding="utf-8"))
+            except Exception:
+                self._people_by_id = {}
+            else:
+                self._people_by_id = {
+                    compact(item.get("id")): item for item in payload if compact(item.get("id"))
+                }
+        return self._people_by_id.get(normalized_id)
+
+
 class InputNormalizer:
+    def __init__(self, person_name_lookup: PersonNameLookup | None = None) -> None:
+        self._person_name_lookup = person_name_lookup or LibraryPersonNameLookup()
+
     def normalize(self, item: RetrievalItem) -> DraftRecordingEntry:
         primary_names: list[str] = []
         primary_names_latin: list[str] = []
@@ -216,7 +261,11 @@ class InputNormalizer:
         for credit in item.seed.credits:
             display_name = strip_alias_annotations(compact(credit.display_name))
             label = compact(credit.label)
-            primary_label = compact(display_name or label)
+            resolved_person = self._person_name_lookup.resolve(credit.person_id)
+            resolved_name = compact((resolved_person or {}).get("name"))
+            resolved_name_latin = compact((resolved_person or {}).get("nameLatin"))
+            resolved_aliases = [compact(value) for value in (resolved_person or {}).get("aliases") or [] if compact(value)]
+            primary_label = compact(display_name or resolved_name or label)
             role = compact(credit.role).lower()
             explicit_latin = extract_explicit_latin_alias(credit.display_name) or extract_explicit_latin_alias(credit.label)
             if not primary_label:
@@ -228,6 +277,9 @@ class InputNormalizer:
                 latin_value = label
             elif looks_latin(primary_label):
                 latin_value = primary_label
+            elif looks_latin(resolved_name_latin):
+                latin_value = resolved_name_latin
+            latin_variants = build_latin_credit_variants(latin_value, resolved_aliases)
 
             bucket = resolve_credit_bucket(work_type=work_type, role=role)
             if work_type == "chamber_solo" and role in {"soloist", "instrumentalist", "person"} and primary_names:
@@ -236,24 +288,16 @@ class InputNormalizer:
                 bucket = "secondary"
             if bucket == "primary":
                 primary_names.append(primary_label)
-                if latin_value:
-                    primary_names_latin.append(latin_value)
+                primary_names_latin.extend(latin_variants)
             elif bucket == "secondary":
                 secondary_names.append(primary_label)
-                if latin_value:
-                    secondary_names_latin.append(latin_value)
+                secondary_names_latin.extend(latin_variants)
             elif bucket == "lead":
                 primary_names.append(primary_label)
-                if latin_value:
-                    primary_names_latin.append(latin_value)
+                primary_names_latin.extend(latin_variants)
             if role in {"orchestra", "ensemble", "choir", "group"}:
                 ensembles.append(primary_label)
-                if explicit_latin:
-                    ensembles_latin.append(explicit_latin)
-                elif label and looks_latin(label):
-                    ensembles_latin.append(label)
-                elif looks_latin(primary_label):
-                    ensembles_latin.append(primary_label)
+                ensembles_latin.extend(latin_variants)
 
         if primary_names and not secondary_names and work_type in {"concerto", "chamber_solo", "opera_vocal"}:
             for inferred_name in title_people:
@@ -478,6 +522,30 @@ def looks_latin(value: str) -> bool:
 
 def contains_cjk(value: str) -> bool:
     return bool(re.search(r"[\u4e00-\u9fff]", value or ""))
+
+
+def ascii_fold(value: str) -> str:
+    normalized = compact(value)
+    if not normalized:
+        return ""
+    folded = unicodedata.normalize("NFKD", normalized)
+    return "".join(char for char in folded if not unicodedata.combining(char))
+
+
+def build_latin_credit_variants(primary_value: str, aliases: list[str]) -> list[str]:
+    candidates = [compact(primary_value), *[compact(alias) for alias in aliases]]
+    variants: list[str] = []
+    for candidate in candidates:
+        if not candidate:
+            continue
+        cleaned = strip_alias_annotations(candidate)
+        if not looks_latin(cleaned):
+            continue
+        variants.append(cleaned)
+        folded = ascii_fold(cleaned)
+        if folded and looks_latin(folded) and folded != cleaned:
+            variants.append(folded)
+    return dedupe_preserve_order(variants)
 
 
 def build_latin_work_alias(value: str) -> str:
