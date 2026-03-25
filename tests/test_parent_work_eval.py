@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from app.services.parent_work_eval import (
     build_recording_scenarios,
+    classify_target_link_audit,
     categorize_result_reason,
     evaluate_hit_metrics,
+    summarize_link_audit,
     summarize_results,
     workspace_root,
 )
@@ -192,3 +194,42 @@ def test_categorize_result_reason_distinguishes_alt_upload_from_real_recall_miss
 
     assert alt_upload_reason == "same_platform_alt_upload"
     assert recall_reason == "recall_miss"
+
+
+def test_classify_target_link_audit_distinguishes_unavailable_suspicious_and_healthy() -> None:
+    assert classify_target_link_audit(available=False, match_score=None) == "unavailable"
+    assert classify_target_link_audit(available=True, match_score=0.12) == "available_but_suspicious"
+    assert classify_target_link_audit(available=True, match_score=0.39) == "available"
+
+
+def test_summarize_link_audit_counts_statuses_and_platforms() -> None:
+    summary = summarize_link_audit(
+        [
+            {"platform": "bilibili", "available": True, "auditStatus": "available"},
+            {"platform": "youtube", "available": True, "auditStatus": "available_but_suspicious"},
+            {"platform": "youtube", "available": False, "auditStatus": "unavailable"},
+        ]
+    )
+
+    assert summary == {
+        "total": 3,
+        "available": 2,
+        "unavailable": 1,
+        "byStatus": {
+            "available": 1,
+            "available_but_suspicious": 1,
+            "unavailable": 1,
+        },
+        "byPlatform": {
+            "bilibili": {
+                "total": 1,
+                "available": 1,
+                "unavailable": 0,
+            },
+            "youtube": {
+                "total": 2,
+                "available": 1,
+                "unavailable": 1,
+            },
+        },
+    }

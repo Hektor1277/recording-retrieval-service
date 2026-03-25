@@ -394,6 +394,45 @@ def summarize_results(results: list[dict]) -> dict[str, dict[str, int]]:
     }
 
 
+def classify_target_link_audit(*, available: bool, match_score: float | None) -> str:
+    if not available:
+        return "unavailable"
+    if match_score is None:
+        return "available_but_unscored"
+    if match_score < 0.25:
+        return "available_but_suspicious"
+    return "available"
+
+
+def summarize_link_audit(rows: list[dict]) -> dict[str, object]:
+    by_status: dict[str, int] = defaultdict(int)
+    by_platform: dict[str, dict[str, int]] = defaultdict(
+        lambda: {"total": 0, "available": 0, "unavailable": 0}
+    )
+    available_count = 0
+    unavailable_count = 0
+    for row in rows:
+        status = compact(row.get("auditStatus"))
+        platform = compact(row.get("platform")) or "unknown"
+        available = bool(row.get("available"))
+        if status:
+            by_status[status] += 1
+        by_platform[platform]["total"] += 1
+        if available:
+            available_count += 1
+            by_platform[platform]["available"] += 1
+        else:
+            unavailable_count += 1
+            by_platform[platform]["unavailable"] += 1
+    return {
+        "total": len(rows),
+        "available": available_count,
+        "unavailable": unavailable_count,
+        "byStatus": dict(by_status),
+        "byPlatform": dict(by_platform),
+    }
+
+
 def classify_link_match(
     *,
     targets: list[str],

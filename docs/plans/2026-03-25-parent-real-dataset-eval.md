@@ -17,6 +17,12 @@
 - `app/services/parent_work_eval.py`
   - 从父项目 `works.json / recordings.json / composers.json` 生成真实评估样本
   - 统一 `canonicalize_url`（链接规范化）、`build_recording_scenarios`（样本生成）、`summarize_results`（结果汇总）
+- `scripts/audit_parent_work_links.py`
+  - 对父项目某一作品的原始 `YouTube / Bilibili` 真值链接做 `availability + metadata match`（可用性 + 元数据匹配）审计
+  - 输出 `link audit`（链接审计）JSON，区分：
+    - `available`
+    - `available_but_suspicious`
+    - `unavailable`
 - `scripts/run_parent_work_eval.py`
   - 直接执行某一作品的整组 live 评估
   - 同时输出：
@@ -175,6 +181,36 @@
   - 长尾人名/俄语转写的 `recall`（召回）增强
   - 是否引入“跨平台同版”辅助评估口径，但不能覆盖现有严格口径
 
+## Ground Truth Audit
+
+- 第六轮先不改召回，而是对父项目原始真值做健康度审计，避免把“原始链接过时”误判成检索失败。
+- 审计方法：
+  - `YouTube` 使用 `oEmbed`
+  - `Bilibili` 使用 `x/web-interface/view`
+  - 每条原始链接都抓取当前标题 / 上传者
+  - 用同一录音的 `full + partial` 两个样本分别打 `match score`，取最高分，避免“标题未写齐全部协作字段”导致的误伤
+
+- 审计结果：
+  - `20/20 available`
+  - `0/20 unavailable`
+  - `18/20 available`
+  - `2/20 available_but_suspicious`
+  - 说明当前舒曼钢协数据集没有真实失效链接，至少在 `2026-03-25` 这次审计时，评估基线仍然可用
+
+- 当前唯一明确可疑的原始真值都落在 `Alicia de Larrocha / Sawallisch 1977`：
+  - `bilibili:BV1EUE4zgEDH`
+    - 标题是 `Larrocha拉罗查现场录音③勃拉姆斯、舒曼 Brahms Schumann`
+    - 更像合集页，而不是直接指向单一 `Schumann Piano Concerto`
+    - `matchScore=0.0`
+  - `youtube:j4kYjcLRpNY`
+    - 虽然标题写明 `Schumann Concerto in A minor, Op.54 (1977 Live)`，但缺少关键协作线索，和当前录音条目的耦合度很弱
+    - `matchScore=0.06`
+
+- 这说明：
+  - 当前真实评估里的主问题不是“链接失效”
+  - 更像是少数父项目历史真值本身就偏宽、偏合集或缺少唯一性
+  - 下一轮如果要进一步提高评估可信度，应该优先把这些 `available_but_suspicious` 原始链接单独标注，而不是先放宽检索口径
+
 ## Artifact Paths
 
 - 数据集：
@@ -183,10 +219,13 @@
   - `output/parent_work_eval_schumann_op54_results_v5.json`
 - 访问报告：
   - `output/parent_work_eval_schumann_op54_access_v5.json`
+- 链接审计：
+  - `output/parent_work_eval_schumann_op54_link_audit_v2.json`
 
 ## Next Candidates
 
 - 优先继续看：
+  - `available_but_suspicious` 的父项目原始真值标注
   - `candidateHit=true && finalHit=false`
   - `LLM timeout`（LLM 超时）导致的最终链接漏采纳
   - 长尾钢琴家/指挥的 `query enrichment`（查询富化）
