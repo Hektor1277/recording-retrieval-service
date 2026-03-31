@@ -202,7 +202,7 @@ def select_roles(recording: dict, work_type_hint: str) -> tuple[RoleInput | None
     return primary, None, None
 
 
-def supported_target_urls(recording: dict) -> list[str]:
+def supported_target_urls(recording: dict, allowed_canonicals: set[str] | None = None) -> list[str]:
     targets: list[str] = []
     seen: set[str] = set()
     for link in recording.get("links") or []:
@@ -213,9 +213,37 @@ def supported_target_urls(recording: dict) -> list[str]:
         canonical = canonicalize_url(url)
         if not canonical or canonical in seen:
             continue
+        if allowed_canonicals is not None and canonical not in allowed_canonicals:
+            continue
         seen.add(canonical)
         targets.append(canonical)
     return targets
+
+
+def build_allowed_targets_by_recording(
+    rows: list[dict],
+    *,
+    allowed_statuses: set[str] | None = None,
+) -> dict[str, set[str]]:
+    allowed = allowed_statuses or {"available"}
+    grouped: dict[str, set[str]] = defaultdict(set)
+    for row in rows:
+        recording_id = compact(row.get("recordingId"))
+        canonical = compact(row.get("canonical"))
+        audit_status = compact(row.get("auditStatus"))
+        if not recording_id or not canonical or audit_status not in allowed:
+            continue
+        grouped[recording_id].add(canonical)
+    return dict(grouped)
+
+
+def list_work_ids_with_supported_targets(recordings: dict[str, dict]) -> list[str]:
+    work_ids = {
+        compact(recording.get("workId"))
+        for recording in recordings.values()
+        if compact(recording.get("workId")) and supported_target_urls(recording)
+    }
+    return sorted(work_ids)
 
 
 def build_source_line(
@@ -285,13 +313,19 @@ def build_retrieval_item(
     )
 
 
-def build_recording_scenarios(recording: dict, work: dict, composer: dict) -> list[GeneratedScenario]:
+def build_recording_scenarios(
+    recording: dict,
+    work: dict,
+    composer: dict,
+    *,
+    allowed_targets: set[str] | None = None,
+) -> list[GeneratedScenario]:
     work_type_hint = determine_work_type_hint(recording)
     primary, secondary, group = select_roles(recording, work_type_hint)
     full_roles = [role for role in [primary, secondary, group] if role is not None]
     partial_roles = [role for role in [primary] if role is not None]
     performance_date_text = str(recording.get("performanceDateText") or "").strip()
-    targets = supported_target_urls(recording)
+    targets = supported_target_urls(recording, allowed_canonicals=allowed_targets)
 
     scenarios = [
         GeneratedScenario(
@@ -334,6 +368,7 @@ def build_work_dataset(
     recordings: dict[str, dict],
     works: dict[str, dict],
     composers: dict[str, dict],
+    allowed_targets_by_recording: dict[str, set[str]] | None = None,
 ) -> list[GeneratedScenario]:
     work = works[work_id]
     composer = composers[work["composerId"]]
@@ -343,7 +378,14 @@ def build_work_dataset(
     ]
     selected_recordings.sort(key=lambda item: str(item.get("title") or item["id"]))
     for recording in selected_recordings:
-        scenarios.extend(build_recording_scenarios(recording, work, composer))
+        scenarios.extend(
+            build_recording_scenarios(
+                recording,
+                work,
+                composer,
+                allowed_targets=(allowed_targets_by_recording or {}).get(str(recording.get("id") or "").strip()),
+            )
+        )
     return scenarios
 
 

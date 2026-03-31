@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from app.services.parent_work_eval import (
+    build_allowed_targets_by_recording,
     build_recording_scenarios,
+    build_work_dataset,
     canonicalize_url,
     classify_target_link_audit,
     categorize_result_reason,
     evaluate_hit_metrics,
+    list_work_ids_with_supported_targets,
     supported_target_urls,
     summarize_link_audit,
     summarize_results,
@@ -79,6 +82,65 @@ def test_supported_target_urls_accepts_apple_music_platform_aliases() -> None:
         "apple_music:/cn/album/demo/123?i=456",
         "youtube:abc123xyz01",
     ]
+
+
+def test_supported_target_urls_can_filter_to_allowed_canonicals() -> None:
+    recording = {
+        "links": [
+            {"platform": "youtube", "url": "https://www.youtube.com/watch?v=abc123xyz01"},
+            {"platform": "bilibili", "url": "https://www.bilibili.com/video/BV1xx411c7mD/"},
+        ]
+    }
+
+    assert supported_target_urls(recording, allowed_canonicals={"bilibili:BV1xx411c7mD"}) == [
+        "bilibili:BV1xx411c7mD"
+    ]
+
+
+def test_build_allowed_targets_by_recording_keeps_only_allowed_audit_statuses() -> None:
+    rows = [
+        {
+            "recordingId": "recording-1",
+            "canonical": "youtube:abc123xyz01",
+            "auditStatus": "available",
+        },
+        {
+            "recordingId": "recording-1",
+            "canonical": "bilibili:BV1xx411c7mD",
+            "auditStatus": "available_but_suspicious",
+        },
+        {
+            "recordingId": "recording-2",
+            "canonical": "youtube:def456uvw89",
+            "auditStatus": "unavailable",
+        },
+    ]
+
+    assert build_allowed_targets_by_recording(rows, allowed_statuses={"available"}) == {
+        "recording-1": {"youtube:abc123xyz01"}
+    }
+
+
+def test_list_work_ids_with_supported_targets_only_returns_truth_backed_works() -> None:
+    recordings = {
+        "recording-1": {
+            "id": "recording-1",
+            "workId": "work-1",
+            "links": [{"platform": "youtube", "url": "https://www.youtube.com/watch?v=abc123xyz01"}],
+        },
+        "recording-2": {
+            "id": "recording-2",
+            "workId": "work-2",
+            "links": [{"platform": "spotify", "url": "https://open.spotify.com/track/demo"}],
+        },
+        "recording-3": {
+            "id": "recording-3",
+            "workId": "work-1",
+            "links": [],
+        },
+    }
+
+    assert list_work_ids_with_supported_targets(recordings) == ["work-1"]
 
 
 def test_summarize_results_groups_hits_by_variant_and_tracks_evaluable_cases() -> None:
@@ -169,6 +231,48 @@ def test_summarize_results_groups_hits_by_variant_and_tracks_evaluable_cases() -
 
 def test_workspace_root_points_to_parent_project_root() -> None:
     assert (workspace_root() / "data" / "library" / "works.json").exists()
+
+
+def test_build_work_dataset_can_filter_targets_by_audit_results() -> None:
+    recordings = {
+        "recording-1": {
+            "id": "recording-1",
+            "workId": "work-1",
+            "title": "Example Recording",
+            "performanceDateText": "March 3, 1942 Berlin",
+            "credits": [
+                {"role": "soloist", "displayName": "Walter Gieseking", "personId": "person-solo"},
+                {"role": "conductor", "displayName": "Wilhelm Furtwangler", "personId": "person-cond"},
+            ],
+            "links": [
+                {"platform": "youtube", "url": "https://www.youtube.com/watch?v=abc123xyz01"},
+                {"platform": "bilibili", "url": "https://www.bilibili.com/video/BV1xx411c7mD/"},
+            ],
+        }
+    }
+    works = {
+        "work-1": {
+            "id": "work-1",
+            "composerId": "composer-1",
+            "title": "a小调钢琴协奏曲",
+            "titleLatin": "Piano Concerto, Op.54",
+            "catalogue": "Op.54",
+        }
+    }
+    composers = {"composer-1": {"id": "composer-1", "name": "罗伯特·舒曼", "nameLatin": "Robert Schumann"}}
+
+    scenarios = build_work_dataset(
+        work_id="work-1",
+        recordings=recordings,
+        works=works,
+        composers=composers,
+        allowed_targets_by_recording={"recording-1": {"youtube:abc123xyz01"}},
+    )
+
+    assert len(scenarios) == 2
+    assert scenarios[0].target_urls == ["youtube:abc123xyz01"]
+    assert scenarios[1].target_urls == ["youtube:abc123xyz01"]
+    assert all(scenario.evaluable is True for scenario in scenarios)
 
 
 def test_evaluate_hit_metrics_counts_high_confidence_same_platform_alt_upload_as_relaxed_hit() -> None:

@@ -16,6 +16,7 @@ from app.services.parent_work_eval import (
     canonicalize_url,
     classify_target_link_audit,
     find_work_id,
+    list_work_ids_with_supported_targets,
     load_library_indices,
     normalize_ground_truth_platform,
     summarize_link_audit,
@@ -26,13 +27,38 @@ from app.services.pipeline import InputNormalizer
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--work-id", default="")
+    parser.add_argument("--work-ids", default="")
     parser.add_argument("--title-latin", default="Piano Concerto, Op.54")
     parser.add_argument("--title", default="")
+    parser.add_argument("--all-works", action="store_true")
+    parser.add_argument("--limit-works", type=int, default=0)
     parser.add_argument(
         "--output",
         default="output/parent_work_eval_schumann_op54_link_audit.json",
     )
     return parser
+
+
+def resolve_selected_work_ids(args: argparse.Namespace, recordings: dict[str, dict], works: dict[str, dict]) -> list[str]:
+    explicit_work_ids = [value.strip() for value in str(args.work_ids or "").split(",") if value.strip()]
+    if explicit_work_ids:
+        missing = [work_id for work_id in explicit_work_ids if work_id not in works]
+        if missing:
+            raise KeyError(f"unknown work ids: {', '.join(missing)}")
+        return explicit_work_ids
+    if args.all_works:
+        work_ids = list_work_ids_with_supported_targets(recordings)
+        if args.limit_works > 0:
+            work_ids = work_ids[: args.limit_works]
+        return work_ids
+    return [
+        find_work_id(
+            works=works,
+            work_id=args.work_id,
+            title_latin=args.title_latin,
+            title=args.title,
+        )
+    ]
 
 
 def extract_bilibili_bvid(url: str) -> str:
@@ -211,42 +237,43 @@ async def main() -> None:
     args = parser.parse_args()
 
     recordings, works, composers = load_library_indices()
-    work_id = find_work_id(
-        works=works,
-        work_id=args.work_id,
-        title_latin=args.title_latin,
-        title=args.title,
-    )
-    work = works[work_id]
-    composer = composers[work["composerId"]]
+    selected_work_ids = resolve_selected_work_ids(args, recordings, works)
     normalizer = InputNormalizer()
     rows: list[dict[str, object]] = []
+    per_work_payloads: list[dict[str, object]] = []
 
     async with httpx.AsyncClient(
         timeout=20.0,
         follow_redirects=True,
         headers={"user-agent": "Mozilla/5.0"},
     ) as client:
-        selected_recordings = [
-            recording for recording in recordings.values() if recording.get("workId") == work_id
-        ]
-        selected_recordings.sort(key=lambda item: str(item.get("title") or item["id"]))
-        for recording in selected_recordings:
-            scenarios = build_recording_scenarios(recording, work, composer)
-            drafts = [normalizer.normalize(scenario.item) for scenario in scenarios]
-            primary_scenario = scenarios[0]
-            for link in recording.get("links") or []:
-                platform = normalize_ground_truth_platform(str(link.get("platform") or ""))
-                if platform not in {"youtube", "bilibili", "apple_music"}:
-                    continue
-                audit = await audit_link(
-                    client,
-                    platform=platform,
-                    url=str(link.get("url") or "").strip(),
-                    drafts=drafts,
-                )
-                rows.append(
-                    {
+        for work_id in selected_work_ids:
+            work = works[work_id]
+            composer = composers[work["composerId"]]
+            work_rows: list[dict[str, object]] = []
+            selected_recordings = [
+                recording for recording in recordings.values() if recording.get("workId") == work_id
+            ]
+            selected_recordings.sort(key=lambda item: str(item.get("title") or item["id"]))
+            for recording in selected_recordings:
+                scenarios = build_recording_scenarios(recording, work, composer)
+                drafts = [normalizer.normalize(scenario.item) for scenario in scenarios]
+                primary_scenario = scenarios[0]
+                for link in recording.get("links") or []:
+                    platform = normalize_ground_truth_platform(str(link.get("platform") or ""))
+                    if platform not in {"youtube", "bilibili", "apple_music"}:
+                        continue
+                    audit = await audit_link(
+                        client,
+                        platform=platform,
+                        url=str(link.get("url") or "").strip(),
+                        drafts=drafts,
+                    )
+                    row = {
+                        "workId": work_id,
+                        "workTitle": str(work.get("title") or "").strip(),
+                        "workTitleLatin": str(work.get("titleLatin") or "").strip(),
+                        "composerNameLatin": str(composer.get("nameLatin") or "").strip(),
                         "recordingId": recording["id"],
                         "recordingTitle": str(recording.get("title") or "").strip(),
                         "sourceLine": primary_scenario.item.source_line,
@@ -255,21 +282,40 @@ async def main() -> None:
                         "canonical": canonicalize_url(str(link.get("url") or "").strip()),
                         **audit,
                     }
-                )
+                    rows.append(row)
+                    work_rows.append(row)
+            per_work_payloads.append(
+                {
+                    "workId": work_id,
+                    "title": str(work.get("title") or ""),
+                    "titleLatin": str(work.get("titleLatin") or ""),
+                    "composerName": str(composer.get("name") or ""),
+                    "composerNameLatin": str(composer.get("nameLatin") or ""),
+                    "recordingCount": len({row["recordingId"] for row in work_rows}),
+                    "targetLinkCount": len(work_rows),
+                    "summary": summarize_link_audit(work_rows),
+                }
+            )
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "work": {
-            "workId": work_id,
-            "title": str(work.get("title") or ""),
-            "titleLatin": str(work.get("titleLatin") or ""),
-            "composerName": str(composer.get("name") or ""),
-            "composerNameLatin": str(composer.get("nameLatin") or ""),
+    payload: dict[str, object] = {
+        "scope": {
+            "allWorks": bool(args.all_works),
+            "workCount": len(selected_work_ids),
         },
         "summary": summarize_link_audit(rows),
+        "works": per_work_payloads,
         "results": rows,
     }
+    if len(per_work_payloads) == 1:
+        payload["work"] = {
+            "workId": per_work_payloads[0]["workId"],
+            "title": per_work_payloads[0]["title"],
+            "titleLatin": per_work_payloads[0]["titleLatin"],
+            "composerName": per_work_payloads[0]["composerName"],
+            "composerNameLatin": per_work_payloads[0]["composerNameLatin"],
+        }
     output_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(payload["summary"], ensure_ascii=False, indent=2))
     print(output_path.as_posix())
