@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from app.services.parent_work_eval import (
     build_recording_scenarios,
+    canonicalize_url,
     classify_target_link_audit,
     categorize_result_reason,
     evaluate_hit_metrics,
+    supported_target_urls,
     summarize_link_audit,
     summarize_results,
     workspace_root,
@@ -53,6 +55,32 @@ def test_build_recording_scenarios_for_concerto_produces_full_and_partial_varian
     assert partial_item.item_id == "recording-1-partial"
 
 
+def test_canonicalize_url_normalizes_apple_music_and_classical_track_urls() -> None:
+    assert (
+        canonicalize_url("https://music.apple.com/us/album/demo-album/123456789?i=987654321&uo=4")
+        == "apple_music:/us/album/demo-album/123456789?i=987654321"
+    )
+    assert (
+        canonicalize_url("https://classical.music.apple.com/us/work/demo-work/123456789?i=987654321&l=en-US")
+        == "apple_music:/us/work/demo-work/123456789?i=987654321"
+    )
+
+
+def test_supported_target_urls_accepts_apple_music_platform_aliases() -> None:
+    recording = {
+        "links": [
+            {"platform": "apple-music", "url": "https://music.apple.com/cn/album/demo/123?i=456"},
+            {"platform": "apple_music", "url": "https://classical.music.apple.com/cn/album/demo/123?i=456&uo=4"},
+            {"platform": "youtube", "url": "https://www.youtube.com/watch?v=abc123xyz01"},
+        ]
+    }
+
+    assert supported_target_urls(recording) == [
+        "apple_music:/cn/album/demo/123?i=456",
+        "youtube:abc123xyz01",
+    ]
+
+
 def test_summarize_results_groups_hits_by_variant_and_tracks_evaluable_cases() -> None:
     summary = summarize_results(
         [
@@ -63,6 +91,8 @@ def test_summarize_results_groups_hits_by_variant_and_tracks_evaluable_cases() -
                 "candidateHit": True,
                 "relaxedFinalHit": True,
                 "relaxedCandidateHit": True,
+                "versionFinalHit": True,
+                "versionCandidateHit": True,
                 "strictMissReason": "none",
             },
             {
@@ -72,6 +102,8 @@ def test_summarize_results_groups_hits_by_variant_and_tracks_evaluable_cases() -
                 "candidateHit": True,
                 "relaxedFinalHit": True,
                 "relaxedCandidateHit": True,
+                "versionFinalHit": True,
+                "versionCandidateHit": True,
                 "strictMissReason": "same_platform_alt_upload",
             },
             {
@@ -81,6 +113,8 @@ def test_summarize_results_groups_hits_by_variant_and_tracks_evaluable_cases() -
                 "candidateHit": False,
                 "relaxedFinalHit": False,
                 "relaxedCandidateHit": False,
+                "versionFinalHit": True,
+                "versionCandidateHit": True,
                 "strictMissReason": "recall_miss",
             },
             {
@@ -90,6 +124,8 @@ def test_summarize_results_groups_hits_by_variant_and_tracks_evaluable_cases() -
                 "candidateHit": False,
                 "relaxedFinalHit": False,
                 "relaxedCandidateHit": False,
+                "versionFinalHit": False,
+                "versionCandidateHit": False,
                 "strictMissReason": "not_evaluable",
             },
         ]
@@ -102,6 +138,8 @@ def test_summarize_results_groups_hits_by_variant_and_tracks_evaluable_cases() -
         "candidateHit": 2,
         "relaxedFinalHit": 2,
         "relaxedCandidateHit": 2,
+        "versionFinalHit": 3,
+        "versionCandidateHit": 3,
     }
     assert summary["byVariant"]["full"] == {
         "total": 2,
@@ -110,6 +148,8 @@ def test_summarize_results_groups_hits_by_variant_and_tracks_evaluable_cases() -
         "candidateHit": 2,
         "relaxedFinalHit": 2,
         "relaxedCandidateHit": 2,
+        "versionFinalHit": 2,
+        "versionCandidateHit": 2,
     }
     assert summary["byVariant"]["partial"] == {
         "total": 2,
@@ -118,6 +158,8 @@ def test_summarize_results_groups_hits_by_variant_and_tracks_evaluable_cases() -
         "candidateHit": 0,
         "relaxedFinalHit": 0,
         "relaxedCandidateHit": 0,
+        "versionFinalHit": 1,
+        "versionCandidateHit": 1,
     }
     assert summary["strictMissReasons"] == {
         "same_platform_alt_upload": 1,
@@ -168,6 +210,48 @@ def test_evaluate_hit_metrics_rejects_low_confidence_same_platform_alt_upload() 
     assert metrics["relaxedFinalHit"] is False
     assert metrics["relaxedCandidateHit"] is False
     assert metrics["candidateMatchType"] == "none"
+
+
+def test_evaluate_hit_metrics_counts_high_confidence_cross_platform_version_hit_separately() -> None:
+    metrics = evaluate_hit_metrics(
+        targets=["bilibili:BV1target1234"],
+        final_links=[
+            {
+                "canonical": "youtube:araujochum1977",
+                "platform": "youtube",
+                "confidence": 0.97,
+                "title": "Schumann: Piano Concerto in A minor, Op. 54 - Claudio Arrau, RCO, Eugen Jochum. Rec. 1977",
+            }
+        ],
+        candidate_links=[],
+    )
+
+    assert metrics["finalHit"] is False
+    assert metrics["relaxedFinalHit"] is False
+    assert metrics["versionFinalHit"] is True
+    assert metrics["versionCandidateHit"] is True
+    assert metrics["finalVersionMatchType"] == "cross_platform_version_equivalent"
+    assert metrics["candidateVersionMatchType"] == "cross_platform_version_equivalent"
+
+
+def test_evaluate_hit_metrics_counts_apple_music_same_platform_alt_upload_as_relaxed_hit() -> None:
+    metrics = evaluate_hit_metrics(
+        targets=["apple_music:/us/album/demo-album/123456789?i=111"],
+        final_links=[
+            {
+                "canonical": "apple_music:/us/album/demo-album/123456789?i=222",
+                "platform": "apple_music",
+                "confidence": 0.84,
+                "title": "Schumann: Piano Concerto in A Minor, Op. 54",
+            }
+        ],
+        candidate_links=[],
+    )
+
+    assert metrics["finalHit"] is False
+    assert metrics["relaxedFinalHit"] is True
+    assert metrics["versionFinalHit"] is True
+    assert metrics["finalMatchType"] == "same_platform_alt_upload"
 
 
 def test_categorize_result_reason_distinguishes_alt_upload_from_real_recall_miss() -> None:

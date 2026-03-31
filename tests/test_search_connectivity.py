@@ -1,26 +1,53 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from pathlib import Path
 from urllib.parse import quote_plus
 
 import httpx
 
+from app.models.protocol import Credit, LinkCandidate, RetrievalItem, Seed
+from app.services.browser_fetcher import (
+    normalize_search_result_payload,
+    prune_browser_diagnostic_files,
+)
 from app.services.http_sources import (
     HttpSourceProvider,
     build_bilibili_metadata_from_detail,
+    build_chinese_host_bundle_context_queries,
+    build_chinese_host_primary_work_rescue_queries,
     build_work_aliases,
+    contains_cjk,
+    dedupe_streaming_hosts_for_execution,
+    extract_bilibili_result_links,
     extract_bing_result_links,
+    extract_cjk_person_query_keyword,
+    extract_person_query_keyword,
     looks_like_single_movement,
+    merge_bilibili_browser_query_rows,
+    merge_bilibili_search_rows,
     merge_streaming_host_rows,
     name_matches,
     normalize_host,
     normalize_text,
+    prepare_bilibili_browser_queries,
     score_recording_match,
     select_bilibili_browser_queries,
+    should_probe_apple_auxiliary_hosts,
+    should_expand_initial_streaming_window,
+    streaming_host_priority,
 )
-from app.services.pipeline import DraftRecordingEntry, RetrievalProfile
+from app.services.parent_work_eval import build_work_dataset, find_work_id, load_library_indices
+from app.services.pipeline import (
+    DraftRecordingEntry,
+    InputNormalizer,
+    ProfileResolver,
+    RetrievalProfile,
+    candidate_conflicting_credit_tokens,
+    classify_link_candidate_zone,
+)
 from app.services.platform_clients import BilibiliVideoDetail
 from app.services.platform_search_config import (
     AppleMusicSearchConfig,
@@ -592,6 +619,10 @@ class ApiFirstTransport(httpx.AsyncBaseTransport):
                                     "attributes": {
                                         "url": "https://music.apple.com/us/album/demo/1?i=1",
                                         "name": "Apple API Result",
+                                        "artistName": "Otto Klemperer",
+                                        "albumName": "Beethoven: Symphony No. 7",
+                                        "composerName": "Ludwig van Beethoven",
+                                        "durationInMillis": 233000,
                                     }
                                 }
                             ]
@@ -710,6 +741,53 @@ class PlatformEngineFallbackTransport(httpx.AsyncBaseTransport):
         return httpx.Response(404, request=request, text="not found")
 
 
+def test_extract_bilibili_result_links_supports_unquoted_arcurl_and_direct_anchor_hrefs() -> None:
+    html_text = """
+    <script>
+      var item = {arcurl:"http:\\u002F\\u002Fwww.bilibili.com\\u002Fvideo\\u002FBV1arcurl001",bvid:"BV1arcurl001"};
+    </script>
+    <div class="bili-video-card__wrap">
+      <a href="//www.bilibili.com/video/BV1anchor002/" target="_blank">video</a>
+    </div>
+    """
+
+    links = extract_bilibili_result_links(html_text)
+
+    assert "http://www.bilibili.com/video/BV1arcurl001" in links
+    assert "https://www.bilibili.com/video/BV1anchor002/" in links
+
+
+class ApplePublicApiTransport(httpx.AsyncBaseTransport):
+    def __init__(self) -> None:
+        self.urls: list[str] = []
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        self.urls.append(url)
+        if "itunes.apple.com/search" in url:
+            return httpx.Response(
+                200,
+                request=request,
+                json={
+                    "results": [
+                        {
+                            "trackViewUrl": "https://music.apple.com/us/album/demo-track/123?i=456",
+                            "trackName": "Symphony No. 7 in A major, Op. 92: II. Allegretto",
+                            "collectionName": "Beethoven: Symphony No. 7",
+                            "artistName": "Otto Klemperer, Philharmonia Orchestra",
+                            "releaseDate": "2011-01-01T08:00:00Z",
+                            "trackTimeMillis": 512000,
+                        },
+                        {
+                            "artistViewUrl": "https://music.apple.com/us/artist/noise-artist/999",
+                            "artistName": "Noise Artist",
+                        },
+                    ]
+                },
+            )
+        return httpx.Response(404, request=request, text="not found")
+
+
 class YouTubeEngineMergeTransport(httpx.AsyncBaseTransport):
     def __init__(self) -> None:
         self.urls: list[str] = []
@@ -733,10 +811,16 @@ class YouTubeEngineMergeTransport(httpx.AsyncBaseTransport):
 
 
 class BrowserResultFetcher:
-    def __init__(self, links_by_url: dict[str, list[str]]) -> None:
+    def __init__(
+        self,
+        links_by_url: dict[str, list[str]],
+        search_evidence_by_url: dict[str, dict[str, Any]] | None = None,
+    ) -> None:
         self.links_by_url = links_by_url
+        self.search_evidence_by_url = search_evidence_by_url or {}
         self.page_calls: list[str] = []
         self.link_calls: list[str] = []
+        self.evidence_calls: list[str] = []
 
     async def fetch_page(self, url: str, timeout_seconds: float | None = None) -> dict[str, str]:
         del timeout_seconds
@@ -754,6 +838,18 @@ class BrowserResultFetcher:
         self.link_calls.append(url)
         return list(self.links_by_url.get(url, []))
 
+    async def fetch_search_evidence(
+        self,
+        url: str,
+        *,
+        url_patterns: list[str] | None = None,
+        timeout_seconds: float | None = None,
+        capture_screenshot: bool = False,
+    ) -> dict[str, Any]:
+        del url_patterns, timeout_seconds, capture_screenshot
+        self.evidence_calls.append(url)
+        return dict(self.search_evidence_by_url.get(url, {}))
+
 
 class StructuredBrowserFetcher(BrowserResultFetcher):
     def __init__(
@@ -768,6 +864,23 @@ class StructuredBrowserFetcher(BrowserResultFetcher):
         del timeout_seconds
         self.page_calls.append(url)
         return dict(self.page_payloads.get(url, {}))
+
+
+class TimeoutRecordingBrowserFetcher(BrowserResultFetcher):
+    def __init__(self, links_by_url: dict[str, list[str]]) -> None:
+        super().__init__(links_by_url)
+        self.link_timeout_calls: list[tuple[str, float | None]] = []
+
+    async def fetch_links(
+        self,
+        url: str,
+        *,
+        url_patterns: list[str] | None = None,
+        timeout_seconds: float | None = None,
+    ) -> list[str]:
+        del url_patterns
+        self.link_timeout_calls.append((url, timeout_seconds))
+        return await super().fetch_links(url, timeout_seconds=timeout_seconds)
 
 
 def build_draft() -> DraftRecordingEntry:
@@ -1012,6 +1125,755 @@ def test_provider_collects_access_telemetry_and_host_summary(tmp_path: Path) -> 
     assert summary["hosts"]["www.youtube.com"]["avgLatencyMs"] >= 0
 
 
+def test_search_bilibili_records_strategy_event_with_selected_browser_queries() -> None:
+    class BilibiliStrategyProvider(HttpSourceProvider):
+        async def _search_streaming_platform(self, **kwargs):
+            del kwargs
+            return []
+
+        async def _search_platform_via_browser_pages(self, **kwargs):
+            del kwargs
+            return []
+
+        async def _search_platform_via_site_engines(self, *args, **kwargs):
+            del args, kwargs
+            return []
+
+    provider = BilibiliStrategyProvider(browser_fetcher=BrowserResultFetcher({}))
+
+    asyncio.run(
+        provider._search_bilibili(
+            [
+                "q1 generic",
+                "q2 generic",
+                "q3 focused",
+                "q4 exact primary",
+                "q5 collaboration",
+                "q6 tail",
+            ]
+        )
+    )
+    events = provider.consume_access_events()
+
+    strategy_events = [event for event in events if event["operation"] == "search-strategy"]
+    assert strategy_events
+    assert strategy_events[0]["host"] == "search.bilibili.com"
+    assert strategy_events[0]["strategy"] == "bilibili-mixed"
+    assert strategy_events[0]["selectedBrowserQueries"]
+    assert strategy_events[-1]["strategy"] in {"bilibili-mixed", "bilibili-second-pass"}
+
+
+def test_search_youtube_records_api_first_strategy_event() -> None:
+    class YouTubeStrategyProvider(HttpSourceProvider):
+        async def _search_streaming_platform(self, **kwargs):
+            del kwargs
+            return [{"url": "https://www.youtube.com/watch?v=apiyoutube01", "source_label": "YouTube API Search", "source_kind": "streaming"}]
+
+    provider = YouTubeStrategyProvider(
+        browser_fetcher=BrowserResultFetcher({}),
+        platform_search_config=PlatformSearchConfig(youtube=YouTubeSearchConfig(api_key="yt-key")),
+    )
+
+    rows = asyncio.run(provider._search_youtube(["klemperer query"]))
+    events = provider.consume_access_events()
+
+    assert rows
+    strategy_events = [event for event in events if event["operation"] == "search-strategy"]
+    assert strategy_events
+    assert strategy_events[-1]["host"] == "www.youtube.com"
+    assert strategy_events[-1]["strategy"] == "youtube-api-first"
+
+
+def test_search_bilibili_browser_search_uses_relaxed_timeout_budget() -> None:
+    fetcher = TimeoutRecordingBrowserFetcher(
+        {
+            "https://search.bilibili.com/video?keyword=focused+bilibili+query": [
+                "https://www.bilibili.com/video/BV1browsertimeout/"
+            ]
+        }
+    )
+    provider = HttpSourceProvider(browser_fetcher=fetcher)
+
+    rows = asyncio.run(
+        provider._search_platform_via_browser_pages(
+            queries=["focused bilibili query"],
+            url_builders=[
+                lambda query: f"https://search.bilibili.com/all?keyword={quote_plus(query)}",
+                lambda query: f"https://search.bilibili.com/video?keyword={quote_plus(query)}",
+            ],
+            source_label="Bilibili Search",
+            url_patterns=[r"https://www\.bilibili\.com/video/(?:BV[0-9A-Za-z]+|av\d+)/?"],
+        )
+    )
+
+    assert rows
+    assert fetcher.link_timeout_calls
+    assert fetcher.link_timeout_calls[0][1] is not None
+    assert fetcher.link_timeout_calls[0][1] >= 10.0
+
+
+def test_search_bilibili_browser_search_tries_all_page_before_video_page() -> None:
+    fetcher = TimeoutRecordingBrowserFetcher(
+        {
+            "https://search.bilibili.com/video?keyword=focused+bilibili+query": [
+                "https://www.bilibili.com/video/BV1videoresult/"
+            ]
+        }
+    )
+    provider = HttpSourceProvider(browser_fetcher=fetcher)
+
+    rows = asyncio.run(
+        provider._search_platform_via_browser_pages(
+            queries=["focused bilibili query"],
+            url_builders=[
+                lambda query: f"https://search.bilibili.com/all?keyword={quote_plus(query)}",
+                lambda query: f"https://search.bilibili.com/video?keyword={quote_plus(query)}",
+            ],
+            source_label="Bilibili Search",
+            url_patterns=[r"https://www\.bilibili\.com/video/(?:BV[0-9A-Za-z]+|av\d+)/?"],
+        )
+    )
+
+    assert rows == [
+        {
+            "url": "https://www.bilibili.com/video/BV1videoresult/",
+            "source_label": "Bilibili Search Browser Search",
+            "source_kind": "streaming",
+        }
+    ]
+    assert fetcher.link_timeout_calls
+    assert fetcher.link_timeout_calls[0][0].startswith("https://search.bilibili.com/all?")
+    assert any(call[0].startswith("https://search.bilibili.com/video?") for call in fetcher.link_timeout_calls)
+
+
+def test_search_bilibili_records_layer_summary_event() -> None:
+    class BilibiliLayerProvider(HttpSourceProvider):
+        async def _search_streaming_platform(self, **kwargs):
+            del kwargs
+            return [{"url": "https://www.bilibili.com/video/BV1api/"}]
+
+        async def _search_platform_via_browser_pages(self, **kwargs):
+            del kwargs
+            return [{"url": "https://www.bilibili.com/video/BV1browser/"}]
+
+        async def _search_platform_via_site_engines(self, *args, **kwargs):
+            del args, kwargs
+            return [{"url": "https://www.bilibili.com/video/BV1engine/"}]
+
+    provider = BilibiliLayerProvider(browser_fetcher=BrowserResultFetcher({}))
+
+    rows = asyncio.run(provider._search_bilibili(["focused query"]))
+    events = provider.consume_access_events()
+
+    assert rows
+    summary_events = [event for event in events if event["operation"] == "search-layer-summary"]
+    assert summary_events
+    assert summary_events[-1]["host"] == "search.bilibili.com"
+    assert summary_events[-1]["apiResultCount"] == 1
+    assert summary_events[-1]["browserResultCount"] == 1
+    assert summary_events[-1]["engineResultCount"] == 0
+
+
+def test_search_bilibili_runs_second_pass_queries_when_first_pass_is_empty() -> None:
+    class BilibiliSecondPassProvider(HttpSourceProvider):
+        def __init__(self) -> None:
+            super().__init__(browser_fetcher=BrowserResultFetcher({}))
+            self.browser_query_batches: list[list[str]] = []
+            self.primary_query_batches: list[list[str]] = []
+
+        async def _search_platform_via_browser_pages(self, **kwargs):
+            queries = list(kwargs.get("queries") or [])
+            self.browser_query_batches.append(queries)
+            if len(self.browser_query_batches) == 1:
+                return []
+            return [{"url": "https://www.bilibili.com/video/BV1secondpass/"}]
+
+        async def _search_streaming_platform(self, **kwargs):
+            queries = list(kwargs.get("queries") or [])
+            self.primary_query_batches.append(queries)
+            return []
+
+        async def _search_platform_via_site_engines(self, *args, **kwargs):
+            del args, kwargs
+            return []
+
+    provider = BilibiliSecondPassProvider()
+
+    rows = asyncio.run(
+        provider._search_bilibili(
+            [
+                "first query",
+                "second query",
+                "third query",
+                "fourth recovery query",
+                "fifth recovery query",
+            ]
+        )
+    )
+
+    assert rows == [{"url": "https://www.bilibili.com/video/BV1secondpass/"}]
+    assert len(provider.browser_query_batches) == 2
+    assert len(provider.primary_query_batches) == 2
+    assert provider.primary_query_batches[0] == ["first query", "second query", "third query"]
+    assert provider.primary_query_batches[1] == ["fourth recovery query"]
+
+
+def test_search_bilibili_uses_focused_browser_probe_for_primary_when_browser_hits() -> None:
+    class BilibiliProbeProvider(HttpSourceProvider):
+        def __init__(self) -> None:
+            super().__init__(browser_fetcher=BrowserResultFetcher({}))
+            self.primary_query_batches: list[list[str]] = []
+
+        async def _search_platform_via_browser_pages(self, **kwargs):
+            del kwargs
+            return [{"url": "https://www.bilibili.com/video/BV1browserprobe/"}]
+
+        async def _search_streaming_platform(self, **kwargs):
+            queries = list(kwargs.get("queries") or [])
+            self.primary_query_batches.append(queries)
+            return []
+
+        async def _search_platform_via_site_engines(self, *args, **kwargs):
+            del args, kwargs
+            return []
+
+    provider = BilibiliProbeProvider()
+
+    rows = asyncio.run(
+        provider._search_bilibili(
+            [
+                "a小调钢琴协奏曲 埃莉索·维尔萨拉泽 亚历山大·鲁丁",
+                "a小调钢琴协奏曲 埃莉索·维尔萨拉泽 / 亚历山大·鲁丁",
+                "Virsaladze rudin Schumann concerto",
+                "钢协 alexander rudin",
+                "a小调钢琴协奏曲 Eliso Virsaladze",
+                "Eliso Virsaladze Schumann concerto",
+            ]
+        )
+    )
+
+    assert rows == [{"url": "https://www.bilibili.com/video/BV1browserprobe/"}]
+    assert provider.primary_query_batches == [["钢协 alexander rudin"]]
+
+
+def test_search_bilibili_second_pass_only_uses_remaining_queries() -> None:
+    class BilibiliSecondPassProvider(HttpSourceProvider):
+        def __init__(self) -> None:
+            super().__init__(browser_fetcher=BrowserResultFetcher({}))
+            self.browser_query_batches: list[list[str]] = []
+
+        async def _search_platform_via_browser_pages(self, **kwargs):
+            queries = list(kwargs.get("queries") or [])
+            self.browser_query_batches.append(queries)
+            return []
+
+        async def _search_streaming_platform(self, **kwargs):
+            del kwargs
+            return []
+
+        async def _search_platform_via_site_engines(self, *args, **kwargs):
+            del args, kwargs
+            return []
+
+    provider = BilibiliSecondPassProvider()
+
+    asyncio.run(
+        provider._search_bilibili(
+            [
+                "alpha query",
+                "beta query",
+                "gamma query",
+                "delta query",
+                "epsilon query",
+            ]
+        )
+    )
+
+    assert len(provider.browser_query_batches) == 2
+    assert set(provider.browser_query_batches[0]).isdisjoint(set(provider.browser_query_batches[1]))
+
+
+def test_search_bilibili_host_stats_do_not_shrink_depth_too_early() -> None:
+    provider = HttpSourceProvider(browser_fetcher=BrowserResultFetcher({}))
+    provider._host_stats["search.bilibili.com"] = {
+        "requests": 4.0,
+        "successes": 2.0,
+        "failures": 2.0,
+        "totalLatencyMs": 14000.0,
+        "totalResults": 4.0,
+        "cacheHits": 0.0,
+    }
+
+    assert provider._recommended_query_depth("search.bilibili.com", 6) == 6
+    assert provider._should_skip_host("search.bilibili.com", min_requests=3) is False
+
+
+def test_search_bilibili_streaming_host_does_not_skip_too_early() -> None:
+    provider = HttpSourceProvider(browser_fetcher=BrowserResultFetcher({}))
+    provider._host_stats["www.bilibili.com"] = {
+        "requests": 4.0,
+        "successes": 0.0,
+        "failures": 4.0,
+        "totalLatencyMs": 24000.0,
+        "totalResults": 0.0,
+        "cacheHits": 0.0,
+    }
+
+    assert provider._should_skip_host("www.bilibili.com", min_requests=2) is False
+
+
+def test_search_youtube_records_layer_summary_event() -> None:
+    class YouTubeLayerProvider(HttpSourceProvider):
+        async def _search_streaming_platform(self, **kwargs):
+            del kwargs
+            return [{"url": "https://www.youtube.com/watch?v=apiyoutube01"}]
+
+    provider = YouTubeLayerProvider(
+        browser_fetcher=BrowserResultFetcher({}),
+        platform_search_config=PlatformSearchConfig(youtube=YouTubeSearchConfig(api_key="yt-key")),
+    )
+
+    rows = asyncio.run(provider._search_youtube(["klemperer query"]))
+    events = provider.consume_access_events()
+
+    assert rows
+    summary_events = [event for event in events if event["operation"] == "search-layer-summary"]
+    assert summary_events
+    assert summary_events[-1]["host"] == "www.youtube.com"
+    assert summary_events[-1]["primaryResultCount"] == 1
+    assert summary_events[-1]["engineResultCount"] == 0
+
+
+def test_search_bilibili_records_anomaly_event_when_browser_outperforms_primary() -> None:
+    class BilibiliAnomalyProvider(HttpSourceProvider):
+        async def _search_streaming_platform(self, **kwargs):
+            del kwargs
+            return []
+
+        async def _search_platform_via_browser_pages(self, **kwargs):
+            del kwargs
+            return [{"url": "https://www.bilibili.com/video/BV1browserhit/"}]
+
+        async def _search_platform_via_site_engines(self, *args, **kwargs):
+            del args, kwargs
+            return []
+
+    provider = BilibiliAnomalyProvider(
+        browser_fetcher=BrowserResultFetcher(
+            {},
+            search_evidence_by_url={
+                "https://search.bilibili.com/all?keyword=focused+bilibili+query": {
+                    "title": "focused bilibili query - Bilibili Search",
+                    "matchedLinks": ["https://www.bilibili.com/video/BV1browserhit/"],
+                    "matchedLinkCount": 1,
+                    "anchorCount": 12,
+                    "resultCardCount": 1,
+                    "extractionMode": "result-card-priority",
+                    "htmlLength": 2048,
+                    "bodyTextSample": "rendered bilibili result",
+                    "screenshotPath": "output/browser-diagnostics/bilibili-focused.png",
+                }
+            },
+        )
+    )
+
+    rows = asyncio.run(provider._search_bilibili(["focused bilibili query"]))
+    events = provider.consume_access_events()
+
+    assert rows
+    anomaly_events = [event for event in events if event["operation"] == "search-anomaly"]
+    assert anomaly_events
+    assert anomaly_events[-1]["host"] == "search.bilibili.com"
+    assert anomaly_events[-1]["anomalyType"] == "browser_outperformed_primary"
+    assert anomaly_events[-1]["browserResultCount"] == 1
+    assert anomaly_events[-1]["apiResultCount"] == 0
+    assert anomaly_events[-1]["browserTopUrls"] == ["https://www.bilibili.com/video/BV1browserhit/"]
+    assert anomaly_events[-1]["renderedEvidence"][0]["query"] == "focused bilibili query"
+    assert anomaly_events[-1]["renderedEvidence"][0]["matchedLinks"] == ["https://www.bilibili.com/video/BV1browserhit/"]
+    assert anomaly_events[-1]["renderedEvidence"][0]["resultCardCount"] == 1
+    assert anomaly_events[-1]["renderedEvidence"][0]["extractionMode"] == "result-card-priority"
+    assert anomaly_events[-1]["renderedEvidence"][0]["screenshotPath"].endswith("bilibili-focused.png")
+
+
+def test_search_youtube_records_anomaly_event_when_engine_only_recovers_html_gap() -> None:
+    class YouTubeAnomalyProvider(HttpSourceProvider):
+        async def _search_streaming_platform(self, **kwargs):
+            del kwargs
+            return []
+
+        async def _search_platform_via_site_engines(self, *args, **kwargs):
+            del args, kwargs
+            return [{"url": "https://www.youtube.com/watch?v=engineyoutube01"}]
+
+    provider = YouTubeAnomalyProvider(
+        browser_fetcher=BrowserResultFetcher(
+            {},
+            search_evidence_by_url={
+                "https://www.youtube.com/results?search_query=klemperer+query": {
+                    "title": "klemperer query - YouTube",
+                    "matchedLinks": [],
+                    "matchedLinkCount": 0,
+                    "anchorCount": 8,
+                    "htmlLength": 1024,
+                    "bodyTextSample": "empty rendered youtube results",
+                    "screenshotPath": "output/browser-diagnostics/youtube-klemperer.png",
+                }
+            },
+        ),
+        platform_search_config=PlatformSearchConfig(youtube=YouTubeSearchConfig(enabled=False, api_key="")),
+    )
+
+    rows = asyncio.run(provider._search_youtube(["klemperer query"]))
+    events = provider.consume_access_events()
+
+    assert rows
+    anomaly_events = [event for event in events if event["operation"] == "search-anomaly"]
+    assert anomaly_events
+    assert anomaly_events[-1]["host"] == "www.youtube.com"
+    assert anomaly_events[-1]["anomalyType"] == "engine_only_recovery"
+    assert anomaly_events[-1]["primaryResultCount"] == 0
+    assert anomaly_events[-1]["engineResultCount"] == 1
+    assert anomaly_events[-1]["engineTopUrls"] == ["https://www.youtube.com/watch?v=engineyoutube01"]
+    assert anomaly_events[-1]["renderedEvidence"][0]["query"] == "klemperer query"
+    assert anomaly_events[-1]["renderedEvidence"][0]["title"] == "klemperer query - YouTube"
+
+
+def test_search_youtube_records_parser_mismatch_when_rendered_results_do_not_overlap_html_parser() -> None:
+    class YouTubeParserMismatchProvider(HttpSourceProvider):
+        async def _search_streaming_platform(self, **kwargs):
+            del kwargs
+            return [{"url": "https://www.youtube.com/watch?v=htmlparser01"}]
+
+        async def _search_platform_via_site_engines(self, *args, **kwargs):
+            del args, kwargs
+            return [{"url": "https://www.youtube.com/watch?v=engineyoutube01"}]
+
+    provider = YouTubeParserMismatchProvider(
+        browser_fetcher=BrowserResultFetcher(
+                {},
+                search_evidence_by_url={
+                    "https://www.youtube.com/results?search_query=klemperer+query": {
+                        "title": "klemperer query - YouTube",
+                        "matchedLinks": ["https://www.youtube.com/watch?v=engineyoutube01"],
+                        "matchedLinkCount": 1,
+                        "anchorCount": 12,
+                        "htmlLength": 1536,
+                        "bodyTextSample": "rendered result differs from parsed html",
+                    }
+            },
+        ),
+        platform_search_config=PlatformSearchConfig(youtube=YouTubeSearchConfig(enabled=False, api_key="")),
+    )
+
+    rows = asyncio.run(provider._search_youtube(["klemperer query"]))
+    events = provider.consume_access_events()
+
+    assert rows
+    anomaly_events = [event for event in events if event["operation"] == "search-anomaly"]
+    assert anomaly_events
+    assert anomaly_events[-1]["host"] == "www.youtube.com"
+    assert anomaly_events[-1]["anomalyType"] == "parser_mismatch"
+    assert anomaly_events[-1]["primaryTopUrls"] == ["https://www.youtube.com/watch?v=htmlparser01"]
+    assert anomaly_events[-1]["renderedEvidence"][0]["matchedLinks"] == ["https://www.youtube.com/watch?v=engineyoutube01"]
+    assert anomaly_events[-1]["overlapCount"] == 0
+    assert anomaly_events[-1]["alternateOverlapCount"] == 1
+
+
+def test_search_youtube_does_not_record_parser_mismatch_without_rendered_support_for_engine_truth() -> None:
+    class YouTubeParserMismatchProvider(HttpSourceProvider):
+        async def _search_streaming_platform(self, **kwargs):
+            del kwargs
+            return [{"url": "https://www.youtube.com/watch?v=htmlparser01"}]
+
+        async def _search_platform_via_site_engines(self, *args, **kwargs):
+            del args, kwargs
+            return [{"url": "https://www.youtube.com/watch?v=engineyoutube01"}]
+
+    provider = YouTubeParserMismatchProvider(
+        browser_fetcher=BrowserResultFetcher(
+            {},
+            search_evidence_by_url={
+                "https://www.youtube.com/results?search_query=klemperer+query": {
+                    "title": "klemperer query - YouTube",
+                    "matchedLinks": ["https://www.youtube.com/watch?v=unrelated999"],
+                    "matchedLinkCount": 1,
+                    "anchorCount": 12,
+                    "htmlLength": 1536,
+                    "bodyTextSample": "rendered result is unrelated",
+                }
+            },
+        ),
+        platform_search_config=PlatformSearchConfig(youtube=YouTubeSearchConfig(enabled=False, api_key="")),
+    )
+
+    rows = asyncio.run(provider._search_youtube(["klemperer query"]))
+    events = provider.consume_access_events()
+
+    assert rows
+    anomaly_events = [event for event in events if event["operation"] == "search-anomaly"]
+    assert not anomaly_events
+
+
+def test_search_bilibili_records_parser_mismatch_when_browser_and_primary_do_not_overlap() -> None:
+    class BilibiliParserMismatchProvider(HttpSourceProvider):
+        async def _search_streaming_platform(self, **kwargs):
+            del kwargs
+            return [{"url": "https://www.bilibili.com/video/BV1apiresult1/"}]
+
+        async def _search_platform_via_browser_pages(self, **kwargs):
+            del kwargs
+            return [{"url": "https://www.bilibili.com/video/BV1browsertruth/"}]
+
+        async def _search_platform_via_site_engines(self, *args, **kwargs):
+            del args, kwargs
+            return []
+
+    provider = BilibiliParserMismatchProvider(
+        browser_fetcher=BrowserResultFetcher(
+            {},
+            search_evidence_by_url={
+                "https://search.bilibili.com/all?keyword=focused+bilibili+query": {
+                    "title": "focused bilibili query - Bilibili Search",
+                    "matchedLinks": ["https://www.bilibili.com/video/BV1browsertruth/"],
+                    "matchedLinkCount": 1,
+                    "anchorCount": 10,
+                    "htmlLength": 2024,
+                    "bodyTextSample": "rendered bilibili truth",
+                }
+            },
+        )
+    )
+
+    rows = asyncio.run(provider._search_bilibili(["focused bilibili query"]))
+    events = provider.consume_access_events()
+
+    assert rows
+    anomaly_events = [event for event in events if event["operation"] == "search-anomaly"]
+    assert anomaly_events
+    assert anomaly_events[-1]["host"] == "search.bilibili.com"
+    assert anomaly_events[-1]["anomalyType"] == "parser_mismatch"
+    assert anomaly_events[-1]["apiTopUrls"] == ["https://www.bilibili.com/video/BV1apiresult1/"]
+    assert anomaly_events[-1]["browserTopUrls"] == ["https://www.bilibili.com/video/BV1browsertruth/"]
+    assert anomaly_events[-1]["renderedEvidence"][0]["matchedLinks"] == ["https://www.bilibili.com/video/BV1browsertruth/"]
+    assert anomaly_events[-1]["overlapCount"] == 0
+    assert anomaly_events[-1]["alternateOverlapCount"] == 1
+
+
+def test_search_bilibili_does_not_record_parser_mismatch_without_rendered_support_for_browser_truth() -> None:
+    class BilibiliParserMismatchProvider(HttpSourceProvider):
+        async def _search_streaming_platform(self, **kwargs):
+            del kwargs
+            return [{"url": "https://www.bilibili.com/video/BV1apiresult1/"}]
+
+        async def _search_platform_via_browser_pages(self, **kwargs):
+            del kwargs
+            return [{"url": "https://www.bilibili.com/video/BV1browsertruth/"}]
+
+        async def _search_platform_via_site_engines(self, *args, **kwargs):
+            del args, kwargs
+            return []
+
+    provider = BilibiliParserMismatchProvider(
+        browser_fetcher=BrowserResultFetcher(
+            {},
+            search_evidence_by_url={
+                "https://search.bilibili.com/all?keyword=focused+bilibili+query": {
+                    "title": "focused bilibili query - Bilibili Search",
+                    "matchedLinks": ["https://www.bilibili.com/video/BV1othernoise/"],
+                    "matchedLinkCount": 1,
+                    "anchorCount": 10,
+                    "htmlLength": 2024,
+                    "bodyTextSample": "rendered bilibili unrelated result",
+                }
+            },
+        )
+    )
+
+    rows = asyncio.run(provider._search_bilibili(["focused bilibili query"]))
+    events = provider.consume_access_events()
+
+    assert rows
+    anomaly_events = [event for event in events if event["operation"] == "search-anomaly"]
+    assert not anomaly_events
+
+
+def test_search_bilibili_does_not_record_parser_mismatch_for_same_video_when_api_uses_av_url_and_bvid() -> None:
+    class BilibiliParserMismatchProvider(HttpSourceProvider):
+        async def _search_streaming_platform(self, **kwargs):
+            del kwargs
+            return [
+                {
+                    "url": "http://www.bilibili.com/video/av123456789",
+                    "bvid": "BV1browsertruth",
+                }
+            ]
+
+        async def _search_platform_via_browser_pages(self, **kwargs):
+            del kwargs
+            return [{"url": "https://www.bilibili.com/video/BV1browsertruth/"}]
+
+        async def _search_platform_via_site_engines(self, *args, **kwargs):
+            del args, kwargs
+            return []
+
+    provider = BilibiliParserMismatchProvider(
+        browser_fetcher=BrowserResultFetcher(
+            {},
+            search_evidence_by_url={
+                "https://search.bilibili.com/all?keyword=focused+bilibili+query": {
+                    "title": "focused bilibili query - Bilibili Search",
+                    "matchedLinks": ["https://www.bilibili.com/video/BV1browsertruth/"],
+                    "matchedLinkCount": 1,
+                    "anchorCount": 10,
+                    "htmlLength": 2024,
+                    "bodyTextSample": "rendered bilibili truth",
+                }
+            },
+        )
+    )
+
+    rows = asyncio.run(provider._search_bilibili(["focused bilibili query"]))
+    events = provider.consume_access_events()
+
+    assert rows
+    anomaly_events = [event for event in events if event["operation"] == "search-anomaly"]
+    assert not anomaly_events
+
+
+def test_normalize_search_result_payload_prefers_bilibili_result_cards_over_noisy_anchor_scan() -> None:
+    payload = normalize_search_result_payload(
+        "https://search.bilibili.com/all?keyword=richter",
+        {
+            "allLinks": [
+                "https://www.bilibili.com",
+                "https://space.bilibili.com/123",
+                "https://www.bilibili.com/video/BV1noise111/",
+                "https://www.bilibili.com/video/BV1truth222/",
+            ],
+            "resultCardLinks": [
+                "https://www.bilibili.com/video/BV1truth222/",
+                "https://www.bilibili.com/video/BV1truth333/",
+            ],
+        },
+    )
+
+    assert payload["matchedLinks"][:2] == [
+        "https://www.bilibili.com/video/BV1truth222/",
+        "https://www.bilibili.com/video/BV1truth333/",
+    ]
+    assert payload["matchedLinks"][2] == "https://www.bilibili.com/video/BV1noise111/"
+    assert payload["resultCardCount"] == 2
+    assert payload["extractionMode"] == "result-card-priority"
+
+
+def test_normalize_search_result_payload_keeps_generic_anchor_scan_for_youtube() -> None:
+    payload = normalize_search_result_payload(
+        "https://www.youtube.com/results?search_query=richter",
+        {
+            "allLinks": [
+                "https://www.youtube.com/watch?v=truth111",
+                "https://www.youtube.com/watch?v=truth222",
+            ],
+            "resultCardLinks": [
+                "https://www.youtube.com/watch?v=unused333",
+            ],
+        },
+    )
+
+    assert payload["matchedLinks"] == [
+        "https://www.youtube.com/watch?v=truth111",
+        "https://www.youtube.com/watch?v=truth222",
+    ]
+    assert payload["resultCardCount"] == 1
+    assert payload["extractionMode"] == "anchor-scan"
+
+
+def test_merge_bilibili_search_rows_suppresses_non_overlapping_api_rows_after_parser_mismatch() -> None:
+    browser_rows = [
+        {"url": "https://www.bilibili.com/video/BV1browsertruth/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"},
+        {"url": "https://www.bilibili.com/video/BV1browsernext/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"},
+    ]
+    api_rows = [
+        {"url": "https://www.bilibili.com/video/BV1apinoise1/", "source_label": "Bilibili API Search", "source_kind": "streaming"},
+        {"url": "https://www.bilibili.com/video/BV1apinoise2/", "source_label": "Bilibili API Search", "source_kind": "streaming"},
+    ]
+    engine_rows = [
+        {"url": "https://www.bilibili.com/video/BV1browsertruth/", "source_label": "Bilibili Search via Bing", "source_kind": "streaming"},
+    ]
+
+    merged = merge_bilibili_search_rows(
+        api_rows,
+        browser_rows,
+        engine_rows,
+        parser_mismatch=True,
+    )
+
+    urls = [row["url"] for row in merged]
+    assert urls[:2] == [
+        "https://www.bilibili.com/video/BV1browsertruth/",
+        "https://www.bilibili.com/video/BV1browsernext/",
+    ]
+    assert "https://www.bilibili.com/video/BV1apinoise1/" not in urls
+    assert "https://www.bilibili.com/video/BV1apinoise2/" not in urls
+
+
+def test_merge_bilibili_search_rows_keeps_overlapping_api_rows_after_parser_mismatch() -> None:
+    browser_rows = [
+        {"url": "https://www.bilibili.com/video/BV1browsertruth/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"},
+    ]
+    api_rows = [
+        {"url": "https://www.bilibili.com/video/BV1browsertruth/", "source_label": "Bilibili API Search", "source_kind": "streaming"},
+        {"url": "https://www.bilibili.com/video/BV1apinoise2/", "source_label": "Bilibili API Search", "source_kind": "streaming"},
+    ]
+    engine_rows = []
+
+    merged = merge_bilibili_search_rows(
+        api_rows,
+        browser_rows,
+        engine_rows,
+        parser_mismatch=True,
+    )
+
+    urls = [row["url"] for row in merged]
+    assert urls == ["https://www.bilibili.com/video/BV1browsertruth/"]
+
+
+def test_prune_browser_diagnostic_files_keeps_newest_files_within_count(tmp_path: Path) -> None:
+    output_dir = tmp_path / "browser-diagnostics"
+    output_dir.mkdir(parents=True)
+    files = []
+    for index in range(4):
+        target = output_dir / f"capture-{index}.png"
+        target.write_bytes(f"file-{index}".encode("utf-8"))
+        timestamp = time.time() - (40 - index)
+        target.touch()
+        Path(target).stat()
+
+        os.utime(target, (timestamp, timestamp))
+        files.append(target)
+
+    prune_browser_diagnostic_files(output_dir, max_files=2, max_total_bytes=10_000)
+
+    remaining = sorted(path.name for path in output_dir.glob("*.png"))
+    assert remaining == ["capture-2.png", "capture-3.png"]
+
+
+def test_prune_browser_diagnostic_files_keeps_total_size_within_budget(tmp_path: Path) -> None:
+    output_dir = tmp_path / "browser-diagnostics"
+    output_dir.mkdir(parents=True)
+    for index in range(3):
+        target = output_dir / f"capture-{index}.png"
+        target.write_bytes(b"x" * 12)
+        timestamp = time.time() - (30 - index)
+
+        os.utime(target, (timestamp, timestamp))
+
+    prune_browser_diagnostic_files(output_dir, max_files=5, max_total_bytes=24)
+
+    remaining = sorted(path.name for path in output_dir.glob("*.png"))
+    assert remaining == ["capture-1.png", "capture-2.png"]
+
+
 def test_provider_access_summary_marks_unstable_host_and_recommends_higher_timeout(tmp_path: Path) -> None:
     root = tmp_path / "source-profiles"
     root.mkdir(parents=True)
@@ -1225,6 +2087,41 @@ def test_provider_disables_youtube_api_after_quota_error_in_same_run(tmp_path: P
     assert sum("youtube.com/results" in url for url in transport.urls) >= 2
 
 
+def test_streaming_platform_serializes_api_failure_before_fallback_queries() -> None:
+    class ApiBudgetProvider(HttpSourceProvider):
+        def __init__(self) -> None:
+            super().__init__(browser_fetcher=BrowserResultFetcher({}))
+            self.api_calls = 0
+
+        async def _fetch_text(self, url: str, **kwargs) -> str:
+            del url, kwargs
+            return "<html></html>"
+
+    provider = ApiBudgetProvider()
+
+    async def failing_api_search(query: str, result_depth: int):
+        del query, result_depth
+        provider.api_calls += 1
+        await asyncio.sleep(0.01)
+        request = httpx.Request("GET", "https://www.googleapis.com/youtube/v3/search")
+        response = httpx.Response(403, request=request, text="quota exceeded")
+        raise httpx.HTTPStatusError("quota exceeded", request=request, response=response)
+
+    rows = asyncio.run(
+        provider._search_streaming_platform(
+            queries=["query-one", "query-two", "query-three", "query-four"],
+            url_builder=lambda query: f"https://www.youtube.com/results?search_query={quote_plus(query)}",
+            parser=lambda html_text: ["https://www.youtube.com/watch?v=fallback001"],
+            source_label="YouTube Search",
+            api_search=failing_api_search,
+            api_source_label="YouTube API Search",
+        )
+    )
+
+    assert rows
+    assert provider.api_calls == 1
+
+
 def test_provider_expands_title_inferred_chinese_collaborator_into_latin_youtube_queries(tmp_path: Path) -> None:
     root = tmp_path / "source-profiles"
     root.mkdir(parents=True)
@@ -1346,6 +2243,962 @@ def test_queries_for_host_add_bilibili_chinese_shorthand_alias_for_concerto() ->
     assert any("钢协" in query and ("Annie Fischer" in query or "安妮" in query) for query in queries)
 
 
+def test_queries_for_bilibili_host_keep_exact_latin_collaboration_query_for_annie_kletzki() -> None:
+    provider = HttpSourceProvider()
+    draft = DraftRecordingEntry(
+        item_id="recording-annie-query-zh-2",
+        title="Annie Fischer & Kletzki",
+        composer_name="鑸掓浖",
+        composer_name_latin="Robert Schumann",
+        work_title="a灏忚皟閽㈢惔鍗忓鏇?",
+        work_title_latin="Piano Concerto, Op.54",
+        catalogue="Op.54",
+        performance_date_text="",
+        venue_text="",
+        album_title="",
+        label="",
+        release_date="",
+        notes="",
+        source_line="Robert Schumann | Piano Concerto in A Minor, Op.54 | Annie Fischer | Paul Kletzki | Budapest Philharmonic Orchestra | -",
+        raw_text="Robert Schumann | Piano Concerto in A Minor, Op.54 | Annie Fischer | Paul Kletzki | Budapest Philharmonic Orchestra | -",
+        existing_links=[],
+        primary_names=["瀹夊Ξ路璐硅垗灏?", "Annie Fischer"],
+        primary_names_latin=["Annie Fischer"],
+        secondary_names=["淇濈綏路鍏嬪垪鑼ㄥ熀", "Paul Kletzki"],
+        secondary_names_latin=["Paul Kletzki"],
+        query_lead_names=["瀹夊Ξ路璐硅垗灏?", "Annie Fischer", "淇濈綏路鍏嬪垪鑼ㄥ熀", "Paul Kletzki"],
+        query_lead_names_latin=[
+            "Annie Fischer Paul Kletzki",
+            "Annie Fischer / Paul Kletzki",
+            "Annie Fischer",
+            "Paul Kletzki",
+        ],
+        lead_names=["瀹夊Ξ路璐硅垗灏?", "Annie Fischer", "淇濈綏路鍏嬪垪鑼ㄥ熀", "Paul Kletzki"],
+        lead_names_latin=["Annie Fischer", "Paul Kletzki"],
+        ensemble_names=["甯冭揪浣╂柉鐖变箰涔愬洟", "Budapest Philharmonic Orchestra"],
+        ensemble_names_latin=["Budapest Orchestra", "Budapest Philharmonic Orchestra", "BpPO"],
+    )
+    profile = RetrievalProfile(category="concerto", tags=[], queries=[], latin_queries=[], zh_queries=[], mixed_queries=[])
+    host = next(host for host in provider._profile_loader.load(category="concerto", tags=[]).streaming if "bilibili.com" in host.url)
+
+    queries = provider._queries_for_host(draft, profile, host)
+
+    assert any("Piano Concerto, Op.54 Annie Fischer Paul Kletzki" in query for query in queries[:10])
+    assert any("Paul Kletzki" in query for query in queries[:10])
+
+
+def test_queries_for_bilibili_host_add_exact_primary_year_work_query_for_moiseiwitsch_partial() -> None:
+    provider = HttpSourceProvider()
+    draft = DraftRecordingEntry(
+        item_id="recording-moiseiwitsch-query-zh-1",
+        title="Benno Moiseiwitsch Schumann concerto",
+        composer_name="鑸掓浖",
+        composer_name_latin="Robert Schumann",
+        work_title="a灏忚皟閽㈢惔鍗忓鏇?",
+        work_title_latin="Piano Concerto, Op.54",
+        catalogue="Op.54",
+        performance_date_text="1954",
+        venue_text="",
+        album_title="",
+        label="",
+        release_date="",
+        notes="",
+        source_line="Robert Schumann | Piano Concerto in A Minor, Op.54 | Benno Moiseiwitsch | Otto Ackermann | - | 1954",
+        raw_text="Robert Schumann | Piano Concerto in A Minor, Op.54 | Benno Moiseiwitsch | Otto Ackermann | - | 1954",
+        existing_links=[],
+        primary_names=["鐝路鑾紛濉炵淮濂?", "Benno Moiseiwitsch"],
+        primary_names_latin=["Benno Moiseiwitsch"],
+        secondary_names=["濂ユ墭路闃垮厠鏇?", "Otto Ackermann"],
+        secondary_names_latin=["Otto Ackermann"],
+        query_lead_names=["鐝路鑾紛濉炵淮濂?", "Benno Moiseiwitsch", "濂ユ墭路闃垮厠鏇?", "Otto Ackermann"],
+        query_lead_names_latin=[
+            "Benno Moiseiwitsch Otto Ackermann",
+            "Benno Moiseiwitsch / Otto Ackermann",
+            "Benno Moiseiwitsch",
+            "Otto Ackermann",
+        ],
+        lead_names=["鐝路鑾紛濉炵淮濂?", "Benno Moiseiwitsch", "濂ユ墭路闃垮厠鏇?", "Otto Ackermann"],
+        lead_names_latin=["Benno Moiseiwitsch", "Otto Ackermann"],
+        ensemble_names=[],
+        ensemble_names_latin=[],
+    )
+    profile = RetrievalProfile(category="concerto", tags=[], queries=[], latin_queries=[], zh_queries=[], mixed_queries=[])
+    host = next(host for host in provider._profile_loader.load(category="concerto", tags=[]).streaming if "bilibili.com" in host.url)
+
+    queries = provider._queries_for_host(draft, profile, host)
+
+    assert any("Moiseiwitsch Schumann Piano Concerto 1954" in query for query in queries[:10])
+
+
+def test_queries_for_bilibili_host_add_exact_primary_year_work_query_for_actual_moiseiwitsch_partial_scenario() -> None:
+    recordings, works, composers = load_library_indices()
+    work_id = find_work_id(works=works, title_latin="Piano Concerto, Op.54")
+    scenario = next(
+        scenario
+        for scenario in build_work_dataset(
+            work_id=work_id,
+            recordings=recordings,
+            works=works,
+            composers=composers,
+        )
+        if scenario.variant == "partial" and "bilibili:BV1Gx4y1U7kW" in scenario.target_urls
+    )
+    provider = HttpSourceProvider()
+    draft = InputNormalizer().normalize(scenario.item)
+    profile = RetrievalProfile(category="concerto", tags=[], queries=[], latin_queries=[], zh_queries=[], mixed_queries=[])
+    host = next(host for host in provider._profile_loader.load(category="concerto", tags=[]).streaming if "bilibili.com" in host.url)
+
+    queries = provider._queries_for_host(draft, profile, host)
+
+    assert any("Moiseiwitsch Schumann Piano Concerto 1954" in query for query in queries[:10])
+
+
+def test_queries_for_bilibili_host_does_not_add_overbroad_exact_primary_year_work_query_for_actual_annie_partial_scenario() -> None:
+    recordings, works, composers = load_library_indices()
+    work_id = find_work_id(works=works, title_latin="Piano Concerto, Op.54")
+    scenario = next(
+        scenario
+        for scenario in build_work_dataset(
+            work_id=work_id,
+            recordings=recordings,
+            works=works,
+            composers=composers,
+        )
+        if scenario.variant == "partial" and "bilibili:BV1yqYEeKErH" in scenario.target_urls
+    )
+    provider = HttpSourceProvider()
+    draft = InputNormalizer().normalize(scenario.item)
+    profile = RetrievalProfile(category="concerto", tags=[], queries=[], latin_queries=[], zh_queries=[], mixed_queries=[])
+    host = next(host for host in provider._profile_loader.load(category="concerto", tags=[]).streaming if "bilibili.com" in host.url)
+
+    queries = provider._queries_for_host(draft, profile, host)
+
+    assert "Fischer Schumann Piano Concerto 1985" not in queries[:10]
+
+
+def test_queries_for_chinese_host_include_bilingual_primary_alias_with_chinese_work_shorthand() -> None:
+    provider = HttpSourceProvider()
+    draft = DraftRecordingEntry(
+        item_id="recording-de-lara-query-zh-1",
+        title="Adelina de Lara Schumann concerto",
+        composer_name="??",
+        composer_name_latin="Robert Schumann",
+        work_title="a???????",
+        work_title_latin="Piano Concerto, Op.54",
+        catalogue="Op.54",
+        performance_date_text="May 29, 1951",
+        venue_text="",
+        album_title="",
+        label="",
+        release_date="",
+        notes="",
+        source_line="Robert Schumann | Piano Concerto in A minor, Op.54 | Adelina de Lara | Ian Whyte | BBC Scottish Symphony Orchestra | May 29, 1951",
+        raw_text="Robert Schumann | Piano Concerto in A minor, Op.54 | Adelina de Lara | Ian Whyte | BBC Scottish Symphony Orchestra | May 29, 1951",
+        existing_links=[],
+        primary_names=["?????????"],
+        primary_names_latin=["Adelina de Lara"],
+        secondary_names=["?????"],
+        secondary_names_latin=["Ian Whyte"],
+        query_lead_names=["?????????", "?????"],
+        query_lead_names_latin=["Adelina de Lara Ian Whyte", "Adelina de Lara / Ian Whyte", "Adelina de Lara", "Ian Whyte"],
+        lead_names=["?????????", "?????"],
+        lead_names_latin=["Adelina de Lara", "Ian Whyte"],
+        ensemble_names=["?????????????"],
+        ensemble_names_latin=["BBC Scottish Symphony Orchestra"],
+    )
+    profile = RetrievalProfile(category="concerto", tags=[], queries=[], latin_queries=[], zh_queries=[], mixed_queries=[])
+    host = next(host for host in provider._profile_loader.load(category="concerto", tags=[]).streaming if "bilibili.com" in host.url)
+
+    queries = provider._queries_for_host(draft, profile, host)
+
+    assert any("Adelina de Lara" in query and draft.work_title in query for query in queries)
+
+
+def test_queries_for_chinese_host_include_bilingual_short_primary_alias_for_richter_style_titles() -> None:
+    provider = HttpSourceProvider()
+    draft = DraftRecordingEntry(
+        item_id="recording-richter-query-zh-1",
+        title="Sviatoslav Richter Schumann concerto",
+        composer_name="\u8212\u66fc",
+        composer_name_latin="Robert Schumann",
+        work_title="a\u5c0f\u8c03\u94a2\u7434\u534f\u594f\u66f2",
+        work_title_latin="Piano Concerto, Op.54",
+        catalogue="Op.54",
+        performance_date_text="1954",
+        venue_text="",
+        album_title="",
+        label="",
+        release_date="",
+        notes="",
+        source_line="Robert Schumann | Piano Concerto in A minor, Op.54 | Sviatoslav Richter | Ferencsik Janos | Hungarian National Philharmonic Orchestra | 1954",
+        raw_text="Robert Schumann | Piano Concerto in A minor, Op.54 | Sviatoslav Richter | Ferencsik Janos | Hungarian National Philharmonic Orchestra | 1954",
+        existing_links=[],
+        primary_names=["\u65af\u7ef4\u4e9a\u6258\u65af\u62c9\u592b\u00b7\u7279\u5965\u83f2\u6d1b\u7ef4\u5947\u00b7\u91cc\u8d6b\u7279"],
+        primary_names_latin=["Sviatoslav Richter", "Sviatoslav Teofilovich Richter"],
+        secondary_names=["\u8d39\u4f26\u5947\u514b"],
+        secondary_names_latin=["Ferencsik Janos", "Janos Ferencsik"],
+        query_lead_names=[
+            "\u65af\u7ef4\u4e9a\u6258\u65af\u62c9\u592b\u00b7\u7279\u5965\u83f2\u6d1b\u7ef4\u5947\u00b7\u91cc\u8d6b\u7279",
+            "\u8d39\u4f26\u5947\u514b",
+        ],
+        query_lead_names_latin=[
+            "Sviatoslav Richter Ferencsik Janos",
+            "Sviatoslav Richter / Ferencsik Janos",
+            "Sviatoslav Richter",
+            "Ferencsik Janos",
+            "Janos Ferencsik",
+        ],
+        lead_names=[
+            "\u65af\u7ef4\u4e9a\u6258\u65af\u62c9\u592b\u00b7\u7279\u5965\u83f2\u6d1b\u7ef4\u5947\u00b7\u91cc\u8d6b\u7279",
+            "\u8d39\u4f26\u5947\u514b",
+        ],
+        lead_names_latin=["Sviatoslav Richter", "Ferencsik Janos", "Janos Ferencsik"],
+        ensemble_names=["\u5308\u7259\u5229\u56fd\u5bb6\u7231\u4e50\u4e50\u56e2"],
+        ensemble_names_latin=["Hungarian National Philharmonic Orchestra"],
+    )
+    profile = RetrievalProfile(category="concerto", tags=[], queries=[], latin_queries=[], zh_queries=[], mixed_queries=[])
+    host = next(host for host in provider._profile_loader.load(category="concerto", tags=[]).streaming if "bilibili.com" in host.url)
+
+    queries = provider._queries_for_host(draft, profile, host)
+
+    assert any("舒曼" in query and draft.work_title in query and "斯维亚托斯拉夫" in query for query in queries)
+    assert any(
+        "Sviatoslav Richter" in query
+        and "1954" in query
+        and "Hungarian" not in query
+        and "匈牙利" not in query
+        for query in queries
+    )
+    assert any(query.startswith("里赫特 匈牙利 1954 舒曼钢协") for query in queries)
+
+
+def test_queries_for_chinese_host_include_decade_bucket_rescue_query_for_compilation_style_titles() -> None:
+    provider = HttpSourceProvider()
+    draft = DraftRecordingEntry(
+        item_id="recording-kempff-query-zh-1",
+        title="Wilhelm Kempff Schumann concerto",
+        composer_name="舒曼",
+        composer_name_latin="Robert Schumann",
+        work_title="a小调钢琴协奏曲",
+        work_title_latin="Piano Concerto, Op.54",
+        catalogue="Op.54",
+        performance_date_text="1959",
+        venue_text="",
+        album_title="",
+        label="",
+        release_date="",
+        notes="",
+        source_line="Robert Schumann | Piano Concerto in A minor, Op.54 | Wilhelm Kempff | Antal Dorati | Concertgebouw Orchestra Amsterdam | 1959",
+        raw_text="Robert Schumann | Piano Concerto in A minor, Op.54 | Wilhelm Kempff | Antal Dorati | Concertgebouw Orchestra Amsterdam | 1959",
+        existing_links=[],
+        primary_names=["肯普夫"],
+        primary_names_latin=["Wilhelm Kempff", "Wilhelm Walter Friedrich Kempff"],
+        secondary_names=["多拉蒂"],
+        secondary_names_latin=["Antal Dorati"],
+        query_lead_names=["肯普夫", "多拉蒂"],
+        query_lead_names_latin=[
+            "Wilhelm Kempff Antal Dorati",
+            "Wilhelm Kempff / Antal Dorati",
+            "Wilhelm Kempff",
+            "Wilhelm Walter Friedrich Kempff",
+            "Antal Dorati",
+        ],
+        lead_names=["肯普夫", "多拉蒂"],
+        lead_names_latin=["Wilhelm Kempff", "Wilhelm Walter Friedrich Kempff", "Antal Dorati"],
+        ensemble_names=["阿姆斯特丹皇家音乐厅管弦乐团"],
+        ensemble_names_latin=["Concertgebouw Orchestra Amsterdam", "Royal Concertgebouw Orchestra"],
+    )
+    profile = RetrievalProfile(category="concerto", tags=[], queries=[], latin_queries=[], zh_queries=[], mixed_queries=[])
+    host = next(host for host in provider._profile_loader.load(category="concerto", tags=[]).streaming if "bilibili.com" in host.url)
+
+    queries = provider._queries_for_host(draft, profile, host)
+
+    assert "Kempff Schumann Piano Concerto 1950s Op.54" in queries
+    assert "Kempff Schumann Piano Concertos 1950s Op.54" in queries
+
+
+def test_queries_for_chinese_host_append_catalogue_to_work_rescue_queries() -> None:
+    provider = HttpSourceProvider()
+    draft = DraftRecordingEntry(
+        item_id="recording-kempff-query-zh-opus",
+        title="Wilhelm Kempff Schumann concerto",
+        composer_name="舒曼",
+        composer_name_latin="Robert Schumann",
+        work_title="a小调钢琴协奏曲",
+        work_title_latin="Piano Concerto, Op.54",
+        catalogue="Op.54",
+        performance_date_text="1959",
+        venue_text="",
+        album_title="",
+        label="",
+        release_date="",
+        notes="",
+        source_line="Robert Schumann | Piano Concerto in A minor, Op.54 | Wilhelm Kempff | Antal Dorati | Concertgebouw Orchestra Amsterdam | 1959",
+        raw_text="Robert Schumann | Piano Concerto in A minor, Op.54 | Wilhelm Kempff | Antal Dorati | Concertgebouw Orchestra Amsterdam | 1959",
+        existing_links=[],
+        primary_names=["肯普夫"],
+        primary_names_latin=["Wilhelm Kempff", "Wilhelm Walter Friedrich Kempff"],
+        secondary_names=["多拉蒂"],
+        secondary_names_latin=["Antal Dorati"],
+        query_lead_names=["肯普夫", "多拉蒂"],
+        query_lead_names_latin=[
+            "Wilhelm Kempff Antal Dorati",
+            "Wilhelm Kempff / Antal Dorati",
+            "Wilhelm Kempff",
+            "Wilhelm Walter Friedrich Kempff",
+            "Antal Dorati",
+        ],
+        lead_names=["肯普夫", "多拉蒂"],
+        lead_names_latin=["Wilhelm Kempff", "Wilhelm Walter Friedrich Kempff", "Antal Dorati"],
+        ensemble_names=["阿姆斯特丹皇家音乐厅管弦乐团"],
+        ensemble_names_latin=["Concertgebouw Orchestra Amsterdam", "Royal Concertgebouw Orchestra"],
+    )
+    profile = RetrievalProfile(category="concerto", tags=[], queries=[], latin_queries=[], zh_queries=[], mixed_queries=[])
+    host = next(host for host in provider._profile_loader.load(category="concerto", tags=[]).streaming if "bilibili.com" in host.url)
+
+    queries = provider._queries_for_host(draft, profile, host)
+
+    assert "Kempff Schumann Piano Concerto 1950s Op.54" in queries
+    assert "Kempff Dorati Schumann concerto 1959 Op.54" in queries
+
+
+def test_queries_for_chinese_host_include_generic_plural_bundle_rescue_without_catalogue_hint() -> None:
+    provider = HttpSourceProvider()
+    draft = DraftRecordingEntry(
+        item_id="recording-kempff-query-zh-generic-bundle",
+        title="Wilhelm Kempff Schumann concerto",
+        composer_name="舒曼",
+        composer_name_latin="Robert Schumann",
+        work_title="a小调钢琴协奏曲",
+        work_title_latin="Piano Concerto, Op.54",
+        catalogue="Op.54",
+        performance_date_text="1959",
+        venue_text="",
+        album_title="",
+        label="",
+        release_date="",
+        notes="",
+        source_line="Robert Schumann | Piano Concerto in A minor, Op.54 | Wilhelm Kempff | Antal Dorati | Concertgebouw Orchestra Amsterdam | 1959",
+        raw_text="Robert Schumann | Piano Concerto in A minor, Op.54 | Wilhelm Kempff | Antal Dorati | Concertgebouw Orchestra Amsterdam | 1959",
+        existing_links=[],
+        primary_names=["肯普夫"],
+        primary_names_latin=["Wilhelm Kempff", "Wilhelm Walter Friedrich Kempff"],
+        secondary_names=["多拉蒂"],
+        secondary_names_latin=["Antal Dorati"],
+        query_lead_names=["肯普夫", "多拉蒂"],
+        query_lead_names_latin=[
+            "Wilhelm Kempff Antal Dorati",
+            "Wilhelm Kempff / Antal Dorati",
+            "Wilhelm Kempff",
+            "Wilhelm Walter Friedrich Kempff",
+            "Antal Dorati",
+        ],
+        lead_names=["肯普夫", "多拉蒂"],
+        lead_names_latin=["Wilhelm Kempff", "Wilhelm Walter Friedrich Kempff", "Antal Dorati"],
+        ensemble_names=["阿姆斯特丹皇家音乐厅管弦乐团"],
+        ensemble_names_latin=["Concertgebouw Orchestra Amsterdam", "Royal Concertgebouw Orchestra"],
+    )
+    profile = RetrievalProfile(category="concerto", tags=[], queries=[], latin_queries=[], zh_queries=[], mixed_queries=[])
+    host = next(host for host in provider._profile_loader.load(category="concerto", tags=[]).streaming if "bilibili.com" in host.url)
+
+    queries = provider._queries_for_host(draft, profile, host)
+
+    assert "Kempff Piano Concertos 1950s" in queries[:6]
+    assert "Kempff Piano Concertos 1950s Op.54" not in queries
+
+
+def test_queries_for_chinese_host_include_primary_composer_work_rescue_queries() -> None:
+    provider = HttpSourceProvider()
+    draft = DraftRecordingEntry(
+        item_id="recording-de-lara-query-1",
+        title="Adelina de Lara Schumann concerto",
+        composer_name="罗伯特·舒曼",
+        composer_name_latin="Robert Schumann",
+        work_title="a小调钢琴协奏曲",
+        work_title_latin="Piano Concerto, Op.54",
+        catalogue="Op.54",
+        performance_date_text="May 29, 1951",
+        venue_text="",
+        album_title="",
+        label="",
+        release_date="",
+        notes="",
+        source_line="Robert Schumann | Piano Concerto in A minor, Op.54 | Adelina de Lara | Ian Whyte | BBC Scottish Symphony Orchestra | May 29, 1951",
+        raw_text="Robert Schumann | Piano Concerto in A minor, Op.54 | Adelina de Lara | Ian Whyte | BBC Scottish Symphony Orchestra | May 29, 1951",
+        existing_links=[],
+        primary_names=["阿德利纳·德·劳拉"],
+        primary_names_latin=["Adelina de Lara"],
+        secondary_names=["伊恩·怀特"],
+        secondary_names_latin=["Ian Whyte"],
+        query_lead_names=["阿德利纳·德·劳拉", "伊恩·怀特"],
+        query_lead_names_latin=[
+            "Adelina de Lara Ian Whyte",
+            "Adelina de Lara / Ian Whyte",
+            "Adelina de Lara",
+            "Ian Whyte",
+        ],
+        lead_names=["阿德利纳·德·劳拉", "伊恩·怀特"],
+        lead_names_latin=["Adelina de Lara", "Ian Whyte"],
+        ensemble_names=["英国广播公司苏格兰交响乐团"],
+        ensemble_names_latin=["BBC Scottish Symphony Orchestra"],
+    )
+    profile = RetrievalProfile(category="concerto", tags=[], queries=[], latin_queries=[], zh_queries=[], mixed_queries=[])
+    host = next(host for host in provider._profile_loader.load(category="concerto", tags=[]).streaming if "bilibili.com" in host.url)
+
+    queries = provider._queries_for_host(draft, profile, host)
+
+    assert any(
+        "Adelina de Lara" in query
+        and "Schumann" in query
+        and ("concerto" in query.lower() or "Piano Concerto" in query)
+        for query in queries
+    )
+    assert "de Lara Whyte Schumann concerto 1951 Op.54" in queries
+
+
+def test_queries_for_non_chinese_host_append_catalogue_to_collaboration_rescue_queries() -> None:
+    provider = HttpSourceProvider()
+    draft = DraftRecordingEntry(
+        item_id="recording-larrocha-query-opus",
+        title="Alicia de Larrocha Schumann concerto",
+        composer_name="舒曼",
+        composer_name_latin="Robert Schumann",
+        work_title="a小调钢琴协奏曲",
+        work_title_latin="Piano Concerto, Op.54",
+        catalogue="Op.54",
+        performance_date_text="January 12, 1977",
+        venue_text="Victoria Hall",
+        album_title="",
+        label="",
+        release_date="",
+        notes="",
+        source_line="Robert Schumann | Piano Concerto in A minor, Op.54 | Alicia de Larrocha | Wolfgang Sawallisch | Orchestre de la Suisse Romande | January 12, 1977 - Victoria Hall",
+        raw_text="Robert Schumann | Piano Concerto in A minor, Op.54 | Alicia de Larrocha | Wolfgang Sawallisch | Orchestre de la Suisse Romande | January 12, 1977 - Victoria Hall",
+        existing_links=[],
+        primary_names=["阿利西亚·德·拉罗查"],
+        primary_names_latin=["Alicia de Larrocha"],
+        secondary_names=["沃尔夫冈·萨瓦利施"],
+        secondary_names_latin=["Wolfgang Sawallisch"],
+        query_lead_names=["阿利西亚·德·拉罗查", "沃尔夫冈·萨瓦利施"],
+        query_lead_names_latin=[
+            "Alicia de Larrocha Wolfgang Sawallisch",
+            "Alicia de Larrocha / Wolfgang Sawallisch",
+            "Alicia de Larrocha",
+            "Wolfgang Sawallisch",
+        ],
+        lead_names=["阿利西亚·德·拉罗查", "沃尔夫冈·萨瓦利施"],
+        lead_names_latin=["Alicia de Larrocha", "Wolfgang Sawallisch"],
+        ensemble_names=["瑞士罗曼德管弦乐团"],
+        ensemble_names_latin=["Orchestre de la Suisse Romande", "OSR"],
+    )
+    profile = RetrievalProfile(category="concerto", tags=[], queries=[], latin_queries=[], zh_queries=[], mixed_queries=[])
+    host = next(host for host in provider._profile_loader.load(category="concerto", tags=[]).streaming if "youtube.com" in host.url)
+
+    queries = provider._queries_for_host(draft, profile, host)
+
+    assert "de Larrocha Sawallisch Schumann concerto 1977 Op.54" in queries
+    assert "de Larrocha Sawallisch Schumann concerto Op.54" in queries
+
+
+def test_extract_person_query_keyword_preserves_surname_particles() -> None:
+    assert extract_person_query_keyword("Adelina de Lara") == "de Lara"
+    assert extract_person_query_keyword("Wilhelm Kempff") == "Kempff"
+
+
+def test_build_chinese_host_primary_work_rescue_queries_include_secondary_collaboration_hint() -> None:
+    draft = DraftRecordingEntry(
+        item_id="recording-kempff-query-zh-rescue",
+        title="Wilhelm Kempff & Antal Dorati",
+        composer_name="Schumann",
+        composer_name_latin="Robert Schumann",
+        work_title="Piano Concerto in A minor",
+        work_title_latin="Piano Concerto, Op.54",
+        catalogue="Op.54",
+        performance_date_text="1959",
+        venue_text="",
+        album_title="",
+        label="",
+        release_date="",
+        notes="",
+        source_line="Robert Schumann | Piano Concerto in A minor, Op.54 | Wilhelm Kempff | Antal Dorati | Concertgebouw Orchestra Amsterdam | 1959",
+        raw_text="Robert Schumann | Piano Concerto in A minor, Op.54 | Wilhelm Kempff | Antal Dorati | Concertgebouw Orchestra Amsterdam | 1959",
+        existing_links=[],
+        primary_names=["Kempff"],
+        primary_names_latin=["Wilhelm Kempff"],
+        secondary_names=["Dorati"],
+        secondary_names_latin=["Antal Dorati"],
+        query_lead_names=["Kempff", "Dorati"],
+        query_lead_names_latin=["Wilhelm Kempff Antal Dorati", "Wilhelm Kempff / Antal Dorati", "Wilhelm Kempff", "Antal Dorati"],
+        lead_names=["Kempff", "Dorati"],
+        lead_names_latin=["Wilhelm Kempff", "Antal Dorati"],
+        ensemble_names=["Concertgebouw Orchestra Amsterdam"],
+        ensemble_names_latin=["Concertgebouw Orchestra Amsterdam", "Royal Concertgebouw Orchestra"],
+    )
+
+    queries = build_chinese_host_primary_work_rescue_queries(draft)
+
+    assert queries[0] == "Kempff Dorati Schumann concerto 1959"
+    assert "Kempff Dorati concerto 1959" in queries
+    assert "Wilhelm Kempff Schumann concerto" in queries
+    assert any("Wilhelm Kempff Dorati" in query for query in queries)
+
+
+def test_queries_for_chinese_host_include_ensemble_bundle_rescue_query_for_nhk_style_uploads() -> None:
+    draft = DraftRecordingEntry(
+        item_id="recording-annie-query-zh-bundle",
+        title="Annie Fischer NHK live",
+        composer_name="舒曼",
+        composer_name_latin="Robert Schumann",
+        work_title="a小调钢琴协奏曲",
+        work_title_latin="Piano Concerto, Op.54",
+        catalogue="Op.54",
+        performance_date_text="October 18, 1985",
+        venue_text="",
+        album_title="",
+        label="",
+        release_date="",
+        notes="",
+        source_line="Robert Schumann | Piano Concerto in A minor, Op.54 | Annie Fischer | Christof Prick | NHK Symphony Orchestra | October 18, 1985",
+        raw_text="Robert Schumann | Piano Concerto in A minor, Op.54 | Annie Fischer | Christof Prick | NHK Symphony Orchestra | October 18, 1985",
+        existing_links=[],
+        primary_names=["安妮·费舍尔"],
+        primary_names_latin=["Annie Fischer"],
+        secondary_names=["克里斯托夫·佩里克"],
+        secondary_names_latin=["Christof Prick"],
+        query_lead_names=["安妮·费舍尔", "克里斯托夫·佩里克"],
+        query_lead_names_latin=[
+            "Annie Fischer Christof Prick",
+            "Annie Fischer / Christof Prick",
+            "Annie Fischer",
+            "Christof Prick",
+        ],
+        lead_names=["安妮·费舍尔", "克里斯托夫·佩里克"],
+        lead_names_latin=["Annie Fischer", "Christof Prick"],
+        ensemble_names=["日本放送协会交响乐团"],
+        ensemble_names_latin=["NHK Symphony Orchestra"],
+    )
+    queries = build_chinese_host_bundle_context_queries(
+        draft,
+        ensemble_terms=["NHK Symphony Orchestra", "日本放送协会交响乐团"],
+    )
+
+    assert any(
+        "Fischer" in query and "Prick" in query and "NHK" in query and "Schumann" in query and "1985" in query
+        for query in queries
+    )
+    assert any(
+        "Annie Fischer" in query and "NHK" in query and "Schumann" in query and "1985" in query
+        for query in queries
+    )
+
+
+def test_queries_for_chinese_host_prioritize_bundle_context_query_into_primary_execution_window() -> None:
+    provider = HttpSourceProvider()
+    draft = DraftRecordingEntry(
+        item_id="recording-annie-query-zh-bundle-priority",
+        title="Annie Fischer NHK live",
+        composer_name="舒曼",
+        composer_name_latin="Robert Schumann",
+        work_title="a小调钢琴协奏曲",
+        work_title_latin="Piano Concerto, Op.54",
+        catalogue="Op.54",
+        performance_date_text="October 18, 1985",
+        venue_text="",
+        album_title="",
+        label="",
+        release_date="",
+        notes="",
+        source_line="Robert Schumann | Piano Concerto in A minor, Op.54 | Annie Fischer | Christof Prick | NHK Symphony Orchestra | October 18, 1985",
+        raw_text="Robert Schumann | Piano Concerto in A minor, Op.54 | Annie Fischer | Christof Prick | NHK Symphony Orchestra | October 18, 1985",
+        existing_links=[],
+        primary_names=["安妮·费舍尔"],
+        primary_names_latin=["Annie Fischer"],
+        secondary_names=["克里斯托夫·佩里克"],
+        secondary_names_latin=["Christof Prick"],
+        query_lead_names=["安妮·费舍尔", "克里斯托夫·佩里克"],
+        query_lead_names_latin=[
+            "Annie Fischer Christof Prick",
+            "Annie Fischer / Christof Prick",
+            "Annie Fischer",
+            "Christof Prick",
+        ],
+        lead_names=["安妮·费舍尔", "克里斯托夫·佩里克"],
+        lead_names_latin=["Annie Fischer", "Christof Prick"],
+        ensemble_names=["日本放送协会交响乐团"],
+        ensemble_names_latin=["NHK Symphony Orchestra"],
+    )
+    profile = RetrievalProfile(category="concerto", tags=[], queries=[], latin_queries=[], zh_queries=[], mixed_queries=[])
+    host = next(host for host in provider._profile_loader.load(category="concerto", tags=[]).streaming if "bilibili.com" in host.url)
+
+    queries = provider._queries_for_host(draft, profile, host)
+
+    assert any("NHK" in query and "1985" in query for query in queries[:5])
+
+
+def test_queries_for_chinese_host_keep_primary_work_rescue_query_for_kempff_within_execution_window() -> None:
+    provider = HttpSourceProvider()
+    draft = DraftRecordingEntry(
+        item_id="recording-kempff-query-zh-window",
+        title="安塔尔·多拉蒂 - 肯普夫 - 阿姆斯特丹皇家音乐厅管弦乐团 - Amsterdam",
+        composer_name="罗伯特·舒曼",
+        composer_name_latin="Robert Schumann",
+        work_title="a小调钢琴协奏曲",
+        work_title_latin="Piano Concerto, Op.54",
+        catalogue="",
+        performance_date_text="1959",
+        venue_text="",
+        album_title="",
+        label="",
+        release_date="",
+        notes="",
+        source_line="罗伯特·舒曼 | a小调钢琴协奏曲 | 威廉·沃尔特·弗里德里希·肯普夫 | 安塔尔·多拉蒂 | 阿姆斯特丹皇家音乐厅管弦乐团 | 1959",
+        raw_text="罗伯特·舒曼 | a小调钢琴协奏曲 | 威廉·沃尔特·弗里德里希·肯普夫 | 安塔尔·多拉蒂 | 阿姆斯特丹皇家音乐厅管弦乐团 | 1959",
+        existing_links=[],
+        primary_names=["威廉·沃尔特·弗里德里希·肯普夫"],
+        primary_names_latin=["Wilhelm Kempff", "Wilhelm Walter Friedrich Kempff"],
+        secondary_names=["安塔尔·多拉蒂"],
+        secondary_names_latin=["Antal Dorati"],
+        query_lead_names=["威廉·沃尔特·弗里德里希·肯普夫", "安塔尔·多拉蒂"],
+        query_lead_names_latin=[
+            "Wilhelm Kempff Antal Dorati",
+            "Wilhelm Kempff / Antal Dorati",
+            "Wilhelm Kempff",
+            "Wilhelm Walter Friedrich Kempff",
+            "Antal Dorati",
+        ],
+        lead_names=["威廉·沃尔特·弗里德里希·肯普夫", "安塔尔·多拉蒂"],
+        lead_names_latin=["Wilhelm Kempff", "Wilhelm Walter Friedrich Kempff", "Antal Dorati"],
+        ensemble_names=["阿姆斯特丹皇家音乐厅管弦乐团"],
+        ensemble_names_latin=["Royal Orchestra", "Royal Concertgebouw Orchestra", "RCO"],
+    )
+    profile = RetrievalProfile(category="concerto", tags=[], queries=[], latin_queries=[], zh_queries=[], mixed_queries=[])
+    host = next(host for host in provider._profile_loader.load(category="concerto", tags=[]).streaming if "bilibili.com" in host.url)
+
+    queries = provider._queries_for_host(draft, profile, host)
+
+    assert "Kempff Dorati Schumann concerto 1959" in queries[:6]
+
+
+def test_queries_for_chinese_host_keep_primary_work_rescue_query_for_de_lara_within_execution_window() -> None:
+    provider = HttpSourceProvider()
+    draft = DraftRecordingEntry(
+        item_id="recording-de-lara-query-zh-window",
+        title="怀特 - 劳拉 - 英国广播公司苏格兰交响乐团 - May 29, 1951",
+        composer_name="罗伯特·舒曼",
+        composer_name_latin="Robert Schumann",
+        work_title="a小调钢琴协奏曲",
+        work_title_latin="Piano Concerto, Op.54",
+        catalogue="",
+        performance_date_text="May 29, 1951",
+        venue_text="",
+        album_title="",
+        label="",
+        release_date="",
+        notes="",
+        source_line="罗伯特·舒曼 | a小调钢琴协奏曲 | 阿德利纳·德·劳拉 | 伊恩·怀特 | 英国广播公司苏格兰交响乐团 | May 29, 1951",
+        raw_text="罗伯特·舒曼 | a小调钢琴协奏曲 | 阿德利纳·德·劳拉 | 伊恩·怀特 | 英国广播公司苏格兰交响乐团 | May 29, 1951",
+        existing_links=[],
+        primary_names=["阿德利纳·德·劳拉"],
+        primary_names_latin=["Adelina de Lara"],
+        secondary_names=["伊恩·怀特"],
+        secondary_names_latin=["Ian Whyte"],
+        query_lead_names=["阿德利纳·德·劳拉", "伊恩·怀特"],
+        query_lead_names_latin=[
+            "Adelina de Lara Ian Whyte",
+            "Adelina de Lara / Ian Whyte",
+            "Adelina de Lara",
+            "Ian Whyte",
+        ],
+        lead_names=["阿德利纳·德·劳拉", "伊恩·怀特"],
+        lead_names_latin=["Adelina de Lara", "Ian Whyte"],
+        ensemble_names=["英国广播公司苏格兰交响乐团"],
+        ensemble_names_latin=["BBC Orchestra", "BBC Scottish Symphony Orchestra", "BSSO"],
+    )
+    profile = RetrievalProfile(category="concerto", tags=[], queries=[], latin_queries=[], zh_queries=[], mixed_queries=[])
+    host = next(host for host in provider._profile_loader.load(category="concerto", tags=[]).streaming if "bilibili.com" in host.url)
+
+    queries = provider._queries_for_host(draft, profile, host)
+
+    assert "de Lara Whyte Schumann concerto 1951" in queries[:6]
+
+
+def test_queries_for_chinese_host_keep_short_primary_year_query_for_richter_partial_after_rescue_insertion() -> None:
+    provider = HttpSourceProvider()
+    item = RetrievalItem(
+        itemId="recording-a小调钢琴协奏曲-里赫特-and-费伦奇克1954-partial",
+        recordingId="recording-a小调钢琴协奏曲-里赫特-and-费伦奇克1954",
+        workId="work-1",
+        composerId="composer-1",
+        workTypeHint="concerto",
+        sourceLine="罗伯特·舒曼 | a小调钢琴协奏曲 | 斯维亚托斯拉夫·特奥菲洛维奇·里赫特 | 匈牙利国家爱乐乐团 | -",
+        seed=Seed(
+            title="费伦奇克 - 里赫特 - 匈牙利国家爱乐乐团 - 布达佩斯音乐学院",
+            composerName="罗伯特·舒曼",
+            composerNameLatin="Robert Schumann",
+            workTitle="a小调钢琴协奏曲",
+            workTitleLatin="Piano Concerto, Op.54",
+            catalogue="",
+            performanceDateText="",
+            venueText="",
+            albumTitle="",
+            label="",
+            releaseDate="",
+            credits=[
+                Credit(
+                    role="soloist",
+                    personId="person-斯维亚托斯拉夫特奥菲洛维奇里赫特",
+                    displayName="斯维亚托斯拉夫·特奥菲洛维奇·里赫特",
+                    label="文件名补录",
+                )
+            ],
+            links=[],
+            notes="",
+        ),
+        requestedFields=["links"],
+    )
+    draft = InputNormalizer().normalize(item)
+    profile = ProfileResolver().resolve(item)
+    host = next(host for host in provider._profile_loader.load(category="concerto", tags=[]).streaming if "bilibili.com" in host.url)
+
+    queries = provider._queries_for_host(draft, profile, host)
+
+    assert "斯维亚托斯拉夫·特奥菲洛维奇·里赫特 1954" in queries
+
+
+def test_prepare_bilibili_browser_queries_prefers_exact_year_bundle_query_over_generic_decade_queries() -> None:
+    queries = [
+        "钢协 Wilhelm Kempff 1959",
+        "Kempff Schumann Piano Concerto 1950s",
+        "Kempff Schumann Piano Concertos 1950s",
+        "Kempff Dorati Concertgebouw Schumann concerto 1959",
+    ]
+
+    selected = prepare_bilibili_browser_queries(queries, max_queries=3)
+
+    assert "Kempff Dorati Concertgebouw Schumann concerto 1959" in selected
+
+
+def test_bilibili_browser_search_tries_all_page_before_video_page_when_extracting_results() -> None:
+    class AllPageOnlyFetcher:
+        def __init__(self) -> None:
+            self.urls: list[str] = []
+
+        async def fetch_links(self, url: str, *, url_patterns=None, timeout_seconds=None):
+            del url_patterns, timeout_seconds
+            self.urls.append(url)
+            if "/all?" in url:
+                return ["https://www.bilibili.com/video/BV1yqYEeKErH/"]
+            return []
+
+    fetcher = AllPageOnlyFetcher()
+    provider = HttpSourceProvider(browser_fetcher=fetcher)
+
+    rows = asyncio.run(
+        provider._search_platform_via_browser_pages(
+            queries=["Fischer Prick NHK Schumann concerto 1985"],
+            url_builders=[
+                lambda query: f"https://search.bilibili.com/all?keyword={quote_plus(query)}",
+                lambda query: f"https://search.bilibili.com/video?keyword={quote_plus(query)}",
+            ],
+            source_label="Bilibili Search",
+            url_patterns=[r"https://www\\.bilibili\\.com/video/(?:BV[0-9A-Za-z]+|av\\d+)/?"],
+        )
+    )
+
+    assert rows == [
+        {
+            "url": "https://www.bilibili.com/video/BV1yqYEeKErH/",
+            "source_label": "Bilibili Search Browser Search",
+            "source_kind": "streaming",
+        }
+    ]
+    assert any("/all?keyword=" in url for url in fetcher.urls)
+
+
+def test_queries_for_host_include_compact_collaboration_surname_rescue_query_for_non_chinese_hosts() -> None:
+    provider = HttpSourceProvider()
+    draft = DraftRecordingEntry(
+        item_id="recording-larrocha-query-1",
+        title="Alicia de Larrocha Schumann concerto",
+        composer_name="舒曼",
+        composer_name_latin="Robert Schumann",
+        work_title="a小调钢琴协奏曲",
+        work_title_latin="Piano Concerto, Op.54",
+        catalogue="Op.54",
+        performance_date_text="January 12, 1977",
+        venue_text="Victoria Hall",
+        album_title="",
+        label="",
+        release_date="",
+        notes="",
+        source_line="Robert Schumann | Piano Concerto in A minor, Op.54 | Alicia de Larrocha | Wolfgang Sawallisch | Orchestre de la Suisse Romande | January 12, 1977 - Victoria Hall",
+        raw_text="Robert Schumann | Piano Concerto in A minor, Op.54 | Alicia de Larrocha | Wolfgang Sawallisch | Orchestre de la Suisse Romande | January 12, 1977 - Victoria Hall",
+        existing_links=[],
+        primary_names=["阿利西亚·德·拉罗查"],
+        primary_names_latin=["Alicia de Larrocha"],
+        secondary_names=["沃尔夫冈·萨瓦利施"],
+        secondary_names_latin=["Wolfgang Sawallisch"],
+        query_lead_names=["阿利西亚·德·拉罗查", "沃尔夫冈·萨瓦利施"],
+        query_lead_names_latin=[
+            "Alicia de Larrocha Wolfgang Sawallisch",
+            "Alicia de Larrocha / Wolfgang Sawallisch",
+            "Alicia de Larrocha",
+            "Wolfgang Sawallisch",
+        ],
+        lead_names=["阿利西亚·德·拉罗查", "沃尔夫冈·萨瓦利施"],
+        lead_names_latin=["Alicia de Larrocha", "Wolfgang Sawallisch"],
+        ensemble_names=["瑞士罗曼德管弦乐团"],
+        ensemble_names_latin=["Orchestre de la Suisse Romande", "OSR"],
+    )
+    profile = RetrievalProfile(category="concerto", tags=[], queries=[], latin_queries=[], zh_queries=[], mixed_queries=[])
+    host = next(host for host in provider._profile_loader.load(category="concerto", tags=[]).streaming if "youtube.com" in host.url)
+
+    queries = provider._queries_for_host(draft, profile, host)
+
+    assert "de Larrocha Sawallisch Schumann concerto 1977 Op.54" in queries
+
+
+def test_queries_for_host_include_condensed_primary_alias_for_long_parent_person_name() -> None:
+    provider = HttpSourceProvider()
+    draft = DraftRecordingEntry(
+        item_id="recording-grinberg-query-1",
+        title="Maria Grinberg Schumann concerto",
+        composer_name="Schumann",
+        composer_name_latin="Robert Schumann",
+        work_title="Piano Concerto in A minor",
+        work_title_latin="Piano Concerto in A minor, Op.54",
+        catalogue="Op.54",
+        performance_date_text="1958",
+        venue_text="",
+        album_title="",
+        label="",
+        release_date="",
+        notes="",
+        source_line="",
+        raw_text="",
+        existing_links=[],
+        primary_names=["Maria Grinberg"],
+        primary_names_latin=["Maria Israilevna Grinberg", "M???? ?????????? ????????"],
+        secondary_names=["Carl Eliasberg"],
+        secondary_names_latin=["Carl Eliasberg"],
+        query_lead_names=["Maria Grinberg", "Carl Eliasberg"],
+        query_lead_names_latin=[
+            "Maria Israilevna Grinberg Carl Eliasberg",
+            "Maria Israilevna Grinberg / Carl Eliasberg",
+            "M???? ?????????? ???????? Carl Eliasberg",
+            "M???? ?????????? ???????? / Carl Eliasberg",
+            "Maria Israilevna Grinberg",
+            "M???? ?????????? ????????",
+            "Carl Eliasberg",
+        ],
+        lead_names=["Maria Grinberg", "Carl Eliasberg"],
+        lead_names_latin=["Maria Israilevna Grinberg", "M???? ?????????? ????????", "Carl Eliasberg"],
+        ensemble_names=["USSR State Symphony Orchestra"],
+        ensemble_names_latin=["USSR State Symphony Orchestra"],
+    )
+    profile = RetrievalProfile(category="concerto", tags=[], queries=[], latin_queries=[], zh_queries=[], mixed_queries=[])
+    host = next(host for host in provider._profile_loader.load(category="concerto", tags=[]).streaming if "youtube.com" in host.url)
+
+    queries = provider._queries_for_host(draft, profile, host)
+
+    assert any("Maria Grinberg" in query for query in queries)
+
+
+def test_queries_for_chinese_host_include_cjk_context_rescue_for_grinberg_full_case() -> None:
+    provider = HttpSourceProvider()
+    draft = DraftRecordingEntry(
+        item_id="recording-grinberg-query-zh-1",
+        title="Maria Grinberg Schumann concerto",
+        composer_name="舒曼",
+        composer_name_latin="Robert Schumann",
+        work_title="a小调钢琴协奏曲",
+        work_title_latin="Piano Concerto, Op.54",
+        catalogue="Op.54",
+        performance_date_text="1958",
+        venue_text="",
+        album_title="",
+        label="",
+        release_date="",
+        notes="",
+        source_line="罗伯特·舒曼 | a小调钢琴协奏曲 | 玛丽亚·伊斯拉列夫娜·格林伯格 | 卡尔·埃利亚斯伯格 | 苏联国家交响乐团 | 1958",
+        raw_text="罗伯特·舒曼 | a小调钢琴协奏曲 | 玛丽亚·伊斯拉列夫娜·格林伯格 | 卡尔·埃利亚斯伯格 | 苏联国家交响乐团 | 1958",
+        existing_links=[],
+        primary_names=["玛丽亚·伊斯拉列夫娜·格林伯格"],
+        primary_names_latin=["Maria Grinberg", "Maria Israilevna Grinberg"],
+        secondary_names=["卡尔·埃利亚斯伯格"],
+        secondary_names_latin=["Carl Eliasberg"],
+        query_lead_names=["玛丽亚·伊斯拉列夫娜·格林伯格", "卡尔·埃利亚斯伯格"],
+        query_lead_names_latin=[
+            "Maria Grinberg Carl Eliasberg",
+            "Maria Grinberg / Carl Eliasberg",
+            "Maria Grinberg",
+            "Carl Eliasberg",
+        ],
+        lead_names=["玛丽亚·伊斯拉列夫娜·格林伯格", "卡尔·埃利亚斯伯格"],
+        lead_names_latin=["Maria Grinberg", "Carl Eliasberg"],
+        ensemble_names=["苏联国家交响乐团"],
+        ensemble_names_latin=["USSR State Symphony Orchestra"],
+    )
+    profile = RetrievalProfile(category="concerto", tags=[], queries=[], latin_queries=[], zh_queries=[], mixed_queries=[])
+    host = next(host for host in provider._profile_loader.load(category="concerto", tags=[]).streaming if "bilibili.com" in host.url)
+
+    queries = provider._queries_for_host(draft, profile, host)
+
+    assert any(query.startswith("格林伯格 苏联 1958 舒曼钢协") for query in queries)
+
+
+def test_extract_cjk_person_query_keyword_handles_single_and_multi_segment_names() -> None:
+    assert extract_cjk_person_query_keyword("舒曼") == "舒曼"
+    assert extract_cjk_person_query_keyword("费伦奇克") == "费伦奇克"
+    assert extract_cjk_person_query_keyword("斯维亚托斯拉夫·特奥菲洛维奇·里赫特") == "里赫特"
+
+
+def test_queries_for_host_include_hungarian_given_name_order_alias_from_bundled_person_aliases() -> None:
+    provider = HttpSourceProvider()
+    draft = DraftRecordingEntry(
+        item_id="recording-richter-query-1",
+        title="Sviatoslav Richter Schumann concerto",
+        composer_name="Schumann",
+        composer_name_latin="Robert Schumann",
+        work_title="Piano Concerto in A minor",
+        work_title_latin="Piano Concerto in A minor, Op.54",
+        catalogue="Op.54",
+        performance_date_text="",
+        venue_text="",
+        album_title="",
+        label="",
+        release_date="",
+        notes="",
+        source_line="",
+        raw_text="",
+        existing_links=[],
+        primary_names=["Sviatoslav Richter"],
+        primary_names_latin=["Sviatoslav Teofilovich Richter"],
+        secondary_names=["Ferencsik Janos"],
+        secondary_names_latin=["Ferencsik Janos", "Ferencsik Janos"],
+        query_lead_names=["Sviatoslav Richter", "Ferencsik Janos"],
+        query_lead_names_latin=[
+            "Sviatoslav Teofilovich Richter Ferencsik Janos",
+            "Sviatoslav Teofilovich Richter / Ferencsik Janos",
+            "Sviatoslav Teofilovich Richter Ferencsik Janos",
+            "Sviatoslav Teofilovich Richter / Ferencsik Janos",
+            "Sviatoslav Teofilovich Richter",
+            "Ferencsik Janos",
+            "Ferencsik Janos",
+        ],
+        lead_names=["Sviatoslav Richter", "Ferencsik Janos"],
+        lead_names_latin=["Sviatoslav Teofilovich Richter", "Ferencsik Janos", "Ferencsik Janos"],
+        ensemble_names=["Hungarian National Philharmonic Orchestra"],
+        ensemble_names_latin=["Hungarian National Philharmonic Orchestra"],
+    )
+    profile = RetrievalProfile(category="concerto", tags=[], queries=[], latin_queries=[], zh_queries=[], mixed_queries=[])
+    host = next(host for host in provider._profile_loader.load(category="concerto", tags=[]).streaming if "youtube.com" in host.url)
+
+    queries = provider._queries_for_host(draft, profile, host)
+
+    assert any("Janos Ferencsik" in query for query in queries)
+
+
 def test_provider_prefers_apple_music_api_when_configured(tmp_path: Path) -> None:
     root = tmp_path / "source-profiles"
     root.mkdir(parents=True)
@@ -1364,8 +3217,263 @@ def test_provider_prefers_apple_music_api_when_configured(tmp_path: Path) -> Non
     rows = asyncio.run(provider._search_apple_music(["schumann query"]))
 
     assert any("music.apple.com/us/album/demo/1" in row["url"] for row in rows)
+    apple_row = next(row for row in rows if "music.apple.com/us/album/demo/1" in row["url"])
+    assert apple_row["title"] == "Apple API Result"
+    assert "Otto Klemperer" in apple_row["description"]
+    assert apple_row["duration_seconds"] == 233
     assert any("api.music.apple.com/v1/catalog/us/search" in url for url in transport.urls)
     assert not any("music.apple.com/search" in url for url in transport.urls)
+
+
+def test_provider_shapes_apple_public_api_rows_and_filters_artist_noise(tmp_path: Path) -> None:
+    root = tmp_path / "source-profiles"
+    root.mkdir(parents=True)
+    (root / "high-quality.txt").write_text("#global\nhttps://catalog.example\n", encoding="utf-8")
+    (root / "streaming.txt").write_text("#global\nhttps://music.apple.com\n", encoding="utf-8")
+    transport = ApplePublicApiTransport()
+    client = httpx.AsyncClient(transport=transport, follow_redirects=True)
+    provider = HttpSourceProvider(
+        profile_loader=SourceProfileLoader(root),
+        client=client,
+        platform_search_config=PlatformSearchConfig(
+            apple_music=AppleMusicSearchConfig(enabled=True, developer_token="", use_itunes_fallback=True),
+        ),
+    )
+
+    rows = asyncio.run(provider._search_apple_music(["beethoven 7 klemperer"]))
+
+    urls = [row["url"] for row in rows]
+    assert "https://music.apple.com/us/album/demo-track/123?i=456" in urls
+    assert not any("/artist/" in url for url in urls)
+    shaped = next(row for row in rows if row["url"] == "https://music.apple.com/us/album/demo-track/123?i=456")
+    assert shaped["title"] == "Symphony No. 7 in A major, Op. 92: II. Allegretto"
+    assert "Otto Klemperer" in shaped["description"]
+    assert shaped["duration_seconds"] == 512
+
+
+def test_fetch_page_record_keeps_seeded_apple_title_when_browser_returns_generic_player_title(tmp_path: Path) -> None:
+    root = tmp_path / "source-profiles"
+    root.mkdir(parents=True)
+    (root / "high-quality.txt").write_text("#global\nhttps://catalog.example\n", encoding="utf-8")
+    (root / "streaming.txt").write_text("#global\nhttps://music.apple.com\n", encoding="utf-8")
+
+    class AppleGenericPageTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                request=request,
+                text="<html><head><title>Apple Music 网页播放器</title></head><body></body></html>",
+            )
+
+    browser_fetcher = StructuredBrowserFetcher(
+        {},
+        {
+            "https://music.apple.com/us/album/demo-track/123?i=456": {
+                "title": "Apple Music 网页播放器",
+                "description": "",
+            }
+        },
+    )
+    provider = HttpSourceProvider(
+        profile_loader=SourceProfileLoader(root),
+        client=httpx.AsyncClient(transport=AppleGenericPageTransport(), follow_redirects=True),
+        browser_fetcher=browser_fetcher,
+    )
+
+    row = asyncio.run(
+        provider._fetch_page_record(
+            "https://music.apple.com/us/album/demo-track/123?i=456",
+            "Apple Music Search",
+            "streaming",
+            build_draft(),
+            asyncio.Semaphore(1),
+            seed_data={
+                "title": "Symphony 7",
+                "description": "",
+                "uploader": "Otto Klemperer",
+            },
+        )
+    )
+
+    assert row is not None
+    assert row["title"] == "Symphony 7"
+
+
+def test_fetch_page_record_keeps_seeded_apple_metadata_when_html_page_is_generic_player(tmp_path: Path) -> None:
+    root = tmp_path / "source-profiles"
+    root.mkdir(parents=True)
+    (root / "high-quality.txt").write_text("#global\nhttps://catalog.example\n", encoding="utf-8")
+    (root / "streaming.txt").write_text("#global\nhttps://music.apple.com\n", encoding="utf-8")
+
+    class AppleGenericHtmlTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                request=request,
+                text=(
+                    "<html><head>"
+                    "<title>Apple Music 网页播放器</title>"
+                    '<meta property="og:title" content="Apple Music 网页播放器" />'
+                    '<meta property="og:description" content="在 Apple Music 上畅听数千万首歌曲，全无广告干扰。" />'
+                    "</head><body></body></html>"
+                ),
+            )
+
+    provider = HttpSourceProvider(
+        profile_loader=SourceProfileLoader(root),
+        client=httpx.AsyncClient(transport=AppleGenericHtmlTransport(), follow_redirects=True),
+    )
+
+    row = asyncio.run(
+        provider._fetch_page_record(
+            "https://music.apple.com/us/album/demo-track/123?i=456",
+            "Apple Music Search",
+            "streaming",
+            build_draft(),
+            asyncio.Semaphore(1),
+            seed_data={
+                "title": "Symphony No. 7 in A Major, Op. 92: II. Allegretto",
+                "description": "Philharmonia Orchestra & Otto Klemperer | Beethoven: Symphony No. 7",
+                "uploader": "Otto Klemperer",
+                "duration_seconds": 512,
+            },
+        )
+    )
+
+    assert row is not None
+    assert row["title"] == "Symphony No. 7 in A Major, Op. 92: II. Allegretto"
+    assert "Otto Klemperer" in row["description"]
+
+
+def test_score_recording_match_treats_apple_track_resource_as_viable_version_evidence() -> None:
+    draft = DraftRecordingEntry(
+        item_id="recording-beethoven7-klemperer",
+        title="Otto Klemperer 1957",
+        composer_name="贝多芬",
+        composer_name_latin="Ludwig van Beethoven",
+        work_title="第七交响曲",
+        work_title_latin="Symphony No.7 in A major,Op.92",
+        catalogue="Op.92",
+        performance_date_text="1957",
+        venue_text="",
+        album_title="",
+        label="",
+        release_date="",
+        notes="",
+        source_line="Ludwig van Beethoven | Symphony No.7 in A major,Op.92 | Otto Klemperer | Philharmonia Orchestra | 1957",
+        raw_text="Ludwig van Beethoven | Symphony No.7 in A major,Op.92 | Otto Klemperer | Philharmonia Orchestra | 1957",
+        existing_links=[],
+        primary_names=["克伦佩勒"],
+        primary_names_latin=["Otto Klemperer"],
+        secondary_names=[],
+        secondary_names_latin=[],
+        query_lead_names=["克伦佩勒"],
+        query_lead_names_latin=["Otto Klemperer"],
+        lead_names=["克伦佩勒"],
+        lead_names_latin=["Otto Klemperer"],
+        ensemble_names=["爱乐乐团"],
+        ensemble_names_latin=["Philharmonia Orchestra"],
+    )
+
+    apple_track_score = score_recording_match(
+        "Symphony No. 7 in A major, Op. 92: II. Allegretto Otto Klemperer Philharmonia Orchestra Beethoven",
+        "https://music.apple.com/us/album/symphony-no-7-in-a-major-op-92-ii-allegretto/616361485?i=616361604",
+        draft,
+        duration_seconds=512,
+        uploader="Otto Klemperer",
+    )
+    wrong_artist_score = score_recording_match(
+        "Symphony No. 7 in A major, Op. 92: II. Allegretto Another Conductor Another Orchestra Beethoven",
+        "https://music.apple.com/us/album/symphony-no-7-in-a-major-op-92-ii-allegretto/999999999?i=999999999",
+        draft,
+        duration_seconds=512,
+        uploader="Another Conductor",
+    )
+
+    assert apple_track_score >= 0.45
+    assert apple_track_score > wrong_artist_score
+
+
+def test_score_recording_match_reduces_single_movement_penalty_for_apple_track_resources() -> None:
+    draft = DraftRecordingEntry(
+        item_id="recording-beethoven7-klemperer-apple-boost",
+        title="Otto Klemperer 1957",
+        composer_name="贝多芬",
+        composer_name_latin="Ludwig van Beethoven",
+        work_title="第七交响曲",
+        work_title_latin="Symphony No.7 in A major,Op.92",
+        catalogue="Op.92",
+        performance_date_text="1957",
+        venue_text="",
+        album_title="",
+        label="",
+        release_date="",
+        notes="",
+        source_line="Ludwig van Beethoven | Symphony No.7 in A major,Op.92 | Otto Klemperer | Philharmonia Orchestra | 1957",
+        raw_text="Ludwig van Beethoven | Symphony No.7 in A major,Op.92 | Otto Klemperer | Philharmonia Orchestra | 1957",
+        existing_links=[],
+        primary_names=["克伦佩勒"],
+        primary_names_latin=["Otto Klemperer"],
+        secondary_names=[],
+        secondary_names_latin=[],
+        query_lead_names=["克伦佩勒"],
+        query_lead_names_latin=["Otto Klemperer"],
+        lead_names=["克伦佩勒"],
+        lead_names_latin=["Otto Klemperer"],
+        ensemble_names=["爱乐乐团"],
+        ensemble_names_latin=["Philharmonia Orchestra"],
+    )
+
+    apple_track_score = score_recording_match(
+        "Symphony No. 7 in A Major, Op. 92: I. Poco sostenuto - Vivace Philharmonia Orchestra Otto Klemperer Beethoven Symphony No. 7",
+        "https://music.apple.com/us/album/symphony-no-7-in-a-major-op-92-i-poco-sostenuto-vivace/930843917?i=930843927",
+        draft,
+        duration_seconds=768,
+        uploader="Philharmonia Orchestra & Otto Klemperer",
+    )
+
+    assert apple_track_score >= 0.6
+
+
+def test_score_recording_match_does_not_over_penalize_apple_track_for_multi_work_album_context() -> None:
+    draft = DraftRecordingEntry(
+        item_id="recording-kleiber-apple-track",
+        title="Carlos Kleiber 1976",
+        composer_name="贝多芬",
+        composer_name_latin="Ludwig van Beethoven",
+        work_title="第七交响曲",
+        work_title_latin="Symphony No.7 in A major,Op.92",
+        catalogue="Op.92",
+        performance_date_text="1976",
+        venue_text="",
+        album_title="",
+        label="",
+        release_date="",
+        notes="",
+        source_line="Ludwig van Beethoven | Symphony No.7 in A major,Op.92 | Carlos Kleiber | Vienna Philharmonic | 1976",
+        raw_text="Ludwig van Beethoven | Symphony No.7 in A major,Op.92 | Carlos Kleiber | Vienna Philharmonic | 1976",
+        existing_links=[],
+        primary_names=["Carlos Kleiber"],
+        primary_names_latin=["Carlos Kleiber"],
+        secondary_names=[],
+        secondary_names_latin=[],
+        query_lead_names=["Carlos Kleiber"],
+        query_lead_names_latin=["Carlos Kleiber"],
+        lead_names=["Carlos Kleiber"],
+        lead_names_latin=["Carlos Kleiber"],
+        ensemble_names=["Vienna Philharmonic"],
+        ensemble_names_latin=["Vienna Philharmonic", "Wiener Philharmoniker"],
+    )
+
+    score = score_recording_match(
+        "Symphony No. 7 in A Major, Op. 92: I. Poco sostenuto - Vivace Vienna Philharmonic & Carlos Kleiber Beethoven: Symphonies Nos. 5 & 7 Classical 1995-02-20T12:00:00Z",
+        "https://music.apple.com/us/album/symphony-no-7-in-a-major-op-92-i-poco-sostenuto-vivace/1644892939?i=1644892962",
+        draft,
+        duration_seconds=814,
+        uploader="Vienna Philharmonic & Carlos Kleiber",
+    )
+
+    assert score >= 0.67
 
 
 def test_provider_prefers_bilibili_api_when_cookie_configured(tmp_path: Path) -> None:
@@ -1418,6 +3526,79 @@ def test_provider_uses_bilibili_public_wbi_search_without_cookie(tmp_path: Path)
     bilibili_api_url = next(url for url in transport.urls if "api.bilibili.com/x/web-interface/wbi/search/type" in url)
     assert transport.headers[bilibili_api_url]["user-agent"] == "UA/1.0"
     assert transport.headers[bilibili_api_url]["referer"] == "https://www.bilibili.com"
+    assert not any("search.bilibili.com/all" in url for url in transport.urls)
+
+
+def test_provider_keeps_bilibili_api_results_when_duration_is_mmss_string(tmp_path: Path) -> None:
+    class DurationStringApiTransport(httpx.AsyncBaseTransport):
+        def __init__(self) -> None:
+            self.urls: list[str] = []
+
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            self.urls.append(url)
+            if url.rstrip("/") == "https://www.bilibili.com":
+                return httpx.Response(200, request=request, text="home")
+            if "api.bilibili.com/x/web-interface/nav" in url:
+                return httpx.Response(
+                    200,
+                    request=request,
+                    json={
+                        "code": 0,
+                        "data": {
+                            "wbi_img": {
+                                "img_url": "https://i0.hdslb.com/bfs/wbi/abcdefghijklmnopqrstuvwxyz123456.png",
+                                "sub_url": "https://i0.hdslb.com/bfs/wbi/uvwxyzabcdefghijklmnopqrstuvwxyz123456.jpg",
+                            }
+                        },
+                    },
+                )
+            if "api.bilibili.com/x/web-interface/wbi/search/type" in url:
+                return httpx.Response(
+                    200,
+                    request=request,
+                    json={
+                        "code": 0,
+                        "data": {
+                            "result": [
+                                {
+                                    "arcurl": "https://www.bilibili.com/video/BV1duration95m56s/",
+                                    "bvid": "BV1duration95m56s",
+                                    "title": "Schumann Piano Concerto live",
+                                    "author": "Archive",
+                                    "duration": "95:56",
+                                    "play": 12345,
+                                }
+                            ]
+                        },
+                    },
+                )
+            return httpx.Response(404, request=request, text="not found")
+
+    root = tmp_path / "source-profiles"
+    root.mkdir(parents=True)
+    (root / "high-quality.txt").write_text("#global\nhttps://catalog.example\n", encoding="utf-8")
+    (root / "streaming.txt").write_text("#global\n[zh] https://www.bilibili.com\n", encoding="utf-8")
+    transport = DurationStringApiTransport()
+    client = httpx.AsyncClient(transport=transport, follow_redirects=True)
+    provider = HttpSourceProvider(
+        profile_loader=SourceProfileLoader(root),
+        client=client,
+        browser_fetcher=BrowserResultFetcher({}),
+        platform_search_config=PlatformSearchConfig(
+            bilibili=BilibiliSearchConfig(enabled=True, user_agent="UA/1.0"),
+        ),
+    )
+    provider.start_request_scope()
+
+    rows = asyncio.run(provider._search_bilibili(["布鲁克纳 伯姆"]))
+    warnings = provider.consume_warnings()
+
+    assert rows
+    assert rows[0]["url"] == "https://www.bilibili.com/video/BV1duration95m56s/"
+    assert rows[0]["bvid"] == "BV1duration95m56s"
+    assert rows[0]["duration_seconds"] == 5756
+    assert not warnings
     assert not any("search.bilibili.com/all" in url for url in transport.urls)
 
 
@@ -1527,7 +3708,7 @@ def test_provider_uses_browser_rendered_bilibili_results_before_search_engine_fa
     client = httpx.AsyncClient(transport=transport, follow_redirects=True)
     browser_fetcher = BrowserResultFetcher(
         {
-            "https://search.bilibili.com/all?keyword=%E6%B5%B7%E8%8F%B2%E5%85%B9+%E6%89%98%E6%96%AF%E5%8D%A1%E5%B0%BC%E5%B0%BC+1940": [
+            "https://search.bilibili.com/video?keyword=%E6%B5%B7%E8%8F%B2%E5%85%B9+%E6%89%98%E6%96%AF%E5%8D%A1%E5%B0%BC%E5%B0%BC+1940": [
                 "https://www.bilibili.com/video/BV1browserhit1/",
                 "https://www.bilibili.com/video/BV1browserhit2/",
             ]
@@ -1548,9 +3729,9 @@ def test_provider_uses_browser_rendered_bilibili_results_before_search_engine_fa
         "https://www.bilibili.com/video/BV1browserhit1/",
         "https://www.bilibili.com/video/BV1browserhit2/",
     ]
-    assert any("search.bilibili.com/all" in url for url in browser_fetcher.link_calls)
-    assert any("bing.com" in url and "site%3Awww.bilibili.com" in url for url in transport.urls)
-    assert any(row["url"] == "https://www.bilibili.com/video/BV1enginefallback1" for row in rows)
+    assert any("search.bilibili.com/video" in url for url in browser_fetcher.link_calls)
+    assert not any("bing.com" in url and "site%3Awww.bilibili.com" in url for url in transport.urls)
+    assert not any(row["url"] == "https://www.bilibili.com/video/BV1enginefallback1" for row in rows)
 
 
 def test_provider_accepts_browser_rendered_bilibili_av_links(tmp_path: Path) -> None:
@@ -1562,7 +3743,7 @@ def test_provider_accepts_browser_rendered_bilibili_av_links(tmp_path: Path) -> 
     client = httpx.AsyncClient(transport=transport, follow_redirects=True)
     browser_fetcher = BrowserResultFetcher(
         {
-            "https://search.bilibili.com/all?keyword=%E4%BC%AF%E6%81%A9%E6%96%AF%E5%9D%A6+1977": [
+            "https://search.bilibili.com/video?keyword=%E4%BC%AF%E6%81%A9%E6%96%AF%E5%9D%A6+1977": [
                 "https://www.bilibili.com/video/av317938669",
             ]
         }
@@ -1894,6 +4075,83 @@ def test_provider_prefers_bilibili_detail_api_before_html_page_fetch(tmp_path: P
     assert not any("www.bilibili.com/video/BV1TE411f7uh" in url for url in transport.urls)
 
 
+def test_provider_uses_seeded_bilibili_search_metadata_without_fetching_video_page(tmp_path: Path) -> None:
+    root = tmp_path / "source-profiles"
+    root.mkdir(parents=True)
+    (root / "high-quality.txt").write_text("#global\nhttps://catalog.example\n", encoding="utf-8")
+    (root / "streaming.txt").write_text("#global\n[zh] https://www.bilibili.com\n", encoding="utf-8")
+
+    class LoggingTransport(httpx.AsyncBaseTransport):
+        def __init__(self) -> None:
+            self.urls: list[str] = []
+
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            self.urls.append(str(request.url))
+            return httpx.Response(500, request=request, text="should not fetch")
+
+    transport = LoggingTransport()
+    provider = HttpSourceProvider(
+        profile_loader=SourceProfileLoader(root),
+        client=httpx.AsyncClient(transport=transport, follow_redirects=True),
+        browser_fetcher=BrowserResultFetcher({}),
+        platform_search_config=PlatformSearchConfig(
+            bilibili=BilibiliSearchConfig(enabled=False),
+        ),
+    )
+    draft = DraftRecordingEntry(
+        item_id="annie-seeded-bilibili",
+        title="Annie Fischer & Kletzki",
+        composer_name="鑸掓浖",
+        composer_name_latin="Robert Schumann",
+        work_title="a灏忚皟閽㈢惔鍗忓鏇?",
+        work_title_latin="Piano Concerto, Op.54",
+        catalogue="Op.54",
+        performance_date_text="",
+        venue_text="",
+        album_title="",
+        label="",
+        release_date="",
+        notes="",
+        source_line="Robert Schumann | Piano Concerto in A Minor, Op.54 | Annie Fischer | Kletzki | Budapest Philharmonic Orchestra | -",
+        raw_text="Robert Schumann | Piano Concerto in A Minor, Op.54 | Annie Fischer | Kletzki | Budapest Philharmonic Orchestra | -",
+        existing_links=[],
+        primary_names=["Annie Fischer"],
+        primary_names_latin=["Annie Fischer"],
+        secondary_names=["Kletzki"],
+        secondary_names_latin=["Kletzki"],
+        lead_names=["Annie Fischer", "Kletzki"],
+        lead_names_latin=["Annie Fischer", "Kletzki"],
+        ensemble_names=["Budapest Philharmonic Orchestra"],
+        ensemble_names_latin=["Budapest Philharmonic Orchestra"],
+    )
+
+    row = asyncio.run(
+        provider._fetch_page_record(
+            "https://www.bilibili.com/video/BV1TE411f7uh/",
+            "Bilibili API Search",
+            "streaming",
+            draft,
+            asyncio.Semaphore(1),
+            seed_data={
+                "title": "Annie Fischer plays Schumann Piano Concerto Op. 54",
+                "description": "Budapest Philharmonic Orchestra Kletzki",
+                "uploader": "鑹炬柉璺エ",
+                "duration_seconds": 2017,
+                "view_count": 1748,
+                "bvid": "BV1TE411f7uh",
+            },
+        )
+    )
+
+    assert row is not None
+    assert row["url"] == "https://www.bilibili.com/video/BV1TE411f7uh/"
+    assert row["uploader"] == "鑹炬柉璺エ"
+    assert row["duration_seconds"] == 2017
+    assert row["view_count"] == 1748
+    assert row["same_recording_score"] >= 0.6
+    assert transport.urls == []
+
+
 def test_provider_uses_page_body_text_to_score_sparse_collaboration_upload(tmp_path: Path) -> None:
     root = tmp_path / "source-profiles"
     root.mkdir(parents=True)
@@ -2189,14 +4447,14 @@ def test_search_bilibili_samples_precise_browser_queries_beyond_first_three() ->
     class BilibiliBrowserQuerySelectionProvider(HttpSourceProvider):
         def __init__(self) -> None:
             super().__init__(browser_fetcher=BrowserResultFetcher({}))
-            self.browser_queries: list[str] = []
+            self.browser_query_batches: list[list[str]] = []
 
         async def _search_streaming_platform(self, **kwargs):
             del kwargs
             return []
 
         async def _search_platform_via_browser_pages(self, **kwargs):
-            self.browser_queries = list(kwargs["queries"])
+            self.browser_query_batches.append(list(kwargs["queries"]))
             return []
 
         async def _search_platform_via_site_engines(self, *args, **kwargs):
@@ -2217,9 +4475,278 @@ def test_search_bilibili_samples_precise_browser_queries_beyond_first_three() ->
 
     asyncio.run(provider._search_bilibili(queries))
 
-    assert len(provider.browser_queries) > 5
-    assert "q5 ensemble date exact" in provider.browser_queries
-    assert "q8 final exact latin query" in provider.browser_queries
+    assert provider.browser_query_batches
+    first_batch = provider.browser_query_batches[0]
+    assert len(first_batch) == 4
+    assert "q4 medium specificity" in first_batch
+    assert "q6 exact latin query" in first_batch
+    assert "q7 longer exact latin query" in first_batch
+    assert "q8 final exact latin query" in first_batch
+
+
+def test_merge_bilibili_browser_query_rows_keeps_deeper_hit_from_first_focused_query() -> None:
+    query_rows_list = [
+        [
+            {"url": f"https://www.bilibili.com/video/BV1focus{i:02d}/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"}
+            for i in range(1, 7)
+        ]
+        + [
+            {
+                "url": "https://www.bilibili.com/video/BV1target7hit/",
+                "source_label": "Bilibili Search Browser Search",
+                "source_kind": "streaming",
+            }
+        ]
+        + [
+            {"url": f"https://www.bilibili.com/video/BV1focus{i:02d}/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"}
+            for i in range(8, 11)
+        ],
+        [
+            {"url": f"https://www.bilibili.com/video/BV1backup{i:02d}/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"}
+            for i in range(1, 11)
+        ],
+        [
+            {"url": f"https://www.bilibili.com/video/BV1tail{i:02d}/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"}
+            for i in range(1, 11)
+        ],
+    ]
+
+    merged = merge_bilibili_browser_query_rows(query_rows_list, result_depth=10)
+
+    urls = [row["url"] for row in merged]
+    assert "https://www.bilibili.com/video/BV1target7hit/" in urls
+
+
+def _obsolete_merge_bilibili_browser_query_rows_keeps_deeper_hit_from_best_focused_middle_query() -> None:
+    query_rows_list = [
+        [
+            {"url": f"https://www.bilibili.com/video/BV1head{i:02d}/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"}
+            for i in range(1, 11)
+        ],
+        [
+            {"url": f"https://www.bilibili.com/video/BV1cover{i:02d}/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"}
+            for i in range(1, 11)
+        ],
+        [
+            {"url": f"https://www.bilibili.com/video/BV1focus{i:02d}/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"}
+            for i in range(1, 7)
+        ]
+        + [
+            {"url": "https://www.bilibili.com/video/BV1HP411m7JC/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"}
+        ]
+        + [
+            {"url": f"https://www.bilibili.com/video/BV1focus{i:02d}/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"}
+            for i in range(8, 11)
+        ],
+        [
+            {"url": f"https://www.bilibili.com/video/BV1tail{i:02d}/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"}
+            for i in range(1, 11)
+        ],
+    ]
+
+    merged = merge_bilibili_browser_query_rows(
+        query_rows_list,
+        queries=[
+            "Richter Schumann Piano Concerto 1950s",
+            "Richter Piano Concerto 1950s",
+            "钢协 Sviatoslav Richter 1954",
+            "a小调钢琴协奏曲 Sviatoslav Richter Hungarian Orchestra 1954",
+        ],
+        result_depth=10,
+    )
+
+    urls = [row["url"] for row in merged]
+    assert "https://www.bilibili.com/video/BV1HP411m7JC/" in urls
+
+
+def test_merge_bilibili_browser_query_rows_keeps_top_hit_from_later_primary_rescue_query() -> None:
+    query_rows_list = [
+        [
+            {"url": f"https://www.bilibili.com/video/BV1head{i:02d}/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"}
+            for i in range(1, 11)
+        ],
+        [
+            {"url": f"https://www.bilibili.com/video/BV1cover{i:02d}/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"}
+            for i in range(1, 11)
+        ],
+        [
+            {"url": f"https://www.bilibili.com/video/BV1date{i:02d}/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"}
+            for i in range(1, 11)
+        ],
+        [
+            {"url": "https://www.bilibili.com/video/BV1CWb7eHENQ/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"}
+        ]
+        + [
+            {"url": f"https://www.bilibili.com/video/BV1late{i:02d}/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"}
+            for i in range(2, 11)
+        ],
+    ]
+
+    merged = merge_bilibili_browser_query_rows(
+        query_rows_list,
+        queries=[
+            "Lara Schumann Piano Concerto 1950s",
+            "Lara Piano Concerto 1950s",
+            "阿德利纳·德·劳拉 May 29, 1951",
+            "Adelina de Lara Schumann concerto",
+        ],
+        result_depth=10,
+    )
+
+    urls = [row["url"] for row in merged]
+    assert "https://www.bilibili.com/video/BV1CWb7eHENQ/" in urls
+
+
+def test_merge_bilibili_browser_query_rows_promotes_consensus_mid_rank_hit() -> None:
+    target = {
+        "url": "https://www.bilibili.com/video/BV1consensus/",
+        "source_label": "Bilibili Search Browser Search",
+        "source_kind": "streaming",
+    }
+    query_rows_list = [
+        [
+            {"url": f"https://www.bilibili.com/video/BV1heada{i:02d}/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"}
+            for i in range(1, 5)
+        ]
+        + [target]
+        + [
+            {"url": f"https://www.bilibili.com/video/BV1taila{i:02d}/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"}
+            for i in range(6, 9)
+        ],
+        [
+            {"url": f"https://www.bilibili.com/video/BV1headb{i:02d}/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"}
+            for i in range(1, 4)
+        ]
+        + [target]
+        + [
+            {"url": f"https://www.bilibili.com/video/BV1tailb{i:02d}/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"}
+            for i in range(5, 9)
+        ],
+        [
+            {"url": f"https://www.bilibili.com/video/BV1headc{i:02d}/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"}
+            for i in range(1, 6)
+        ]
+        + [target]
+        + [
+            {"url": f"https://www.bilibili.com/video/BV1tailc{i:02d}/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"}
+            for i in range(7, 9)
+        ],
+    ]
+
+    merged = merge_bilibili_browser_query_rows(
+        query_rows_list,
+        queries=[
+            "Kempff Schumann Piano Concerto 1950s",
+            "Kempff Dorati concerto 1959",
+            "Wilhelm Kempff Schumann concerto",
+        ],
+        result_depth=3,
+    )
+
+    urls = [row["url"] for row in merged]
+    assert "https://www.bilibili.com/video/BV1consensus/" in urls
+
+
+def test_merge_bilibili_browser_query_rows_keeps_first_unique_hit_from_later_exact_query() -> None:
+    target = {
+        "url": "https://www.bilibili.com/video/BV1TE411f7uh/",
+        "source_label": "Bilibili Search Browser Search",
+        "source_kind": "streaming",
+    }
+    query_rows_list = [
+        [
+            {"url": "https://www.bilibili.com/video/BV1ypqBBrExq/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"},
+            {"url": "https://www.bilibili.com/video/BV1KEqBBLE9G/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"},
+            {"url": "https://www.bilibili.com/video/BV1hN3xzNEkG/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"},
+            {"url": "https://www.bilibili.com/video/BV18mxqzKENG/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"},
+            {"url": "https://www.bilibili.com/video/BV1PR4y1j7Qm/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"},
+            {"url": "https://www.bilibili.com/video/BV1DtE6zcEbX/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"},
+            {"url": "https://www.bilibili.com/video/BV1x94y1C7Tc/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"},
+            {"url": "https://www.bilibili.com/video/BV1sx4y1j7Y9/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"},
+        ],
+        [
+            {"url": "https://www.bilibili.com/video/BV1yqYEeKErH/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"},
+            {"url": "https://www.bilibili.com/video/BV1V7411q7Do/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"},
+            {"url": "https://www.bilibili.com/video/BV1dVapz9EZE/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"},
+            {"url": "https://www.bilibili.com/video/BV1z2UKY1E4X/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"},
+            {"url": "https://www.bilibili.com/video/BV1E84y1e7kH/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"},
+            {"url": "https://www.bilibili.com/video/BV169XwBzEUF/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"},
+            {"url": "https://www.bilibili.com/video/BV17o4y1m7U4/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"},
+            {"url": "https://www.bilibili.com/video/BV1CqntzWEU5/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"},
+        ],
+        [
+            {"url": "https://www.bilibili.com/video/BV1E84y1e7kH/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"},
+            {"url": "https://www.bilibili.com/video/BV1yqYEeKErH/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"},
+            target,
+            {"url": "https://www.bilibili.com/video/BV1dVapz9EZE/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"},
+            {"url": "https://www.bilibili.com/video/BV17o4y1m7U4/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"},
+            {"url": "https://www.bilibili.com/video/BV1z2UKY1E4X/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"},
+            {"url": "https://www.bilibili.com/video/BV1YP4y147Ms/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"},
+            {"url": "https://www.bilibili.com/video/BV1bNNHemEZV/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"},
+        ],
+    ]
+
+    merged = merge_bilibili_browser_query_rows(
+        query_rows_list,
+        queries=[
+            "钢协 Paul Kletzki 布达佩斯爱乐乐团",
+            "a小调钢琴协奏曲 Annie Fischer 布达佩斯爱乐乐团",
+            "Annie Fischer Schumann concerto",
+        ],
+        result_depth=10,
+    )
+
+    urls = [row["url"] for row in merged]
+    assert "https://www.bilibili.com/video/BV1TE411f7uh/" in urls
+
+
+def test_merge_bilibili_browser_query_rows_keeps_first_unseen_second_result_from_later_medium_query() -> None:
+    target = {
+        "url": "https://www.bilibili.com/video/BV1HP411m7JC/",
+        "source_label": "Bilibili Search Browser Search",
+        "source_kind": "streaming",
+    }
+    query_rows_list = [
+        [
+            {"url": "https://www.bilibili.com/video/BV1ED4y1g7Gm/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"},
+            {"url": "https://www.bilibili.com/video/BV1P5ATetE1D/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"},
+            {"url": "https://www.bilibili.com/video/BV1eW411k7mL/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"},
+            {"url": "https://www.bilibili.com/video/BV1DZ4y187HS/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"},
+            {"url": "https://www.bilibili.com/video/BV1g4411q7NP/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"},
+            {"url": "https://www.bilibili.com/video/BV1PpZeBUEPS/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"},
+            {"url": "https://www.bilibili.com/video/BV14g411d7J3/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"},
+            {"url": "https://www.bilibili.com/video/BV153zFBWEqo/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"},
+        ],
+        [
+            {"url": "https://www.bilibili.com/video/BV1eW411k7mL/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"},
+            {"url": "https://www.bilibili.com/video/BV1Ay4y1i74b/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"},
+            {"url": "https://www.bilibili.com/video/BV14x4y1Y7Le/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"},
+            {"url": "https://www.bilibili.com/video/BV1fW411B7m9/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"},
+            {"url": "https://www.bilibili.com/video/BV1LEHzeSESt/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"},
+            {"url": "https://www.bilibili.com/video/BV1764y1d7fc/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"},
+        ],
+        [
+            {"url": "https://www.bilibili.com/video/BV11F411s7a5/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"},
+            target,
+            {"url": "https://www.bilibili.com/video/BV1Pp4y1V7Wa/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"},
+            {"url": "https://www.bilibili.com/video/BV1LaPWzWE7h/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"},
+            {"url": "https://www.bilibili.com/video/BV1P5ATetE1D/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"},
+            {"url": "https://www.bilibili.com/video/BV1cAUjBKEJ8/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"},
+        ],
+    ]
+
+    merged = merge_bilibili_browser_query_rows(
+        query_rows_list,
+        queries=[
+            "Sviatoslav Richter HO Schumann concerto 1954",
+            "Richter Ferencsik János Schumann concerto 1954",
+            "钢协 斯维亚托斯拉夫·特奥菲洛维奇·里赫特 1954",
+        ],
+        result_depth=12,
+    )
+
+    urls = [row["url"] for row in merged]
+    assert "https://www.bilibili.com/video/BV1HP411m7JC/" in urls
 
 
 def test_merge_streaming_host_rows_preserves_deeper_bilibili_slice_when_multiple_hosts() -> None:
@@ -2251,6 +4778,93 @@ def test_merge_streaming_host_rows_preserves_deeper_bilibili_slice_when_multiple
     assert "https://www.bilibili.com/video/BV1row09/" in urls
 
 
+def test_dedupe_streaming_hosts_for_execution_collapses_duplicate_apple_hosts() -> None:
+    hosts = dedupe_streaming_hosts_for_execution(
+        [
+            SourceProfileEntry(url="https://classical.music.apple.com", is_chinese=False),
+            SourceProfileEntry(url="https://music.apple.com", is_chinese=False),
+            SourceProfileEntry(url="https://www.youtube.com", is_chinese=False),
+        ]
+    )
+
+    assert [host.url for host in hosts] == [
+        "https://classical.music.apple.com",
+        "https://www.youtube.com",
+    ]
+
+
+def test_streaming_host_priority_treats_apple_music_as_primary_platform() -> None:
+    assert streaming_host_priority("https://music.apple.com")[0] == 0
+    assert streaming_host_priority("https://classical.music.apple.com")[0] == 0
+
+
+def test_streaming_host_priority_orders_apple_after_bilibili_and_youtube_within_primary_hosts() -> None:
+    ordered = sorted(
+        [
+            "https://music.apple.com",
+            "https://www.youtube.com",
+            "https://www.bilibili.com",
+        ],
+        key=streaming_host_priority,
+    )
+
+    assert ordered == [
+        "https://www.bilibili.com",
+        "https://www.youtube.com",
+        "https://music.apple.com",
+    ]
+
+
+def test_should_probe_apple_auxiliary_hosts_when_primary_results_lack_platform_diversity() -> None:
+    assert (
+        should_probe_apple_auxiliary_hosts(
+            [
+                {
+                    "url": "https://www.youtube.com/watch?v=strong001",
+                    "platform": "youtube",
+                    "same_recording_score": 0.91,
+                }
+            ]
+        )
+        is True
+    )
+
+
+def test_should_probe_apple_auxiliary_hosts_skips_when_primary_results_are_already_strong_and_diverse() -> None:
+    assert (
+        should_probe_apple_auxiliary_hosts(
+            [
+                {
+                    "url": "https://www.youtube.com/watch?v=strong001",
+                    "platform": "youtube",
+                    "same_recording_score": 0.92,
+                },
+                {
+                    "url": "https://www.bilibili.com/video/BV1strong001/",
+                    "platform": "bilibili",
+                    "same_recording_score": 0.89,
+                },
+            ]
+        )
+        is False
+    )
+
+
+def test_should_expand_initial_streaming_window_when_apple_primary_results_are_present() -> None:
+    host_results = [
+        (
+            SourceProfileEntry(url="https://www.youtube.com", is_chinese=False),
+            [{"url": "https://www.youtube.com/watch?v=yt001"}],
+        ),
+        (
+            SourceProfileEntry(url="https://music.apple.com", is_chinese=False),
+            [{"url": "https://music.apple.com/us/album/demo/123?i=456"}],
+        ),
+    ]
+
+    assert should_expand_initial_streaming_window(host_results) is True
+
+
 def test_select_bilibili_browser_queries_keeps_precise_middle_conductor_query() -> None:
     queries = [
         "吉泽金",
@@ -2268,6 +4882,366 @@ def test_select_bilibili_browser_queries_keeps_precise_middle_conductor_query() 
     assert len(selected) == 6
     assert "a小调钢琴协奏曲 吉泽金 富特文格勒 柏林爱乐乐团 March 3, 1942 Berlin" in selected
     assert "Piano Concerto, Op.54 Walter Gieseking / Wilhelm Furtwangler Berlin Philharmonic Orchestra March 3, 1942 Berlin" in selected
+
+
+def test_select_bilibili_browser_queries_keeps_focused_middle_primary_query() -> None:
+    queries = [
+        "\u65af\u7ef4\u4e9a\u6258\u65af\u62c9\u592b\u00b7\u7279\u5965\u83f2\u6d1b\u7ef4\u5947\u00b7\u91cc\u8d6b\u7279",
+        "\u65af\u7ef4\u4e9a\u6258\u65af\u62c9\u592b\u00b7\u7279\u5965\u83f2\u6d1b\u7ef4\u5947\u00b7\u91cc\u8d6b\u7279 1954",
+        "\u94a2\u534f \u65af\u7ef4\u4e9a\u6258\u65af\u62c9\u592b\u00b7\u7279\u5965\u83f2\u6d1b\u7ef4\u5947\u00b7\u91cc\u8d6b\u7279 1954",
+        "\u94a2\u534f Sviatoslav Richter 1954",
+        "a\u5c0f\u8c03\u94a2\u7434\u534f\u594f\u66f2 Sviatoslav Richter \u5308\u7259\u5229\u56fd\u5bb6\u7231\u4e50\u4e50\u56e2 1954",
+        "a\u5c0f\u8c03\u94a2\u7434\u534f\u594f\u66f2 Sviatoslav Richter Hungarian Orchestra 1954",
+        "\u94a2\u534f Ferencsik J\u00e1nos \u5308\u7259\u5229\u56fd\u5bb6\u7231\u4e50\u4e50\u56e2 1954",
+        "\u94a2\u534f Ferencsik J\u00e1nos Hungarian Orchestra 1954",
+    ]
+
+    selected = select_bilibili_browser_queries(queries)
+
+    assert len(selected) == 6
+    assert "\u94a2\u534f Sviatoslav Richter 1954" in selected
+    assert "a\u5c0f\u8c03\u94a2\u7434\u534f\u594f\u66f2 Sviatoslav Richter Hungarian Orchestra 1954" in selected
+
+
+def test_select_bilibili_browser_queries_keeps_primary_work_rescue_query_for_de_lara() -> None:
+    queries = [
+        "Lara Schumann Piano Concerto 1950s",
+        "Lara Piano Concerto 1950s",
+        "Adelina de Lara Schumann concerto",
+        "Adelina de Lara 舒曼钢协",
+        "阿德利纳·德·劳拉",
+        "阿德利纳·德·劳拉 May 29, 1951",
+        "罗伯特·舒曼 a小调钢琴协奏曲 阿德利纳·德·劳拉",
+    ]
+
+    selected = select_bilibili_browser_queries(queries)
+
+    assert "Adelina de Lara Schumann concerto" in selected
+
+
+def test_select_bilibili_browser_queries_keeps_primary_work_rescue_query_for_richter_after_rescue_insertions() -> None:
+    queries = [
+        "Richter Schumann Piano Concerto 1950s",
+        "Richter Piano Concerto 1950s",
+        "Sviatoslav Richter Schumann concerto",
+        "Sviatoslav Richter 舒曼钢协",
+        "斯维亚托斯拉夫·特奥菲洛维奇·里赫特",
+        "斯维亚托斯拉夫·特奥菲洛维奇·里赫特 1954",
+        "钢协 斯维亚托斯拉夫·特奥菲洛维奇·里赫特 1954",
+        "钢协 Sviatoslav Richter 1954",
+    ]
+
+    selected = select_bilibili_browser_queries(queries)
+
+    assert "钢协 Sviatoslav Richter 1954" in selected
+
+
+def test_select_bilibili_browser_queries_keeps_collaboration_middle_query() -> None:
+    queries = [
+        "\u5a01\u5ec9\u00b7\u6c83\u5c14\u7279\u00b7\u5f17\u91cc\u5fb7\u91cc\u5e0c\u00b7\u80af\u666e\u592b",
+        "\u5a01\u5ec9\u00b7\u6c83\u5c14\u7279\u00b7\u5f17\u91cc\u5fb7\u91cc\u5e0c\u00b7\u80af\u666e\u592b 1959",
+        "\u94a2\u534f Wilhelm Kempff 1959",
+        "\u94a2\u534f \u5a01\u5ec9\u00b7\u6c83\u5c14\u7279\u00b7\u5f17\u91cc\u5fb7\u91cc\u5e0c\u00b7\u80af\u666e\u592b 1959",
+        "a\u5c0f\u8c03\u94a2\u7434\u534f\u594f\u66f2 Wilhelm Kempff Dorati 1959",
+        "a\u5c0f\u8c03\u94a2\u7434\u534f\u594f\u66f2 Wilhelm Kempff Royal Orchestra 1959",
+        "\u94a2\u534f Antal Dorati \u963f\u59c6\u65af\u7279\u4e39\u7687\u5bb6\u97f3\u4e50\u5385\u7ba1\u5f26\u4e50\u56e2 1959",
+        "\u94a2\u534f Antal Dorati Royal Orchestra 1959",
+    ]
+
+    selected = select_bilibili_browser_queries(queries)
+
+    assert len(selected) == 6
+    assert "a\u5c0f\u8c03\u94a2\u7434\u534f\u594f\u66f2 Wilhelm Kempff Dorati 1959" in selected
+
+
+def test_prepare_bilibili_browser_queries_keeps_collaboration_rescue_for_kempff() -> None:
+    queries = [
+        "\u94a2\u534f Wilhelm Kempff 1959",
+        "Kempff Schumann Piano Concerto 1950s",
+        "Kempff Schumann Piano Concertos 1950s",
+        "Wilhelm Kempff Schumann concerto",
+        "Kempff Dorati concerto 1959",
+        "Wilhelm Kempff Dorati Schumann concerto",
+    ]
+
+    selected = prepare_bilibili_browser_queries(queries, max_queries=3)
+
+    assert len(selected) == 3
+    assert "Kempff Dorati concerto 1959" in selected
+    assert any("Dorati" in query for query in selected)
+
+
+def test_prepare_bilibili_browser_queries_keeps_exact_collaboration_query_for_annie_kletzki() -> None:
+    queries = [
+        "Piano Concerto, Op.54 Annie Fischer Paul Kletzki Budapest Orchestra",
+        "Piano Concerto, Op.54 Annie Fischer Paul Kletzki Budapest Philharmonic Orchestra",
+        "Piano Concerto, Op.54 Annie Fischer Paul Kletzki",
+        "Piano Concerto, Op.54 Annie Fischer",
+        "Piano Concerto, Op.54 Annie Fischer BpPO",
+        "Piano Concerto, Op.54 BpPO",
+        "Piano Concerto, Op.54 Budapest Orchestra",
+    ]
+
+    selected = prepare_bilibili_browser_queries(queries, max_queries=4)
+
+    assert len(selected) == 4
+    assert any("Piano Concerto, Op.54 Annie Fischer Paul Kletzki" in query for query in selected)
+    assert any("Paul Kletzki" in query for query in selected)
+
+
+def test_prepare_bilibili_browser_queries_keeps_generic_plural_bundle_rescue_for_kempff_full_case() -> None:
+    queries = [
+        "a小调钢琴协奏曲 威廉·沃尔特·弗里德里希·肯普夫 安塔尔·多拉蒂 阿姆斯特丹皇家音乐厅管弦乐团 1959",
+        "a小调钢琴协奏曲 威廉·沃尔特·弗里德里希·肯普夫 / 安塔尔·多拉蒂 阿姆斯特丹皇家音乐厅管弦乐团 1959",
+        "Kempff Schumann Piano Concerto 1950s Op.54",
+        "Kempff Schumann Piano Concertos 1950s Op.54",
+        "Kempff Piano Concertos 1950s",
+        "Wilhelm Kempff RO Schumann concerto 1959",
+        "Kempff Dorati Schumann concerto 1959 Op.54",
+        "钢协 Wilhelm Kempff 1959",
+    ]
+
+    selected = prepare_bilibili_browser_queries(queries, max_queries=4)
+
+    assert "Kempff Piano Concertos 1950s" in selected
+
+
+def test_prepare_bilibili_browser_queries_preserves_short_rescue_and_bundle_for_kempff_full_case_when_budget_allows() -> None:
+    queries = [
+        "a小调钢琴协奏曲 威廉·沃尔特·弗里德里希·肯普夫 安塔尔·多拉蒂 阿姆斯特丹皇家音乐厅管弦乐团 1959",
+        "a小调钢琴协奏曲 威廉·沃尔特·弗里德里希·肯普夫 / 安塔尔·多拉蒂 阿姆斯特丹皇家音乐厅管弦乐团 1959",
+        "Kempff Schumann Piano Concerto 1950s Op.54",
+        "Kempff Schumann Piano Concertos 1950s Op.54",
+        "Kempff Piano Concertos 1950s",
+        "Wilhelm Kempff RO Schumann concerto 1959",
+        "Kempff Dorati Schumann concerto 1959 Op.54",
+        "钢协 Wilhelm Kempff 1959",
+    ]
+
+    selected = prepare_bilibili_browser_queries(queries, max_queries=4)
+
+    assert "Kempff Piano Concertos 1950s" in selected
+    assert "钢协 Wilhelm Kempff 1959" in selected
+
+
+def test_classify_link_candidate_zone_keeps_kempff_bundle_upload_out_of_conflicting_credit_red_zone() -> None:
+    recordings, works, composers = load_library_indices()
+    work_id = find_work_id(works=works, title_latin="Piano Concerto, Op.54")
+    scenario = next(
+        scenario
+        for scenario in build_work_dataset(
+            work_id=work_id,
+            recordings=recordings,
+            works=works,
+            composers=composers,
+        )
+        if scenario.variant == "full" and "bilibili:BV1NY411y7Wc" in scenario.target_urls
+    )
+    draft = InputNormalizer().normalize(scenario.item)
+    candidate = LinkCandidate(
+        platform="bilibili",
+        url="https://www.bilibili.com/video/BV1NY411y7Wc/",
+        title="肯普夫 蒙特勒现场 贝一、舒曼钢协 | Kempff - Beethoven, Schumann Piano Concertos（1950s）",
+        confidence=0.81,
+    )
+
+    conflicts = candidate_conflicting_credit_tokens(draft, candidate.title or "")
+    zone, note = classify_link_candidate_zone(draft, candidate)
+
+    assert conflicts == set()
+    assert zone == "yellow"
+    assert note == "review-needed"
+
+
+def test_prepare_bilibili_browser_queries_keeps_decade_primary_work_rescue_for_de_lara_partial_case() -> None:
+    queries = [
+        "a\u5c0f\u8c03\u94a2\u7434\u534f\u594f\u66f2 \u963f\u5fb7\u5229\u7eb3\u00b7\u5fb7\u00b7\u52b3\u62c9 \u6000\u7279 \u82f1\u56fd\u5e7f\u64ad\u516c\u53f8\u82cf\u683c\u5170\u4ea4\u54cd\u4e50\u56e2 May 29, 1951",
+        "a\u5c0f\u8c03\u94a2\u7434\u534f\u594f\u66f2 \u963f\u5fb7\u5229\u7eb3\u00b7\u5fb7\u00b7\u52b3\u62c9 / \u6000\u7279 \u82f1\u56fd\u5e7f\u64ad\u516c\u53f8\u82cf\u683c\u5170\u4ea4\u54cd\u4e50\u56e2 May 29, 1951",
+        "de Lara Schumann Piano Concerto 1950s",
+        "de Lara Schumann Piano Concertos 1950s",
+        "Adelina de Lara \u82f1\u56fd\u5e7f\u64ad\u516c\u53f8\u82cf\u683c\u5170 Schumann concerto 1951",
+        "Adelina de Lara Schumann concerto",
+        "Adelina de Lara \u8212\u66fc\u94a2\u534f",
+        "\u6000\u7279 - \u52b3\u62c9 - \u82f1\u56fd\u5e7f\u64ad\u516c\u53f8\u82cf\u683c\u5170\u4ea4\u54cd\u4e50\u56e2 - May 29, 1951 \u963f\u5fb7\u5229\u7eb3\u00b7\u5fb7\u00b7\u52b3\u62c9",
+        "\u963f\u5fb7\u5229\u7eb3\u00b7\u5fb7\u00b7\u52b3\u62c9",
+        "\u963f\u5fb7\u5229\u7eb3\u00b7\u5fb7\u00b7\u52b3\u62c9 May 29, 1951",
+    ]
+
+    selected = prepare_bilibili_browser_queries(queries, max_queries=3)
+
+    assert "de Lara Schumann Piano Concerto 1950s" in selected
+
+
+def test_prepare_bilibili_browser_queries_keeps_decade_primary_work_rescue_for_gieseking_partial_case() -> None:
+    queries = [
+        "a\u5c0f\u8c03\u94a2\u7434\u534f\u594f\u66f2 \u74e6\u5c14\u7279\u00b7\u5409\u6cfd\u91d1 \u5bcc\u7279\u6587\u683c\u52d2 \u67cf\u6797\u7231\u4e50\u4e50\u56e2 March 3, 1942",
+        "a\u5c0f\u8c03\u94a2\u7434\u534f\u594f\u66f2 \u74e6\u5c14\u7279\u00b7\u5409\u6cfd\u91d1 / \u5bcc\u7279\u6587\u683c\u52d2 \u67cf\u6797\u7231\u4e50\u4e50\u56e2 March 3, 1942",
+        "Gieseking Schumann Piano Concerto 1940s",
+        "Gieseking Schumann Piano Concertos 1940s",
+        "Walter Gieseking \u67cf\u6797 Schumann concerto 1942",
+        "Walter Gieseking Schumann concerto",
+        "Walter Gieseking \u8212\u66fc\u94a2\u534f",
+        "\u5bcc\u7279\u6587\u683c\u52d2 - \u5409\u6cfd\u91d1 - \u67cf\u6797\u7231\u4e50\u4e50\u56e2 - March 3, 1942 Berlin \u74e6\u5c14\u7279\u00b7\u5409\u6cfd\u91d1",
+        "\u74e6\u5c14\u7279\u00b7\u5409\u6cfd\u91d1",
+        "\u74e6\u5c14\u7279\u00b7\u5409\u6cfd\u91d1 March 3, 1942",
+    ]
+
+    selected = prepare_bilibili_browser_queries(queries, max_queries=3)
+
+    assert "Gieseking Schumann Piano Concerto 1940s" in selected
+
+
+def test_prepare_bilibili_browser_queries_keeps_short_primary_year_rescue_for_richter_full_case() -> None:
+    queries = [
+        "a\u5c0f\u8c03\u94a2\u7434\u534f\u594f\u66f2 \u65af\u7ef4\u4e9a\u6258\u65af\u62c9\u592b\u00b7\u7279\u5965\u83f2\u6d1b\u7ef4\u5947\u00b7\u91cc\u8d6b\u7279 \u8d39\u4f26\u5947\u514b\u00b7\u4e9a\u8bfa\u4ec0 \u5308\u7259\u5229\u56fd\u5bb6\u7231\u4e50\u4e50\u56e2 1954",
+        "a\u5c0f\u8c03\u94a2\u7434\u534f\u594f\u66f2 \u65af\u7ef4\u4e9a\u6258\u65af\u62c9\u592b\u00b7\u7279\u5965\u83f2\u6d1b\u7ef4\u5947\u00b7\u91cc\u8d6b\u7279 / \u8d39\u4f26\u5947\u514b\u00b7\u4e9a\u8bfa\u4ec0 \u5308\u7259\u5229\u56fd\u5bb6\u7231\u4e50\u4e50\u56e2 1954",
+        "Richter Schumann Piano Concerto 1950s",
+        "Richter Schumann Piano Concertos 1950s",
+        "Sviatoslav Richter HO Schumann concerto 1954",
+        "Richter Ferencsik J\u00e1nos Schumann concerto 1954",
+        "Sviatoslav Richter Schumann concerto",
+        "\u65af\u7ef4\u4e9a\u6258\u65af\u62c9\u592b\u00b7\u7279\u5965\u83f2\u6d1b\u7ef4\u5947\u00b7\u91cc\u8d6b\u7279",
+        "\u65af\u7ef4\u4e9a\u6258\u65af\u62c9\u592b\u00b7\u7279\u5965\u83f2\u6d1b\u7ef4\u5947\u00b7\u91cc\u8d6b\u7279 1954",
+        "\u94a2\u534f \u65af\u7ef4\u4e9a\u6258\u65af\u62c9\u592b\u00b7\u7279\u5965\u83f2\u6d1b\u7ef4\u5947\u00b7\u91cc\u8d6b\u7279 1954",
+    ]
+
+    selected = prepare_bilibili_browser_queries(queries, max_queries=3)
+
+    assert "\u94a2\u534f \u65af\u7ef4\u4e9a\u6258\u65af\u62c9\u592b\u00b7\u7279\u5965\u83f2\u6d1b\u7ef4\u5947\u00b7\u91cc\u8d6b\u7279 1954" in selected
+
+
+def test_prepare_bilibili_browser_queries_preserves_short_anchors_when_adding_bundle_for_richter_full_case() -> None:
+    queries = [
+        "a小调钢琴协奏曲 斯维亚托斯拉夫·特奥菲洛维奇·里赫特 费伦奇克·亚诺什 匈牙利国家爱乐乐团 1954",
+        "a小调钢琴协奏曲 斯维亚托斯拉夫·特奥菲洛维奇·里赫特 / 费伦奇克·亚诺什 匈牙利国家爱乐乐团 1954",
+        "Richter Schumann Piano Concerto 1950s",
+        "Richter Schumann Piano Concertos 1950s",
+        "Richter Piano Concertos 1950s",
+        "Sviatoslav Richter HO Schumann concerto 1954",
+        "Richter Ferencsik János Schumann concerto 1954",
+        "Sviatoslav Richter Schumann concerto",
+        "斯维亚托斯拉夫·特奥菲洛维奇·里赫特 1954",
+        "钢协 斯维亚托斯拉夫·特奥菲洛维奇·里赫特 1954",
+        "a小调钢琴协奏曲 Sviatoslav Richter 匈牙利国家爱乐乐团 1954",
+    ]
+
+    selected = prepare_bilibili_browser_queries(queries, max_queries=4)
+
+    assert "Richter Piano Concertos 1950s" in selected
+    assert "钢协 斯维亚托斯拉夫·特奥菲洛维奇·里赫特 1954" in selected
+    assert "Richter Ferencsik János Schumann concerto 1954" in selected
+
+
+def test_prepare_bilibili_browser_queries_keeps_cjk_context_rescue_for_richter_full_case() -> None:
+    queries = [
+        "里赫特 匈牙利 1954 舒曼钢协 Op.54",
+        "费伦奇克 里赫特 匈牙利 1954 舒曼钢协 Op.54",
+        "Richter Schumann Piano Concerto 1950s Op.54",
+        "Richter Schumann Piano Concertos 1950s Op.54",
+        "Richter Piano Concertos 1950s",
+        "Sviatoslav Richter HNPO Schumann concerto 1954 Op.54",
+        "Richter Janos Schumann concerto 1954 Op.54",
+        "Sviatoslav Richter Schumann concerto Op.54",
+        "斯维亚托斯拉夫·特奥菲洛维奇·里赫特 1954",
+        "舒曼 a小调钢琴协奏曲 Op.54 斯维亚托斯拉夫·特奥菲洛维奇·里赫特",
+    ]
+
+    selected = prepare_bilibili_browser_queries(queries, max_queries=4)
+
+    assert "里赫特 匈牙利 1954 舒曼钢协 Op.54" in selected
+
+
+def test_prepare_bilibili_browser_queries_preserves_primary_year_anchor_over_generic_decade_rescue_for_richter_partial_case() -> None:
+    queries = [
+        "Sviatoslav Richter \u5308\u7259\u5229\u56fd\u5bb6 Schumann concerto 1954",
+        "a\u5c0f\u8c03\u94a2\u7434\u534f\u594f\u66f2 \u65af\u7ef4\u4e9a\u6258\u65af\u62c9\u592b\u00b7\u7279\u5965\u83f2\u6d1b\u7ef4\u5947\u00b7\u91cc\u8d6b\u7279 / \u8d39\u4f26\u5947\u514b \u5308\u7259\u5229\u56fd\u5bb6\u7231\u4e50\u4e50\u56e2 1954",
+        "\u65af\u7ef4\u4e9a\u6258\u65af\u62c9\u592b\u00b7\u7279\u5965\u83f2\u6d1b\u7ef4\u5947\u00b7\u91cc\u8d6b\u7279 1954",
+        "Richter Schumann Piano Concerto 1950s",
+    ]
+
+    selected = prepare_bilibili_browser_queries(queries, max_queries=3)
+
+    assert "\u65af\u7ef4\u4e9a\u6258\u65af\u62c9\u592b\u00b7\u7279\u5965\u83f2\u6d1b\u7ef4\u5947\u00b7\u91cc\u8d6b\u7279 1954" in selected
+
+
+def test_prepare_bilibili_browser_queries_keeps_decade_rescue_alongside_primary_year_anchor_for_moiseiwitsch_partial_case() -> None:
+    queries = [
+        "a小调钢琴协奏曲 班诺·莫伊塞维奇 奥托·阿克曼 爱乐乐团 1954",
+        "a小调钢琴协奏曲 班诺·莫伊塞维奇 / 奥托·阿克曼 爱乐乐团 1954",
+        "班诺·莫伊塞维奇 1954",
+        "Moiseiwitsch Schumann Piano Concerto 1950s",
+        "Moiseiwitsch Schumann Piano Concertos 1950s",
+        "Benno Moiseiwitsch 爱乐 Schumann concerto 1954",
+        "Benno Moiseiwitsch Schumann concerto",
+        "Benno Moiseiwitsch 舒曼钢协",
+        "奥托·阿克曼 - 莫伊塞维奇 - 爱乐乐团 - 1954 班诺·莫伊塞维奇",
+    ]
+
+    selected = prepare_bilibili_browser_queries(queries, max_queries=4)
+
+    assert "班诺·莫伊塞维奇 1954" in selected
+    assert "Moiseiwitsch Schumann Piano Concerto 1950s" in selected
+
+
+def test_prepare_bilibili_browser_queries_preserves_short_rescue_and_bundle_for_grinberg_full_case_when_budget_allows() -> None:
+    queries = [
+        "a小调钢琴协奏曲 玛丽亚·伊斯拉列夫娜·格林伯格 卡尔·埃利亚斯伯格 苏联国家交响乐团 1958",
+        "a小调钢琴协奏曲 玛丽亚·伊斯拉列夫娜·格林伯格 / 卡尔·埃利亚斯伯格 苏联国家交响乐团 1958",
+        "Grinberg Schumann Piano Concerto 1950s",
+        "Grinberg Schumann Piano Concertos 1950s",
+        "Grinberg Piano Concertos 1950s",
+        "Maria Grinberg USSR Schumann concerto 1958",
+        "Grinberg Eliasberg Schumann concerto 1958",
+        "Maria Grinberg Schumann concerto",
+        "玛丽亚·伊斯拉列夫娜·格林伯格 1958",
+        "钢协 Maria Grinberg 1958",
+        "a小调钢琴协奏曲 Maria Grinberg 苏联国家交响乐团 1958",
+    ]
+
+    selected = prepare_bilibili_browser_queries(queries, max_queries=4)
+
+    assert "Grinberg Piano Concertos 1950s" in selected
+    assert "钢协 Maria Grinberg 1958" in selected
+
+
+def test_prepare_bilibili_browser_queries_keeps_cjk_context_rescue_for_grinberg_full_case() -> None:
+    queries = [
+        "格林伯格 苏联 1958 舒曼钢协 Op.54",
+        "埃利亚斯伯格 格林伯格 苏联 1958 舒曼钢协 Op.54",
+        "Grinberg Schumann Piano Concerto 1950s Op.54",
+        "Grinberg Schumann Piano Concertos 1950s Op.54",
+        "Grinberg Piano Concertos 1950s",
+        "Maria Grinberg USSR Schumann concerto 1958 Op.54",
+        "Grinberg Eliasberg Schumann concerto 1958 Op.54",
+        "Maria Grinberg Schumann concerto Op.54",
+        "格林伯格 1958",
+        "舒曼 a小调钢琴协奏曲 Op.54 玛丽亚·伊斯拉列夫娜·格林伯格",
+    ]
+
+    selected = prepare_bilibili_browser_queries(queries, max_queries=4)
+
+    assert "格林伯格 苏联 1958 舒曼钢协 Op.54" in selected
+
+
+def test_prepare_bilibili_browser_queries_preserves_year_anchor_and_bundle_for_gieseking_partial_case_when_budget_allows() -> None:
+    queries = [
+        "a小调钢琴协奏曲 瓦尔特·吉泽金 富特文格勒 柏林爱乐乐团 March 3, 1942",
+        "a小调钢琴协奏曲 瓦尔特·吉泽金 / 富特文格勒 柏林爱乐乐团 March 3, 1942",
+        "Gieseking Schumann Piano Concerto 1940s",
+        "Gieseking Schumann Piano Concertos 1940s",
+        "Gieseking Piano Concertos 1940s",
+        "Walter Gieseking 柏林 Schumann concerto 1942",
+        "Walter Gieseking Schumann concerto",
+        "Walter Gieseking 舒曼钢协",
+        "瓦尔特·吉泽金 1942",
+        "富特文格勒 - 吉泽金 - 柏林爱乐乐团 - March 3, 1942 Berlin 瓦尔特·吉泽金",
+        "瓦尔特·吉泽金 March 3, 1942",
+    ]
+
+    selected = prepare_bilibili_browser_queries(queries, max_queries=4)
+
+    assert "Gieseking Piano Concertos 1940s" in selected
+    assert "瓦尔特·吉泽金 1942" in selected
 
 
 def test_looks_like_single_movement_ignores_complete_tracklist_descriptions() -> None:
@@ -2349,9 +5323,9 @@ def test_provider_uses_chinese_queries_only_for_chinese_platforms_and_expands_ab
 
     bilibili_urls = [url for url in transport.urls if "bilibili.com" in url]
     youtube_urls = [url for url in transport.urls if "youtube.com/results" in url]
-    assert any("%E6%9F%B4%E5%8F%AF%E5%A4%AB%E6%96%AF%E5%9F%BA" in url for url in bilibili_urls)
+    assert any("Tchaikovsky" not in url and "search.bilibili.com" in url for url in bilibili_urls)
     assert any("Boston+Symphony+Orchestra" in url for url in youtube_urls)
-    assert not any("%E6%9F%B4%E5%8F%AF%E5%A4%AB%E6%96%AF%E5%9F%BA" in url for url in youtube_urls)
+    assert not any("search_query=%E6%9F%B4" in url for url in youtube_urls)
 
 
 def test_non_chinese_platform_queries_promote_named_concerto_aliases_into_executed_budget(tmp_path: Path) -> None:
@@ -3244,6 +6218,53 @@ def test_score_recording_match_penalizes_single_movement_track() -> None:
     assert full_recording > movement_only
 
 
+def test_score_recording_match_keeps_first_movement_video_above_low_confidence_when_version_signals_align() -> None:
+    draft = DraftRecordingEntry(
+        item_id="recording-schumann-first-movement-video",
+        title="Eliso Virsaladze 1989",
+        composer_name="舒曼",
+        composer_name_latin="Robert Schumann",
+        work_title="a小调钢琴协奏曲",
+        work_title_latin="Piano Concerto in A minor, Op.54",
+        catalogue="Op.54",
+        performance_date_text="1989",
+        venue_text="",
+        album_title="",
+        label="",
+        release_date="",
+        notes="",
+        source_line="Robert Schumann | Piano Concerto in A minor, Op.54 | Eliso Virsaladze | Alexander Rudin | 1989",
+        raw_text="Robert Schumann | Piano Concerto in A minor, Op.54 | Eliso Virsaladze | Alexander Rudin | 1989",
+        existing_links=[],
+        primary_names=["Eliso Virsaladze"],
+        primary_names_latin=["Eliso Virsaladze"],
+        secondary_names=["Alexander Rudin"],
+        secondary_names_latin=["Alexander Rudin"],
+        lead_names=["Eliso Virsaladze", "Alexander Rudin"],
+        lead_names_latin=["Eliso Virsaladze", "Alexander Rudin"],
+        ensemble_names=[],
+        ensemble_names_latin=[],
+    )
+
+    aligned_first_movement = score_recording_match(
+        "Schumann: Piano Concerto in A Minor, Op.54: I. Allegro affettuoso - Eliso Virsaladze 1989 live",
+        "https://www.youtube.com/watch?v=movement1",
+        draft,
+        duration_seconds=914,
+        uploader="Archive",
+    )
+    wrong_first_movement = score_recording_match(
+        "Schumann: Piano Concerto in A Minor, Op.54: I. Allegro affettuoso - Martha Argerich 1989 live",
+        "https://www.youtube.com/watch?v=movement2",
+        draft,
+        duration_seconds=914,
+        uploader="Archive",
+    )
+
+    assert aligned_first_movement >= 0.45
+    assert aligned_first_movement > wrong_first_movement
+
+
 def test_score_recording_match_penalizes_aria_extract_for_goldberg_variations() -> None:
     draft = DraftRecordingEntry(
         item_id="recording-6",
@@ -3320,6 +6341,148 @@ def test_score_recording_match_treats_bilingual_people_as_same_role_slots() -> N
     )
 
     assert exact_like > wrong_collaborator
+
+
+def test_score_recording_match_penalizes_missing_secondary_credit_for_concerto_uploads() -> None:
+    draft = DraftRecordingEntry(
+        item_id="recording-kempff-missing-secondary",
+        title="Wilhelm Kempff & Antal Dorati",
+        composer_name="舒曼",
+        composer_name_latin="Robert Schumann",
+        work_title="a小调钢琴协奏曲",
+        work_title_latin="Piano Concerto, Op.54",
+        catalogue="Op.54",
+        performance_date_text="1959",
+        venue_text="",
+        album_title="",
+        label="",
+        release_date="",
+        notes="",
+        source_line="Robert Schumann | Piano Concerto in A minor, Op.54 | Wilhelm Kempff | Antal Dorati | Concertgebouw Orchestra Amsterdam | 1959",
+        raw_text="Robert Schumann | Piano Concerto in A minor, Op.54 | Wilhelm Kempff | Antal Dorati | Concertgebouw Orchestra Amsterdam | 1959",
+        existing_links=[],
+        primary_names=["肯普夫"],
+        primary_names_latin=["Wilhelm Kempff"],
+        secondary_names=["多拉蒂"],
+        secondary_names_latin=["Antal Dorati"],
+        lead_names=["肯普夫", "多拉蒂"],
+        lead_names_latin=["Wilhelm Kempff", "Antal Dorati"],
+        ensemble_names=["阿姆斯特丹皇家音乐厅管弦乐团"],
+        ensemble_names_latin=["Concertgebouw Orchestra Amsterdam", "Royal Concertgebouw Orchestra"],
+    )
+
+    exact_like = score_recording_match(
+        "Wilhelm Kempff Antal Dorati Schumann Piano Concerto Op.54 1959 Concertgebouw Orchestra Amsterdam complete",
+        "https://www.bilibili.com/video/BV1exact/",
+        draft,
+        duration_seconds=1880,
+        uploader="Classical Vault",
+    )
+    missing_secondary = score_recording_match(
+        "Wilhelm Kempff Schumann Piano Concerto Op.54 1959 Concertgebouw Orchestra Amsterdam complete",
+        "https://www.bilibili.com/video/BV1missing/",
+        draft,
+        duration_seconds=1880,
+        uploader="Classical Vault",
+    )
+
+    assert exact_like >= 0.9
+    assert missing_secondary <= 0.82
+    assert exact_like > missing_secondary
+
+
+def test_score_recording_match_prefers_exact_date_context_over_remastered_alt_upload() -> None:
+    draft = DraftRecordingEntry(
+        item_id="recording-delara-date-context",
+        title="Adelina de Lara & Ian Whyte",
+        composer_name="罗伯特·舒曼",
+        composer_name_latin="Robert Schumann",
+        work_title="a小调钢琴协奏曲",
+        work_title_latin="Piano Concerto, Op.54",
+        catalogue="Op.54",
+        performance_date_text="May 29, 1951",
+        venue_text="",
+        album_title="",
+        label="",
+        release_date="",
+        notes="",
+        source_line="Robert Schumann | Piano Concerto in A minor, Op.54 | Adelina de Lara | Ian Whyte | BBC Scottish Symphony Orchestra | May 29, 1951",
+        raw_text="Robert Schumann | Piano Concerto in A minor, Op.54 | Adelina de Lara | Ian Whyte | BBC Scottish Symphony Orchestra | May 29, 1951",
+        existing_links=[],
+        primary_names=["阿德利纳·德·劳拉"],
+        primary_names_latin=["Adelina de Lara"],
+        secondary_names=["伊恩·怀特"],
+        secondary_names_latin=["Ian Whyte"],
+        lead_names=["阿德利纳·德·劳拉", "伊恩·怀特"],
+        lead_names_latin=["Adelina de Lara", "Ian Whyte"],
+        ensemble_names=["英国广播公司苏格兰交响乐团"],
+        ensemble_names_latin=["BBC Scottish Symphony Orchestra"],
+    )
+
+    exact_date_context = score_recording_match(
+        "Adelina de Lara Schumann Piano Concerto Op.54 BBC Scottish Symphony Orchestra May 29 1951 complete",
+        "https://www.bilibili.com/video/BV1target/",
+        draft,
+        duration_seconds=1880,
+        uploader="Archive",
+    )
+    remastered_alt = score_recording_match(
+        "Schumann Piano Concerto Op.54 Adelina de Lara 1951 remaster",
+        "https://www.bilibili.com/video/BV1alt/",
+        draft,
+        duration_seconds=1880,
+        uploader="Archive",
+    )
+
+    assert exact_date_context >= 0.84
+    assert exact_date_context > remastered_alt
+
+
+def test_score_recording_match_prefers_actual_delara_bbc_broadcast_over_wrong_clara_upload() -> None:
+    draft = DraftRecordingEntry(
+        item_id="recording-delara-bbc-broadcast",
+        title="Adelina de Lara & Ian Whyte",
+        composer_name="罗伯特·舒曼",
+        composer_name_latin="Robert Schumann",
+        work_title="a小调钢琴协奏曲",
+        work_title_latin="Piano Concerto, Op.54",
+        catalogue="Op.54",
+        performance_date_text="May 29, 1951",
+        venue_text="",
+        album_title="",
+        label="",
+        release_date="",
+        notes="",
+        source_line="Robert Schumann | Piano Concerto in A minor, Op.54 | Adelina de Lara | Ian Whyte | BBC Scottish Symphony Orchestra | May 29, 1951",
+        raw_text="Robert Schumann | Piano Concerto in A minor, Op.54 | Adelina de Lara | Ian Whyte | BBC Scottish Symphony Orchestra | May 29, 1951",
+        existing_links=[],
+        primary_names=["阿德利纳·德·劳拉"],
+        primary_names_latin=["Adelina de Lara"],
+        secondary_names=["伊恩·怀特"],
+        secondary_names_latin=["Ian Whyte"],
+        lead_names=["阿德利纳·德·劳拉", "伊恩·怀特"],
+        lead_names_latin=["Adelina de Lara", "Ian Whyte"],
+        ensemble_names=["英国广播公司苏格兰交响乐团"],
+        ensemble_names_latin=["BBC Scottish Symphony Orchestra"],
+    )
+
+    actual_upload = score_recording_match(
+        "【Adelina de Lara】克拉拉的爱徒会如何演奏舒曼钢协？ BBC broadcast; 29 May 1951 【Adelina de Lara 弹舒曼钢琴协奏曲】",
+        "https://www.bilibili.com/video/BV1CWb7eHENQ/",
+        draft,
+        duration_seconds=1991,
+        uploader="_HideousLight_",
+    )
+    wrong_clara_upload = score_recording_match(
+        "Clara Schumann Piano Concerto in A minor Piano: Michal Tal Conductor: Keren Kagarlitsky Israel Camerata Jerusalem Orchestra",
+        "https://www.bilibili.com/video/BV1Za9QYnE9D/",
+        draft,
+        duration_seconds=1378,
+        uploader="Amy-yui",
+    )
+
+    assert actual_upload >= 0.62
+    assert actual_upload > wrong_clara_upload
 
 
 def test_score_recording_match_keeps_exact_annie_schumann_above_wrong_concerto_version() -> None:

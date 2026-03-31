@@ -4,6 +4,8 @@ import asyncio
 import json
 from pathlib import Path
 
+import httpx
+
 from app.services.llm_client import DualModelLlmClient, ModelConfig, OpenAiCompatibleLlmClient, load_llm_config, migrate_legacy_llm_config
 
 
@@ -127,6 +129,78 @@ def test_openai_compatible_client_recreates_underlying_client_when_event_loop_ch
     assert first == {}
     assert second == {}
     assert len(created_clients) == 2
+
+
+def test_openai_compatible_client_retries_once_after_transport_timeout() -> None:
+    attempts = 0
+
+    class TimeoutOnceClient:
+        async def post(self, *args, **kwargs) -> "_FakeResponse":
+            nonlocal attempts
+            del args, kwargs
+            attempts += 1
+            if attempts == 1:
+                raise httpx.ReadTimeout("timed out")
+            return _FakeResponse()
+
+        async def aclose(self) -> None:
+            return None
+
+    client = OpenAiCompatibleLlmClient(
+        ModelConfig(
+            enabled=True,
+            base_url="https://llm.example/v1",
+            api_key="secret",
+            model="deepseek-chat",
+            timeout_ms=12000,
+        ),
+        client_factory=TimeoutOnceClient,
+    )
+
+    async def run_once() -> dict:
+        return await client._chat_json(
+            [
+                {"role": "system", "content": "Return strict JSON only."},
+                {"role": "user", "content": "{}"},
+            ]
+        )
+
+    payload = asyncio.run(run_once())
+
+    assert payload == {}
+    assert attempts == 2
+
+
+def test_dual_model_client_prefers_fast_model_for_realtime_synthesis(tmp_path: Path) -> None:
+    class FakeFastClient:
+        minimum_synthesis_timeout_seconds = 4.0
+
+        async def analyze_input(self, raw_text: str, work_type_hint: str) -> dict[str, str]:
+            del raw_text, work_type_hint
+            return {}
+
+        async def synthesize(self, draft, profile, records) -> dict[str, object]:
+            del draft, profile, records
+            return {"summary": "fast", "notes": "", "warnings": [], "acceptedUrls": ["fast-url"]}
+
+    class FakeReasoningClient:
+        minimum_synthesis_timeout_seconds = 18.0
+
+        async def analyze_input(self, raw_text: str, work_type_hint: str) -> dict[str, str]:
+            del raw_text, work_type_hint
+            return {}
+
+        async def synthesize(self, draft, profile, records) -> dict[str, object]:
+            del draft, profile, records
+            raise AssertionError("reasoning client should not be called when fast model is available")
+
+    client = DualModelLlmClient(load_llm_config_from_payload({"enabled": False}, tmp_path))
+    client._fast = FakeFastClient()
+    client._reasoning = FakeReasoningClient()
+
+    payload = asyncio.run(client.synthesize(None, None, []))
+
+    assert payload["acceptedUrls"] == ["fast-url"]
 
 
 class LoopBoundFakeClient:

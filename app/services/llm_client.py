@@ -237,24 +237,37 @@ class OpenAiCompatibleLlmClient:
         return await self._chat_json(messages)
 
     async def _chat_json(self, messages: list[dict[str, str]]) -> dict[str, Any]:
-        response = await self._get_client().post(
-            f"{self._config.base_url}/chat/completions",
-            headers={
-                "content-type": "application/json",
-                "authorization": f"Bearer {self._config.api_key}",
-            },
-            json={
-                "model": self._config.model,
-                "messages": messages,
-                "temperature": 0.1,
-                "max_tokens": 1024 if "reasoner" in self._config.model.lower() else 384,
-                "response_format": {"type": "json_object"},
-            },
-        )
-        response.raise_for_status()
-        payload = response.json()
-        content = str(payload.get("choices", [{}])[0].get("message", {}).get("content", "")).strip()
-        return normalize_llm_payload(parse_json_object(content))
+        request_payload = {
+            "model": self._config.model,
+            "messages": messages,
+            "temperature": 0.1,
+            "max_tokens": 1024 if "reasoner" in self._config.model.lower() else 384,
+            "response_format": {"type": "json_object"},
+        }
+        last_error: Exception | None = None
+        for attempt in range(2):
+            try:
+                response = await self._get_client().post(
+                    f"{self._config.base_url}/chat/completions",
+                    headers={
+                        "content-type": "application/json",
+                        "authorization": f"Bearer {self._config.api_key}",
+                    },
+                    json=request_payload,
+                )
+                response.raise_for_status()
+                payload = response.json()
+                content = str(payload.get("choices", [{}])[0].get("message", {}).get("content", "")).strip()
+                return normalize_llm_payload(parse_json_object(content))
+            except (httpx.TimeoutException, httpx.TransportError) as error:
+                last_error = error
+                self._drop_client_for_current_loop()
+                if attempt == 0:
+                    continue
+                raise
+        if last_error is not None:
+            raise last_error
+        return {}
 
     def _get_client(self) -> httpx.AsyncClient:
         loop = asyncio.get_running_loop()
@@ -264,6 +277,16 @@ class OpenAiCompatibleLlmClient:
                 client = self._client_factory()
                 self._loop_clients[loop] = client
             return client
+
+    def _drop_client_for_current_loop(self) -> None:
+        loop = asyncio.get_running_loop()
+        with self._loop_clients_lock:
+            client = self._loop_clients.pop(loop, None)
+        if client is not None:
+            try:
+                asyncio.create_task(client.aclose())
+            except Exception:
+                pass
 
 
 class DualModelLlmClient:
@@ -301,12 +324,12 @@ class DualModelLlmClient:
         records: list[SourceRecord],
     ) -> dict[str, Any]:
         if self._fast is not None:
-            if self._reasoning is not None and should_use_reasoning(records, draft=draft, profile=profile):
-                try:
+            try:
+                return await self._fast.synthesize(draft, profile, records)
+            except Exception:
+                if self._reasoning is not None:
                     return await self._reasoning.synthesize(draft, profile, records)
-                except Exception:
-                    return await self._fast.synthesize(draft, profile, records)
-            return await self._fast.synthesize(draft, profile, records)
+                raise
         if self._reasoning is not None:
             return await self._reasoning.synthesize(draft, profile, records)
         return {}

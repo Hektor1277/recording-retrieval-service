@@ -65,8 +65,12 @@ async def run_scenario(retriever, scenario) -> dict[str, object]:
             "candidateHit": False,
             "relaxedFinalHit": False,
             "relaxedCandidateHit": False,
+            "versionFinalHit": False,
+            "versionCandidateHit": False,
             "finalMatchType": "none",
             "candidateMatchType": "none",
+            "finalVersionMatchType": "none",
+            "candidateVersionMatchType": "none",
             "strictMissReason": "timeout",
             "warnings": ["scenario timeout after internal 55s / external 70s"],
         }

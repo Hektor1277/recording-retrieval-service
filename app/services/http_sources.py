@@ -11,7 +11,7 @@ import time
 from contextlib import suppress
 from pathlib import Path
 from typing import Any, Protocol
-from urllib.parse import quote_plus, urljoin, urlparse
+from urllib.parse import parse_qs, quote_plus, urljoin, urlparse
 
 import httpx
 
@@ -46,6 +46,13 @@ ENGINE_RESULT_DEPTH = 6
 STREAMING_RESULT_DEPTH = 8
 HYDRATE_DEPTH = 12
 HOST_SEARCH_DEPTH = 5
+BILIBILI_BROWSER_SEARCH_BASE_TIMEOUT = 10.0
+BILIBILI_BROWSER_SEARCH_MAX_TIMEOUT = 14.0
+BILIBILI_HOST_STABILITY_MIN_REQUESTS = 6
+BILIBILI_PRIMARY_QUERY_DEPTH = 3
+BILIBILI_BROWSER_QUERY_DEPTH = 4
+BILIBILI_ENGINE_QUERY_DEPTH = 2
+BILIBILI_SECOND_PASS_QUERY_DEPTH = 2
 
 
 class BrowserFetcher(Protocol):
@@ -227,6 +234,8 @@ class HttpSourceProvider:
         error: str = "",
         cache_hit: bool = False,
         timeout_seconds: float | None = None,
+        details: dict[str, Any] | None = None,
+        track_stats: bool = True,
     ) -> None:
         host = urlparse(url).netloc.lower() or normalize_host(url)
         event = {
@@ -244,6 +253,8 @@ class HttpSourceProvider:
             "resultCount": result_count,
             "timeoutSeconds": timeout_seconds,
         }
+        if details:
+            event.update(details)
         request_events = self._request_access_state.get()
         if request_events is not None:
             request_events.append(event)
@@ -251,6 +262,8 @@ class HttpSourceProvider:
             with self._state_lock:
                 self._access_events.append(event)
 
+        if not track_stats:
+            return
         with self._state_lock:
             stats = self._host_stats.setdefault(
                 host,
@@ -269,6 +282,211 @@ class HttpSourceProvider:
             stats["totalLatencyMs"] += max(0.0, duration_ms)
             stats["totalResults"] += max(0, result_count)
             stats["cacheHits"] += 1 if cache_hit else 0
+
+    def _result_url_sample(self, rows: list[dict[str, Any]], *, limit: int = 3) -> list[str]:
+        sample: list[str] = []
+        for row in rows:
+            if len(sample) >= limit:
+                break
+            url = compact(str(row.get("url") or ""))
+            if url:
+                sample.append(url)
+        return sample
+
+    def _normalized_result_identity(self, url: str, *, bvid: str = "") -> str:
+        normalized_url = compact(url)
+        normalized_bvid = compact(bvid)
+        if normalized_bvid:
+            return f"bilibili:{normalized_bvid.lower()}"
+        if not normalized_url:
+            return ""
+        bilibili_bvid_match = re.search(r"/(BV[0-9A-Za-z]+)/?", normalized_url, re.I)
+        if bilibili_bvid_match:
+            return f"bilibili:{bilibili_bvid_match.group(1).lower()}"
+        bilibili_aid_match = re.search(r"/av(\d+)", normalized_url, re.I)
+        if bilibili_aid_match:
+            return f"bilibili:av{bilibili_aid_match.group(1)}"
+        parsed = urlparse(normalized_url)
+        host = parsed.netloc.lower()
+        if "youtube.com" in host:
+            video_id = parse_qs(parsed.query).get("v", [""])[0]
+            if compact(video_id):
+                return f"youtube:{compact(video_id).lower()}"
+        if "youtu.be" in host:
+            video_id = parsed.path.strip("/")
+            if compact(video_id):
+                return f"youtube:{compact(video_id).lower()}"
+        return normalized_url.rstrip("/").lower()
+
+    def _normalized_url_set(self, values: list[str]) -> set[str]:
+        normalized: set[str] = set()
+        for value in values:
+            identity = self._normalized_result_identity(value)
+            if identity:
+                normalized.add(identity)
+        return normalized
+
+    def _row_identity_set(self, rows: list[dict[str, Any]], *, limit: int = 8) -> set[str]:
+        normalized: set[str] = set()
+        for row in rows[:limit]:
+            identity = self._normalized_result_identity(
+                str(row.get("url") or ""),
+                bvid=str(row.get("bvid") or ""),
+            )
+            if identity:
+                normalized.add(identity)
+        return normalized
+
+    def _row_overlap_count(self, left_rows: list[dict[str, Any]], right_rows: list[dict[str, Any]]) -> int:
+        left = self._row_identity_set(left_rows, limit=8)
+        right = self._row_identity_set(right_rows, limit=8)
+        return len(left & right)
+
+    def _rendered_overlap_count(self, primary_rows: list[dict[str, Any]], rendered_evidence: list[dict[str, Any]]) -> int:
+        left = self._row_identity_set(primary_rows, limit=8)
+        rendered_links: list[str] = []
+        for row in rendered_evidence:
+            rendered_links.extend(str(value) for value in row.get("matchedLinks") or [])
+        right = self._normalized_url_set(rendered_links[:8])
+        return len(left & right)
+
+    def _record_search_anomaly(
+        self,
+        *,
+        url: str,
+        source_label: str,
+        strategy: str,
+        anomaly_type: str,
+        primary_rows: list[dict[str, Any]],
+        engine_rows: list[dict[str, Any]] | None = None,
+        browser_rows: list[dict[str, Any]] | None = None,
+        selected_queries: list[str] | None = None,
+        selected_browser_queries: list[str] | None = None,
+        rendered_evidence: list[dict[str, Any]] | None = None,
+        extra_details: dict[str, Any] | None = None,
+    ) -> None:
+        details = {
+            "strategy": strategy,
+            "anomalyType": anomaly_type,
+            "primaryResultCount": len(primary_rows),
+            "primaryTopUrls": self._result_url_sample(primary_rows),
+            "engineResultCount": len(engine_rows or []),
+            "engineTopUrls": self._result_url_sample(engine_rows or []),
+        }
+        if browser_rows is not None:
+            details["browserResultCount"] = len(browser_rows)
+            details["browserTopUrls"] = self._result_url_sample(browser_rows)
+            details["apiResultCount"] = len(primary_rows)
+            details["apiTopUrls"] = self._result_url_sample(primary_rows)
+        if selected_queries:
+            details["selectedQueries"] = list(selected_queries)
+        if selected_browser_queries:
+            details["selectedBrowserQueries"] = list(selected_browser_queries)
+        if rendered_evidence:
+            details["renderedEvidence"] = rendered_evidence
+            details["renderedEvidenceCount"] = len(rendered_evidence)
+        if extra_details:
+            details.update(extra_details)
+        self._record_access_event(
+            url=url,
+            operation="search-anomaly",
+            ok=True,
+            duration_ms=0.0,
+            source_kind="streaming",
+            source_label=source_label,
+            query=" || ".join(selected_queries or selected_browser_queries or []),
+            details=details,
+            track_stats=False,
+        )
+
+    async def _capture_rendered_search_evidence(
+        self,
+        *,
+        queries: list[str],
+        url_builders: list,
+        url_patterns: list[str],
+        source_label: str,
+        max_queries: int = 2,
+    ) -> list[dict[str, Any]]:
+        fetch_search_evidence = getattr(self._browser_fetcher, "fetch_search_evidence", None)
+        if not callable(fetch_search_evidence):
+            return []
+        evidence_rows: list[dict[str, Any]] = []
+        for query in dedupe_text([compact(value) for value in queries if compact(value)])[:max_queries]:
+            for build_url in url_builders[:2]:
+                search_url = build_url(query)
+                started = time.perf_counter()
+                try:
+                    payload = await fetch_search_evidence(
+                        search_url,
+                        url_patterns=url_patterns,
+                        timeout_seconds=min(
+                            4.0,
+                            self._recommended_timeout_seconds(urlparse(search_url).netloc.lower(), 4.0),
+                        ),
+                        capture_screenshot=True,
+                    )
+                except (AttributeError, BrowserFetchUnavailable, RuntimeError, TimeoutError) as error:
+                    self._warn(f"{source_label} 渲染证据抓取失败: {error}")
+                    self._record_access_event(
+                        url=search_url,
+                        operation="browser-search-evidence",
+                        ok=False,
+                        duration_ms=(time.perf_counter() - started) * 1000,
+                        source_kind="streaming",
+                        source_label=f"{source_label} Browser Evidence",
+                        query=query,
+                        error=str(error),
+                        track_stats=False,
+                    )
+                    continue
+                normalized = {
+                    "query": query,
+                    "url": search_url,
+                    "title": compact(str(payload.get("title") or "")),
+                    "matchedLinks": [
+                        compact(str(value))
+                        for value in payload.get("matchedLinks") or []
+                        if compact(str(value))
+                    ],
+                    "matchedLinkCount": int(payload.get("matchedLinkCount", 0) or 0),
+                    "anchorCount": int(payload.get("anchorCount", 0) or 0),
+                    "resultCardCount": int(payload.get("resultCardCount", 0) or 0),
+                    "extractionMode": compact(str(payload.get("extractionMode") or "")),
+                    "htmlLength": int(payload.get("htmlLength", 0) or 0),
+                    "bodyTextSample": compact(str(payload.get("bodyTextSample") or "")),
+                    "screenshotPath": compact(str(payload.get("screenshotPath") or "")),
+                }
+                self._record_access_event(
+                    url=search_url,
+                    operation="browser-search-evidence",
+                    ok=True,
+                    duration_ms=(time.perf_counter() - started) * 1000,
+                    source_kind="streaming",
+                    source_label=f"{source_label} Browser Evidence",
+                    query=query,
+                    result_count=normalized["matchedLinkCount"],
+                    details={
+                        "anchorCount": normalized["anchorCount"],
+                        "resultCardCount": normalized["resultCardCount"],
+                        "extractionMode": normalized["extractionMode"],
+                        "htmlLength": normalized["htmlLength"],
+                        "captureMode": "rendered-search-page",
+                        "hasScreenshot": bool(normalized["screenshotPath"]),
+                    },
+                    track_stats=False,
+                )
+                if any(
+                    [
+                        normalized["matchedLinks"],
+                        normalized["title"],
+                        normalized["bodyTextSample"],
+                        normalized["screenshotPath"],
+                    ]
+                ):
+                    evidence_rows.append(normalized)
+                    break
+        return evidence_rows
 
     def _host_health_status(self, host: str) -> str:
         with self._state_lock:
@@ -304,6 +522,8 @@ class HttpSourceProvider:
         failures = float(stats.get("failures", 0.0))
         avg_results = float(stats.get("totalResults", 0.0)) / requests if requests else 0.0
         depth = base_depth
+        if host == "search.bilibili.com" and requests < BILIBILI_HOST_STABILITY_MIN_REQUESTS:
+            return max(2, min(10, depth))
         if requests >= 2 and failures / requests >= 0.4:
             depth -= 2
         elif requests >= 2 and failures == 0 and avg_results >= 2.0:
@@ -329,11 +549,19 @@ class HttpSourceProvider:
         requests = int(stats.get("requests", 0.0))
         successes = int(stats.get("successes", 0.0))
         failures = int(stats.get("failures", 0.0))
+        if is_bilibili_host(host):
+            min_requests = max(min_requests, BILIBILI_HOST_STABILITY_MIN_REQUESTS)
         if requests < min_requests:
             return False
         if successes == 0 and failures >= min_requests:
             return True
         return failures / max(1, requests) >= 0.85
+
+    def _browser_search_timeout_seconds(self, host: str) -> float:
+        if host == "search.bilibili.com":
+            recommended = self._recommended_timeout_seconds(host, BILIBILI_BROWSER_SEARCH_BASE_TIMEOUT)
+            return round(min(BILIBILI_BROWSER_SEARCH_MAX_TIMEOUT, max(BILIBILI_BROWSER_SEARCH_BASE_TIMEOUT, recommended)), 1)
+        return min(4.0, self._recommended_timeout_seconds(host, 4.0))
 
     def _get_http_client(self) -> httpx.AsyncClient:
         client = self._client
@@ -426,7 +654,9 @@ class HttpSourceProvider:
         self._reset_warnings()
         self._thread_local.current_draft = draft
         profiles = self._profile_loader.load(category=profile.category, tags=profile.tags)
-        streaming_hosts = sorted(profiles.streaming[:HOST_SEARCH_DEPTH], key=lambda host: streaming_host_priority(host.url))
+        streaming_hosts = dedupe_streaming_hosts_for_execution(
+            sorted(profiles.streaming[:HOST_SEARCH_DEPTH], key=lambda host: streaming_host_priority(host.url))
+        )
 
         async def run_host(host: SourceProfileEntry) -> tuple[SourceProfileEntry, list[dict[str, str]]]:
             normalized_host = normalize_host(host.url)
@@ -453,12 +683,15 @@ class HttpSourceProvider:
 
         primary_hosts = [host for host in streaming_hosts if streaming_host_priority(host.url)[0] == 0]
         auxiliary_hosts = [host for host in streaming_hosts if streaming_host_priority(host.url)[0] != 0]
+        apple_auxiliary_hosts = [host for host in auxiliary_hosts if "apple.com" in normalize_host(host.url)]
 
         primary_results = await asyncio.gather(*(run_host(host) for host in primary_hosts), return_exceptions=False)
         host_results = list(primary_results)
+        auxiliary_executed = False
         if should_search_auxiliary_streaming_hosts(primary_results):
             auxiliary_results = await asyncio.gather(*(run_host(host) for host in auxiliary_hosts), return_exceptions=False)
             host_results.extend(auxiliary_results)
+            auxiliary_executed = True
 
         rows = merge_streaming_host_rows(host_results)
         initial_depth = HYDRATE_DEPTH
@@ -469,6 +702,26 @@ class HttpSourceProvider:
             float(row.get("same_recording_score", 0.0) or 0.0) >= LOW_CONFIDENCE_THRESHOLD for row in hydrated_rows
         ):
             extended_depth = min(len(rows), initial_depth + 6)
+            hydrated_rows = await self._hydrate_results(draft, rows[:extended_depth], "streaming")
+        if apple_auxiliary_hosts and not auxiliary_executed and should_probe_apple_auxiliary_hosts(hydrated_rows):
+            self._record_access_event(
+                url="https://music.apple.com/search",
+                operation="search-strategy",
+                ok=True,
+                duration_ms=0.0,
+                source_kind="streaming",
+                source_label="Apple Music Search",
+                details={
+                    "strategy": "apple-auxiliary-probe",
+                    "reason": "primary_results_lack_platform_diversity",
+                    "selectedHosts": [host.url for host in apple_auxiliary_hosts],
+                },
+                track_stats=False,
+            )
+            apple_results = await asyncio.gather(*(run_host(host) for host in apple_auxiliary_hosts), return_exceptions=False)
+            host_results.extend(apple_results)
+            rows = merge_streaming_host_rows(host_results)
+            extended_depth = min(len(rows), max(initial_depth, HYDRATE_DEPTH + 2))
             hydrated_rows = await self._hydrate_results(draft, rows[:extended_depth], "streaming")
         return hydrated_rows
 
@@ -487,13 +740,14 @@ class HttpSourceProvider:
 
     async def search_fallback(self, draft: DraftRecordingEntry, profile: RetrievalProfile) -> list[dict[str, Any]]:
         self._reset_warnings()
+        fallback_queries = ensure_catalogue_hints(profile.queries, draft=draft)
         tasks = [
             self._search_query_via_engines(
                 query=query,
                 source_label="Web Search",
                 source_kind="search",
             )
-            for query in profile.queries[:HOST_QUERY_DEPTH]
+            for query in fallback_queries[:HOST_QUERY_DEPTH]
         ]
         rows: list[dict[str, str]] = []
         for group in await asyncio.gather(*tasks, return_exceptions=False):
@@ -608,41 +862,144 @@ class HttpSourceProvider:
 
     async def _search_youtube(self, queries: list[str]) -> list[dict[str, str]]:
         html_query_depth = min(len(queries), self._recommended_query_depth("www.youtube.com", HOST_QUERY_DEPTH) + 1)
+        builders = [
+            lambda query: f"https://www.youtube.com/results?search_query={quote_plus(query)}",
+            lambda query: f"https://www.youtube.com/results?sp=EgIQAQ%253D%253D&search_query={quote_plus(query)}",
+        ]
+        strategy_label = (
+            "youtube-api-first"
+            if self._can_use_youtube_api() and not self._is_platform_api_disabled("YouTube API Search")
+            else "youtube-html-fallback"
+        )
+        self._record_access_event(
+            url="https://www.youtube.com/results",
+            operation="search-strategy",
+            ok=True,
+            duration_ms=0.0,
+            source_kind="streaming",
+            source_label="YouTube Search",
+            query=" || ".join(queries[:html_query_depth]),
+            details={
+                "strategy": strategy_label,
+                "htmlQueryDepth": html_query_depth,
+                "selectedQueries": list(queries[:html_query_depth]),
+            },
+            track_stats=False,
+        )
         rows = await self._search_streaming_platform(
             queries=queries[:html_query_depth],
-            url_builders=[
-                lambda query: f"https://www.youtube.com/results?search_query={quote_plus(query)}",
-                lambda query: f"https://www.youtube.com/results?sp=EgIQAQ%253D%253D&search_query={quote_plus(query)}",
-            ],
+            url_builders=builders,
             parser=extract_youtube_result_links,
             source_label="YouTube Search",
             api_search=self._run_youtube_api_search if self._can_use_youtube_api() else None,
             api_source_label="YouTube API Search",
         )
         if self._can_use_youtube_api() and not self._is_platform_api_disabled("YouTube API Search"):
+            self._record_access_event(
+                url="https://www.youtube.com/results",
+                operation="search-layer-summary",
+                ok=True,
+                duration_ms=0.0,
+                source_kind="streaming",
+                source_label="YouTube Search",
+                details={
+                    "strategy": strategy_label,
+                    "primaryResultCount": len(rows),
+                    "engineResultCount": 0,
+                },
+                track_stats=False,
+            )
             return rows
         engine_rows = await self._search_platform_via_site_engines(
             queries[: max(4, html_query_depth)],
             site_hosts=["www.youtube.com", "youtu.be"],
             source_label="YouTube Search",
         )
+        self._record_access_event(
+            url="https://www.youtube.com/results",
+            operation="search-layer-summary",
+            ok=True,
+            duration_ms=0.0,
+            source_kind="streaming",
+            source_label="YouTube Search",
+            details={
+                "strategy": strategy_label,
+                "primaryResultCount": len(rows),
+                "engineResultCount": len(engine_rows),
+            },
+            track_stats=False,
+        )
+        if rows and engine_rows and self._row_overlap_count(rows, engine_rows) == 0:
+            rendered_evidence = await self._capture_rendered_search_evidence(
+                queries=list(queries[: max(4, html_query_depth)]),
+                url_builders=builders,
+                url_patterns=[r"https://www\.youtube\.com/watch\?v=[0-9A-Za-z_-]+"],
+                source_label="YouTube Search",
+                max_queries=1,
+            )
+            rendered_primary_overlap = self._rendered_overlap_count(rows, rendered_evidence)
+            rendered_engine_overlap = self._rendered_overlap_count(engine_rows, rendered_evidence)
+            if rendered_evidence and rendered_primary_overlap == 0 and rendered_engine_overlap > 0:
+                self._record_search_anomaly(
+                    url="https://www.youtube.com/results",
+                    source_label="YouTube Search",
+                    strategy=strategy_label,
+                    anomaly_type="parser_mismatch",
+                    primary_rows=rows,
+                    engine_rows=engine_rows,
+                    selected_queries=list(queries[: max(4, html_query_depth)]),
+                    rendered_evidence=rendered_evidence,
+                    extra_details={
+                        "overlapCount": rendered_primary_overlap,
+                        "alternateOverlapCount": rendered_engine_overlap,
+                    },
+                )
+        if engine_rows and not rows:
+            rendered_evidence = await self._capture_rendered_search_evidence(
+                queries=list(queries[: max(4, html_query_depth)]),
+                url_builders=builders,
+                url_patterns=[r"https://www\.youtube\.com/watch\?v=[0-9A-Za-z_-]+"],
+                source_label="YouTube Search",
+            )
+            self._record_search_anomaly(
+                url="https://www.youtube.com/results",
+                source_label="YouTube Search",
+                strategy=strategy_label,
+                anomaly_type="engine_only_recovery",
+                primary_rows=rows,
+                engine_rows=engine_rows,
+                selected_queries=list(queries[: max(4, html_query_depth)]),
+                rendered_evidence=rendered_evidence,
+            )
         return dedupe_rows([*rows, *engine_rows])[:HYDRATE_DEPTH]
 
     async def _search_bilibili(self, queries: list[str]) -> list[dict[str, str]]:
         prioritized_queries = queries
-        html_query_depth = min(len(prioritized_queries), self._recommended_query_depth("search.bilibili.com", HOST_QUERY_DEPTH) + 1)
+        html_query_depth = min(
+            len(prioritized_queries),
+            min(BILIBILI_PRIMARY_QUERY_DEPTH, self._recommended_query_depth("search.bilibili.com", HOST_QUERY_DEPTH) + 1),
+        )
         builders = [
             lambda query: f"https://search.bilibili.com/all?keyword={quote_plus(query)}",
             lambda query: f"https://search.bilibili.com/video?keyword={quote_plus(query)}",
         ]
-        browser_queries = select_bilibili_browser_queries(prioritized_queries)
-        rows = await self._search_streaming_platform(
-            queries=prioritized_queries[:html_query_depth],
-            url_builders=builders,
-            parser=extract_bilibili_result_links,
+        browser_queries = prepare_bilibili_browser_queries(prioritized_queries, max_queries=BILIBILI_BROWSER_QUERY_DEPTH)
+        self._record_access_event(
+            url="https://search.bilibili.com/video",
+            operation="search-strategy",
+            ok=True,
+            duration_ms=0.0,
+            source_kind="streaming",
             source_label="Bilibili Search",
-            api_search=self._run_bilibili_api_search if self._can_use_bilibili_api() else None,
-            api_source_label="Bilibili API Search",
+            query=" || ".join(prioritized_queries[:html_query_depth]),
+            details={
+                "strategy": "bilibili-mixed",
+                "htmlQueryDepth": html_query_depth,
+                "selectedQueries": list(prioritized_queries[:html_query_depth]),
+                "selectedBrowserQueries": list(browser_queries),
+                "selectedBrowserQueryCount": len(browser_queries),
+            },
+            track_stats=False,
         )
         browser_rows = await self._search_platform_via_browser_pages(
             queries=browser_queries,
@@ -650,12 +1007,168 @@ class HttpSourceProvider:
             source_label="Bilibili Search",
             url_patterns=[r"https://www\.bilibili\.com/video/(?:BV[0-9A-Za-z]+|av\d+)/?"],
         )
-        engine_rows = await self._search_platform_via_site_engines(
-            prioritized_queries[: max(4, html_query_depth)],
-            site_hosts=["www.bilibili.com", "m.bilibili.com", "b23.tv"],
+        primary_queries = prioritized_queries[:html_query_depth]
+        if browser_rows:
+            # When browser search already finds hits, probe the most focused browser query once via
+            # the primary/API path so anomaly reporting compares like-for-like queries and we can
+            # still merge any complementary API results into the final candidate pool.
+            primary_queries = dedupe_text([*browser_queries[:1], *prioritized_queries[:1]])[:1]
+        rows: list[dict[str, str]] = []
+        if primary_queries:
+            rows = await self._search_streaming_platform(
+                queries=primary_queries,
+                url_builders=builders,
+                parser=extract_bilibili_result_links,
+                source_label="Bilibili Search",
+                api_search=self._run_bilibili_api_search if self._can_use_bilibili_api() else None,
+                api_source_label="Bilibili API Search",
+            )
+        if not rows and not browser_rows:
+            remaining_queries = [
+                query
+                for query in prioritized_queries
+                if query not in primary_queries and query not in browser_queries
+            ]
+            second_pass_primary_queries = remaining_queries[:BILIBILI_SECOND_PASS_QUERY_DEPTH]
+            second_pass_browser_queries = prepare_bilibili_browser_queries(
+                remaining_queries,
+                max_queries=min(BILIBILI_SECOND_PASS_QUERY_DEPTH, BILIBILI_BROWSER_QUERY_DEPTH),
+            )
+            if second_pass_browser_queries or second_pass_primary_queries:
+                self._record_access_event(
+                    url="https://search.bilibili.com/video",
+                    operation="search-strategy",
+                    ok=True,
+                    duration_ms=0.0,
+                    source_kind="streaming",
+                    source_label="Bilibili Search",
+                    query=" || ".join(remaining_queries[:BILIBILI_SECOND_PASS_QUERY_DEPTH]),
+                    details={
+                        "strategy": "bilibili-second-pass",
+                        "htmlQueryDepth": len(second_pass_primary_queries),
+                        "selectedQueries": list(second_pass_primary_queries),
+                        "selectedBrowserQueries": list(second_pass_browser_queries),
+                        "selectedBrowserQueryCount": len(second_pass_browser_queries),
+                    },
+                    track_stats=False,
+                )
+                if second_pass_browser_queries:
+                    browser_rows = await self._search_platform_via_browser_pages(
+                        queries=second_pass_browser_queries,
+                        url_builders=builders,
+                        source_label="Bilibili Search",
+                        url_patterns=[r"https://www\.bilibili\.com/video/(?:BV[0-9A-Za-z]+|av\d+)/?"],
+                    )
+                if second_pass_primary_queries and not rows:
+                    rows = await self._search_streaming_platform(
+                        queries=second_pass_primary_queries,
+                        url_builders=builders,
+                        parser=extract_bilibili_result_links,
+                        source_label="Bilibili Search",
+                        api_search=self._run_bilibili_api_search if self._can_use_bilibili_api() else None,
+                        api_source_label="Bilibili API Search",
+                    )
+        engine_rows: list[dict[str, str]] = []
+        if not rows and not browser_rows:
+            engine_rows = await self._search_platform_via_site_engines(
+                prioritized_queries[:BILIBILI_ENGINE_QUERY_DEPTH],
+                site_hosts=["www.bilibili.com", "m.bilibili.com", "b23.tv"],
+                source_label="Bilibili Search",
+            )
+        self._record_access_event(
+            url="https://search.bilibili.com/video",
+            operation="search-layer-summary",
+            ok=True,
+            duration_ms=0.0,
+            source_kind="streaming",
             source_label="Bilibili Search",
+            details={
+                "strategy": "bilibili-mixed",
+                "apiResultCount": len(rows),
+                "browserResultCount": len(browser_rows),
+                "engineResultCount": len(engine_rows),
+                "primaryExecuted": bool(primary_queries),
+                "executedPrimaryQueries": list(primary_queries),
+            },
+            track_stats=False,
         )
-        return merge_bilibili_search_rows(rows, browser_rows, engine_rows)
+        parser_mismatch = False
+        if rows and browser_rows and self._row_overlap_count(rows, browser_rows) == 0:
+            rendered_evidence = await self._capture_rendered_search_evidence(
+                queries=list(browser_queries),
+                url_builders=builders,
+                url_patterns=[r"https://www\.bilibili\.com/video/(?:BV[0-9A-Za-z]+|av\d+)/?"],
+                source_label="Bilibili Search",
+                max_queries=1,
+            )
+            rendered_primary_overlap = self._rendered_overlap_count(rows, rendered_evidence)
+            rendered_browser_overlap = self._rendered_overlap_count(browser_rows, rendered_evidence)
+            if rendered_evidence and rendered_primary_overlap == 0 and rendered_browser_overlap > 0:
+                parser_mismatch = True
+                self._record_search_anomaly(
+                    url="https://search.bilibili.com/video",
+                    source_label="Bilibili Search",
+                    strategy="bilibili-mixed",
+                    anomaly_type="parser_mismatch",
+                    primary_rows=rows,
+                    browser_rows=browser_rows,
+                    engine_rows=engine_rows,
+                    selected_queries=list(prioritized_queries[:html_query_depth]),
+                    selected_browser_queries=list(browser_queries),
+                    rendered_evidence=rendered_evidence,
+                    extra_details={
+                        "overlapCount": rendered_primary_overlap,
+                        "alternateOverlapCount": rendered_browser_overlap,
+                    },
+                )
+        if browser_rows and not rows:
+            rendered_evidence = await self._capture_rendered_search_evidence(
+                queries=list(browser_queries),
+                url_builders=builders,
+                url_patterns=[r"https://www\.bilibili\.com/video/(?:BV[0-9A-Za-z]+|av\d+)/?"],
+                source_label="Bilibili Search",
+            )
+            self._record_search_anomaly(
+                url="https://search.bilibili.com/video",
+                source_label="Bilibili Search",
+                strategy="bilibili-mixed",
+                anomaly_type="browser_outperformed_primary",
+                primary_rows=rows,
+                browser_rows=browser_rows,
+                engine_rows=engine_rows,
+                selected_queries=list(prioritized_queries[:html_query_depth]),
+                selected_browser_queries=list(browser_queries),
+                rendered_evidence=rendered_evidence,
+                extra_details={
+                    "primaryExecuted": bool(primary_queries),
+                    "executedPrimaryQueries": list(primary_queries),
+                },
+            )
+        elif engine_rows and not rows and not browser_rows:
+            rendered_evidence = await self._capture_rendered_search_evidence(
+                queries=list(browser_queries or prioritized_queries[:html_query_depth]),
+                url_builders=builders,
+                url_patterns=[r"https://www\.bilibili\.com/video/(?:BV[0-9A-Za-z]+|av\d+)/?"],
+                source_label="Bilibili Search",
+            )
+            self._record_search_anomaly(
+                url="https://search.bilibili.com/video",
+                source_label="Bilibili Search",
+                strategy="bilibili-mixed",
+                anomaly_type="engine_only_recovery",
+                primary_rows=rows,
+                browser_rows=browser_rows,
+                engine_rows=engine_rows,
+                selected_queries=list(prioritized_queries[:html_query_depth]),
+                selected_browser_queries=list(browser_queries),
+                rendered_evidence=rendered_evidence,
+            )
+        return merge_bilibili_search_rows(
+            rows,
+            browser_rows,
+            engine_rows,
+            parser_mismatch=parser_mismatch,
+        )
 
     async def _search_apple_music(self, queries: list[str]) -> list[dict[str, str]]:
         rows = await self._search_streaming_platform(
@@ -734,6 +1247,27 @@ class HttpSourceProvider:
                         result_count=len(api_result.links[:result_depth]),
                     )
                     if api_result.links:
+                        if api_result.rows:
+                            rows: list[dict[str, Any]] = []
+                            for item in api_result.rows[:result_depth]:
+                                url = compact(item.get("url"))
+                                if not url:
+                                    continue
+                                rows.append(
+                                    {
+                                        "url": url,
+                                        "source_label": api_source_label or source_label,
+                                        "source_kind": "streaming",
+                                        "title": compact(item.get("title")),
+                                        "description": compact(item.get("description")),
+                                        "uploader": compact(item.get("uploader")),
+                                        "duration_seconds": int(item.get("duration_seconds") or 0),
+                                        "view_count": int(item.get("view_count") or 0),
+                                        "bvid": compact(item.get("bvid")),
+                                    }
+                                )
+                            if rows:
+                                return rows
                         return [
                             {
                                 "url": link,
@@ -792,7 +1326,13 @@ class HttpSourceProvider:
                 if links or len(rows) >= result_depth:
                     break
             return rows[:result_depth]
-        groups = await asyncio.gather(*(run_query(query) for query in queries[:query_depth]), return_exceptions=False)
+        selected_queries = list(queries[:query_depth])
+        if api_search is not None:
+            groups: list[list[dict[str, str]]] = []
+            for query in selected_queries:
+                groups.append(await run_query(query))
+        else:
+            groups = await asyncio.gather(*(run_query(query) for query in selected_queries), return_exceptions=False)
         if should_merge_streaming_query_coverage(source_label):
             return merge_streaming_query_groups(groups, limit=HYDRATE_DEPTH)
         rows: list[dict[str, str]] = []
@@ -869,19 +1409,18 @@ class HttpSourceProvider:
         result_depth = min(HYDRATE_DEPTH, self._recommended_result_depth(host, STREAMING_RESULT_DEPTH) + 2)
         if bilibili_search:
             query_rows_list: list[list[dict[str, str]]] = []
+            query_row_queries: list[str] = []
+            browser_url_builders = list(url_builders[:2] or url_builders[:1])
             for query in queries[:query_depth]:
                 query_rows: list[dict[str, str]] = []
-                for build_url in url_builders[:2]:
+                for build_url in browser_url_builders:
                     search_url = build_url(query)
                     started = time.perf_counter()
                     try:
                         links = await self._browser_fetcher.fetch_links(
                             search_url,
                             url_patterns=url_patterns,
-                            timeout_seconds=min(
-                                4.0,
-                                self._recommended_timeout_seconds(urlparse(search_url).netloc.lower(), 4.0),
-                            ),
+                            timeout_seconds=self._browser_search_timeout_seconds(urlparse(search_url).netloc.lower()),
                         )
                     except (AttributeError, BrowserFetchUnavailable, RuntimeError, TimeoutError) as error:
                         self._warn(f"{source_label} 浏览器搜索回退失败: {error}")
@@ -919,7 +1458,12 @@ class HttpSourceProvider:
                         break
                 if query_rows:
                     query_rows_list.append(query_rows[:result_depth])
-            return merge_bilibili_browser_query_rows(query_rows_list, result_depth=result_depth)
+                    query_row_queries.append(query)
+            return merge_bilibili_browser_query_rows(
+                query_rows_list,
+                queries=query_row_queries,
+                result_depth=result_depth,
+            )
 
         for query in queries[:query_depth]:
             builders_to_use = url_builders[:1]
@@ -930,10 +1474,7 @@ class HttpSourceProvider:
                     links = await self._browser_fetcher.fetch_links(
                         search_url,
                         url_patterns=url_patterns,
-                        timeout_seconds=min(
-                            4.0,
-                            self._recommended_timeout_seconds(urlparse(search_url).netloc.lower(), 4.0),
-                        ),
+                        timeout_seconds=self._browser_search_timeout_seconds(urlparse(search_url).netloc.lower()),
                     )
                 except (AttributeError, BrowserFetchUnavailable, RuntimeError, TimeoutError) as error:
                     self._warn(f"{source_label} 浏览器搜索回退失败：{error}")
@@ -997,7 +1538,14 @@ class HttpSourceProvider:
     ) -> list[dict[str, Any]]:
         semaphore = asyncio.Semaphore(4)
         tasks = [
-            self._fetch_page_record(item["url"], item["source_label"], source_kind, draft, semaphore)
+            self._fetch_page_record(
+                item["url"],
+                item["source_label"],
+                source_kind,
+                draft,
+                semaphore,
+                seed_data=item,
+            )
             for item in dedupe_rows(rows)
         ]
         return [item for item in await asyncio.gather(*tasks, return_exceptions=False) if item]
@@ -1012,7 +1560,9 @@ class HttpSourceProvider:
             dedupe_text([*draft.query_lead_names_latin, *draft.query_lead_names]),
             prefer_latin=True,
         )
-        latin_leads = dedupe_text([*[value for value in latin_lead_pool if looks_latin(value)], *latin_lead_pool])
+        latin_leads = prioritize_person_query_terms(
+            [*[value for value in latin_lead_pool if looks_latin(value)], *latin_lead_pool]
+        )
         latin_ensembles = self._expand_ensemble_terms(
             draft.ensemble_names_latin or [value for value in draft.ensemble_names if looks_latin(value)],
             prefer_full_names=not host.is_chinese,
@@ -1035,10 +1585,36 @@ class HttpSourceProvider:
             latin_queries = profile.latin_queries or profile.queries
 
         if host.is_chinese:
+            bilingual_primary_terms = prioritize_person_query_terms(
+                draft.primary_names_latin or [value for value in latin_leads if looks_latin(value)]
+            )
+            decade_rescue_queries = build_chinese_host_decade_rescue_queries(draft)
+            generic_bundle_rescue_queries = select_generic_plural_bundle_rescue_queries(
+                decade_rescue_queries,
+                draft=draft,
+            )
+            primary_work_rescue_queries = build_chinese_host_primary_work_rescue_queries(draft)
+            primary_year_anchor_queries = build_chinese_host_primary_year_anchor_queries(draft)
+            cjk_context_rescue_queries = build_chinese_host_cjk_context_rescue_queries(
+                draft,
+                ensemble_terms=dedupe_text([*zh_ensembles, *latin_ensembles]),
+            )
+            bundle_context_queries = build_chinese_host_bundle_context_queries(
+                draft,
+                ensemble_terms=dedupe_text([*latin_ensembles, *zh_ensembles]),
+            )
             primary_only_queries = self._primary_only_queries_for_host(
                 draft,
                 host,
                 composer_query=compact(draft.composer_name),
+            )
+            bilingual_primary_queries = build_queries(
+                work_query=build_work_query(draft, prefer_latin=False),
+                composer_query=compact(draft.composer_name),
+                lead_terms=bilingual_primary_terms[:2],
+                ensemble_terms=dedupe_text([*zh_ensembles, *latin_ensembles]),
+                title=draft.title,
+                performance_date_text=draft.performance_date_text,
             )
             zh_queries = build_queries(
                 work_query=build_work_query(draft, prefer_latin=False),
@@ -1062,9 +1638,23 @@ class HttpSourceProvider:
                 lead_terms=dedupe_text([*zh_leads, *latin_leads]),
                 ensemble_terms=dedupe_text([*zh_ensembles, *latin_ensembles]),
             )
+            bilingual_alias_queries = self._alias_queries_for_host(
+                draft,
+                host,
+                lead_terms=latin_leads,
+                ensemble_terms=dedupe_text([*zh_ensembles, *latin_ensembles]),
+            )
             generated_queries = prioritize_platform_queries(
                 [
-                    *primary_only_queries[:4],
+                    *cjk_context_rescue_queries[:1],
+                    *bundle_context_queries[:1],
+                    *decade_rescue_queries[:2],
+                    *generic_bundle_rescue_queries[:1],
+                    *primary_work_rescue_queries[:2],
+                    *primary_year_anchor_queries[:1],
+                    *primary_only_queries[:3],
+                    *bilingual_primary_queries[:3],
+                    *bilingual_alias_queries[:3],
                     *zh_queries[:3],
                     *latin_queries[:3],
                     *profile.mixed_queries[:1],
@@ -1074,19 +1664,103 @@ class HttpSourceProvider:
                 draft=draft,
                 prefer_cjk=True,
             )
-            return dedupe_text([
-                *primary_only_queries[:4],
-                *alias_queries[:1],
+            final_queries = ensure_catalogue_hints([
                 *profile.zh_queries[:2],
-                *profile.latin_queries[:2],
+                *cjk_context_rescue_queries[:1],
+                *decade_rescue_queries[:2],
+                *generic_bundle_rescue_queries[:1],
+                *bundle_context_queries[:1],
+                *primary_work_rescue_queries[:2],
+                *primary_year_anchor_queries[:1],
+                *primary_only_queries[:3],
+                *bilingual_primary_queries[:1],
+                *bilingual_alias_queries[:1],
+                *alias_queries[:1],
+                *profile.latin_queries[:1],
                 *generated_queries,
-            ])[:8]
+            ], draft=draft)
+            anchor_pool = dedupe_text([
+                *profile.zh_queries[:2],
+                *profile.queries[:3],
+                *profile.latin_queries[:3],
+                *profile.mixed_queries[:2],
+                *zh_queries[:3],
+                *primary_only_queries[:3],
+                *primary_year_anchor_queries[:1],
+                *bilingual_primary_queries[:3],
+                *bilingual_alias_queries[:2],
+                *alias_queries[:2],
+                *decade_rescue_queries[:2],
+                *primary_work_rescue_queries[:2],
+                *generated_queries,
+            ])
+            anchor_candidates = [
+                query for query in primary_year_anchor_queries if bilibili_query_is_primary_year_anchor(query)
+            ]
+            if not anchor_candidates:
+                anchor_candidates = [query for query in anchor_pool if bilibili_query_is_primary_year_anchor(query)]
+            if anchor_candidates:
+                anchor_query = min(
+                    anchor_candidates,
+                    key=lambda query: (0 if contains_cjk(query) else 1, len(compact(query)), query),
+                )
+                if anchor_query not in final_queries[:10]:
+                    if len(final_queries) >= 10:
+                        replace_window = min(len(final_queries), 10)
+                        replace_index = next(
+                            (
+                                index
+                                for index in range(replace_window - 1, -1, -1)
+                                if not bilibili_query_is_primary_work_rescue(final_queries[index])
+                                and not bilibili_query_has_collaboration_signal(final_queries[index])
+                            ),
+                            replace_window - 1,
+                        )
+                        final_queries[replace_index] = anchor_query
+                    else:
+                        final_queries.append(anchor_query)
+                    final_queries = dedupe_text(final_queries)
+            has_explicit_year_context = bool(
+                re.search(r"\b(?:18|19|20)\d{2}\b", compact(draft.performance_date_text).lower())
+            )
+            exact_collaboration_candidates = [
+                query
+                for query in dedupe_text([
+                    *latin_queries[:20],
+                    *profile.latin_queries[:20],
+                    *profile.queries[:20],
+                    *generated_queries,
+                ])
+                if bilibili_query_is_exact_collaboration_anchor(query)
+            ]
+            if exact_collaboration_candidates and not has_explicit_year_context:
+                exact_collaboration_query = exact_collaboration_candidates[0]
+                if exact_collaboration_query not in final_queries[:10]:
+                    if len(final_queries) >= 10:
+                        replace_window = min(len(final_queries), 10)
+                        replace_index = next(
+                            (
+                                index
+                                for index in range(replace_window - 1, -1, -1)
+                                if not bilibili_query_is_primary_work_rescue(final_queries[index])
+                                and not bilibili_query_is_primary_year_anchor(final_queries[index])
+                                and not bilibili_query_is_exact_collaboration_anchor(final_queries[index])
+                                and not bilibili_query_has_collaboration_signal(final_queries[index])
+                            ),
+                            replace_window - 1,
+                        )
+                        final_queries[replace_index] = exact_collaboration_query
+                    else:
+                        final_queries.append(exact_collaboration_query)
+                    final_queries = dedupe_text(final_queries)
+            return final_queries[:10]
 
         primary_only_queries = self._primary_only_queries_for_host(
             draft,
             host,
             composer_query=compact(draft.composer_name_latin),
         )
+        collaboration_rescue_queries = build_collaboration_surname_rescue_queries(draft)
         alias_queries = self._alias_queries_for_host(
             draft,
             host,
@@ -1095,6 +1769,7 @@ class HttpSourceProvider:
         )
         generated_queries = prioritize_platform_queries(
             [
+                *collaboration_rescue_queries[:3],
                 *primary_only_queries[:4],
                 *alias_queries[:4],
                 *latin_queries[:4],
@@ -1102,13 +1777,14 @@ class HttpSourceProvider:
             draft=draft,
             prefer_cjk=False,
         )
-        return dedupe_text([
+        return ensure_catalogue_hints([
+            *collaboration_rescue_queries[:3],
             *primary_only_queries[:4],
             *alias_queries[:1],
             *profile.queries[:2],
             *profile.latin_queries[:2],
             *generated_queries,
-        ])[:10]
+        ], draft=draft)[:10]
 
     def _primary_only_queries_for_host(
         self,
@@ -1123,19 +1799,26 @@ class HttpSourceProvider:
             return []
         if "concerto" not in normalized_work and "协奏曲" not in work_query:
             return []
+        latin_primary_terms: list[str] = []
         if host.is_chinese:
             primary_terms = dedupe_text([*getattr(draft, "primary_names", []), *getattr(draft, "primary_names_latin", [])])
+            latin_primary_terms = prioritize_person_query_terms(getattr(draft, "primary_names_latin", []))[:1]
         else:
             primary_terms = dedupe_text([*getattr(draft, "primary_names_latin", []), *getattr(draft, "primary_names", [])])
         if not primary_terms:
             return []
-        queries = build_queries(
-            work_query=work_query,
-            composer_query=composer_query,
-            lead_terms=primary_terms[:1],
-            ensemble_terms=[],
-            title=draft.title,
-            performance_date_text=draft.performance_date_text,
+        queries: list[str] = []
+        if host.is_chinese:
+            queries.extend(build_chinese_host_decade_rescue_queries(draft))
+        queries.extend(
+            build_queries(
+                work_query=work_query,
+                composer_query=composer_query,
+                lead_terms=primary_terms[:1],
+                ensemble_terms=[],
+                title=draft.title,
+                performance_date_text=draft.performance_date_text,
+            )
         )
         alias_values = build_work_aliases(draft.work_title_latin)
         alias_values.update(build_work_aliases(draft.work_title))
@@ -1157,12 +1840,43 @@ class HttpSourceProvider:
                     performance_date_text=draft.performance_date_text,
                 )[:2]
             )
+        if host.is_chinese and latin_primary_terms:
+            queries.extend(
+                build_queries(
+                    work_query=work_query,
+                    composer_query=composer_query,
+                    lead_terms=latin_primary_terms,
+                    ensemble_terms=[],
+                    title=draft.title,
+                    performance_date_text=draft.performance_date_text,
+                )[:4]
+            )
+            for alias in sorted(alias_values):
+                normalized_alias = compact(alias)
+                if not normalized_alias or not contains_cjk(normalized_alias):
+                    continue
+                queries.extend(
+                    build_queries(
+                        work_query=normalized_alias,
+                        composer_query=composer_query,
+                        lead_terms=latin_primary_terms,
+                        ensemble_terms=[],
+                        title=draft.title,
+                        performance_date_text=draft.performance_date_text,
+                    )[:2]
+                )
         filtered_queries = []
-        required_lead = compact(primary_terms[0]).lower()
+        required_leads = {compact(primary_terms[0]).lower()}
+        required_leads.update(compact(value).lower() for value in latin_primary_terms if compact(value))
+        required_leads.update(
+            compact(extract_person_query_keyword(value)).lower()
+            for value in latin_primary_terms
+            if compact(extract_person_query_keyword(value))
+        )
         catalogue = compact(draft.catalogue).lower()
         for query in dedupe_text(queries):
             lowered = compact(query).lower()
-            if required_lead and required_lead not in lowered:
+            if required_leads and not any(required_lead in lowered for required_lead in required_leads if required_lead):
                 continue
             if catalogue and catalogue not in lowered and "concerto" not in lowered and "协奏曲" not in query and "klavierkonzert" not in lowered:
                 continue
@@ -1240,16 +1954,31 @@ class HttpSourceProvider:
         source_kind: str,
         draft: DraftRecordingEntry,
         semaphore: asyncio.Semaphore,
+        *,
+        seed_data: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         async with semaphore:
             platform = detect_platform(url)
             html_text = ""
             bilibili_metadata: dict[str, Any] = {}
-            duration_seconds = 0
-            uploader = ""
-            view_count = 0
+            seed = seed_data or {}
+            seed_title = strip_html(compact(seed.get("title")))
+            seed_description = strip_html(compact(seed.get("description")))
+            seed_uploader = compact(seed.get("uploader"))
+            seed_bvid = compact(seed.get("bvid"))
+            duration_seconds = int(seed.get("duration_seconds") or 0)
+            uploader = seed_uploader
+            view_count = int(seed.get("view_count") or 0)
+            title = seed_title
+            description = seed_description
+            body_text = compact(seed.get("body_text")) or compact(
+                " ".join(part for part in [seed_title, seed_description, seed_uploader] if compact(part))
+            )
+            image_url = resolve_image_url(url, compact(seed.get("image_url")))
+            canonical_url = canonicalize_bilibili_video_url(url, seed_bvid)
             fetch_timeout = self._recommended_timeout_seconds(urlparse(url).netloc.lower(), 6.0)
-            if platform == "bilibili" and self._can_use_bilibili_api() and not self._is_platform_api_disabled("Bilibili Detail API"):
+            seed_detail_ready = platform == "bilibili" and not metadata_is_insufficient(title, description, body_text) and duration_seconds > 0 and view_count > 0 and compact(uploader)
+            if platform == "bilibili" and not seed_detail_ready and self._can_use_bilibili_api() and not self._is_platform_api_disabled("Bilibili Detail API"):
                 detail_started = time.perf_counter()
                 try:
                     detail = await self._platform_clients().fetch_bilibili_video_detail(url)
@@ -1279,14 +2008,14 @@ class HttpSourceProvider:
                     )
 
             detail_ready = platform == "bilibili" and not metadata_is_insufficient(
-                compact(bilibili_metadata.get("title")),
-                compact(bilibili_metadata.get("description")),
-                compact(bilibili_metadata.get("body_text")),
+                compact(bilibili_metadata.get("title")) or title,
+                compact(bilibili_metadata.get("description")) or description,
+                compact(bilibili_metadata.get("body_text")) or body_text,
             ) and int(bilibili_metadata.get("duration_seconds", 0) or 0) > 0 and int(
                 bilibili_metadata.get("view_count", 0) or 0
             ) > 0 and compact(bilibili_metadata.get("uploader"))
 
-            if not detail_ready:
+            if not detail_ready and not seed_detail_ready:
                 started = time.perf_counter()
                 try:
                     html_text = await self._fetch_text(
@@ -1318,14 +2047,20 @@ class HttpSourceProvider:
             title = strip_html(
                 extract_meta_content(html_text, "og:title")
                 or compact(bilibili_metadata.get("title"))
+                or title
                 or extract_title(html_text)
             )
             description = strip_html(
                 extract_meta_content(html_text, "og:description")
                 or extract_meta_content(html_text, "description", attr="name")
                 or compact(bilibili_metadata.get("description"))
+                or description
             )
-            body_text = compact(bilibili_metadata.get("body_text")) or (strip_html(html_text)[:4000] if html_text else "")
+            if platform == "apple_music" and is_generic_apple_player_text(title):
+                title = seed_title or title
+            if platform == "apple_music" and is_generic_apple_player_text(description):
+                description = seed_description or description
+            body_text = compact(bilibili_metadata.get("body_text")) or body_text or (strip_html(html_text)[:4000] if html_text else "")
             if platform == "bilibili":
                 description = sanitize_bilibili_metadata_text(description)
                 body_text = sanitize_bilibili_metadata_text(body_text)
@@ -1334,12 +2069,19 @@ class HttpSourceProvider:
                 extract_meta_content(html_text, "og:image")
                 or extract_meta_content(html_text, "twitter:image", attr="name")
                 or compact(bilibili_metadata.get("image_url"))
+                or image_url
                 or extract_first_image_src(html_text, url),
             )
-            canonical_url = canonicalize_bilibili_video_url(url, compact(bilibili_metadata.get("bvid")))
+            canonical_url = canonicalize_bilibili_video_url(canonical_url, compact(bilibili_metadata.get("bvid")) or seed_bvid)
             duration_seconds = extract_duration_seconds(html_text) or int(bilibili_metadata.get("duration_seconds", 0) or 0)
+            if duration_seconds <= 0:
+                duration_seconds = int(seed.get("duration_seconds") or 0)
             uploader = extract_uploader_name(html_text) or compact(bilibili_metadata.get("uploader"))
+            if not compact(uploader):
+                uploader = seed_uploader
             view_count = extract_view_count(html_text) or int(bilibili_metadata.get("view_count", 0) or 0)
+            if view_count <= 0:
+                view_count = int(seed.get("view_count") or 0)
 
             browser_metadata_needed = metadata_is_insufficient(title, description, body_text) or (
                 platform == "bilibili" and (duration_seconds <= 0 or view_count <= 0 or not compact(uploader))
@@ -1358,8 +2100,14 @@ class HttpSourceProvider:
                         source_label=source_label,
                         timeout_seconds=browser_timeout,
                     )
-                    title = compact(browser_payload.get("title")) or title
-                    description = compact(browser_payload.get("description")) or description
+                    browser_title = compact(browser_payload.get("title"))
+                    browser_description = compact(browser_payload.get("description"))
+                    if platform == "apple_music" and is_generic_apple_player_text(browser_title):
+                        browser_title = ""
+                    if platform == "apple_music" and is_generic_apple_player_text(browser_description):
+                        browser_description = ""
+                    title = browser_title or title
+                    description = browser_description or description
                     body_text = compact(browser_payload.get("bodyText")) or body_text
                     if platform == "bilibili":
                         description = sanitize_bilibili_metadata_text(description)
@@ -1513,6 +2261,11 @@ def normalize_host(value: str) -> str:
     return compact(value).replace("https://", "").replace("http://", "").strip("/")
 
 
+def is_bilibili_host(value: str) -> bool:
+    normalized = normalize_host(value).lower()
+    return "bilibili.com" in normalized or "b23.tv" in normalized
+
+
 def canonicalize_bilibili_video_url(url: str, bvid: str = "") -> str:
     normalized_url = compact(url)
     normalized_bvid = compact(bvid)
@@ -1525,12 +2278,25 @@ def canonicalize_bilibili_video_url(url: str, bvid: str = "") -> str:
 def streaming_host_priority(value: str) -> tuple[int, str]:
     normalized = normalize_host(value).lower()
     if "youtube.com" in normalized or "youtu.be" in normalized:
-        return (0, normalized)
+        return (0, f"1-{normalized}")
     if "bilibili.com" in normalized or "b23.tv" in normalized:
-        return (0, normalized)
+        return (0, f"0-{normalized}")
     if "apple.com" in normalized:
-        return (1, normalized)
-    return (2, normalized)
+        return (0, f"2-{normalized}")
+    return (1, normalized)
+
+
+def dedupe_streaming_hosts_for_execution(hosts: list[SourceProfileEntry]) -> list[SourceProfileEntry]:
+    deduped: list[SourceProfileEntry] = []
+    seen: set[str] = set()
+    for host in hosts:
+        normalized = normalize_host(host.url).lower()
+        key = "apple_music" if "apple.com" in normalized else normalized
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(host)
+    return deduped
 
 
 def merge_streaming_host_rows(
@@ -1563,21 +2329,144 @@ def merge_bilibili_search_rows(
     api_rows: list[dict[str, str]],
     browser_rows: list[dict[str, str]],
     engine_rows: list[dict[str, str]],
+    *,
+    parser_mismatch: bool = False,
 ) -> list[dict[str, str]]:
+    if parser_mismatch:
+        trusted_urls = {
+            compact(row.get("url")).rstrip("/").lower()
+            for row in [*browser_rows, *engine_rows]
+            if compact(row.get("url"))
+        }
+        api_rows = [
+            row
+            for row in api_rows
+            if compact(row.get("url")).rstrip("/").lower() in trusted_urls
+        ]
     return dedupe_rows([*browser_rows, *api_rows, *engine_rows])[:HYDRATE_DEPTH]
+
+
+def rrf_consensus_query_rows(
+    query_rows_list: list[list[dict[str, str]]],
+    *,
+    result_depth: int,
+    query_weights: list[float] | None = None,
+    rank_constant: int = 10,
+    rank_window: int | None = None,
+) -> list[dict[str, str]]:
+    score_by_key: dict[str, float] = {}
+    occurrence_by_key: dict[str, int] = {}
+    best_rank_by_key: dict[str, int] = {}
+    first_seen_by_key: dict[str, tuple[int, int]] = {}
+    representative_by_key: dict[str, dict[str, str]] = {}
+    window = rank_window if rank_window is not None else max(result_depth * 4, 8)
+
+    for query_index, rows in enumerate(query_rows_list):
+        query_seen: set[str] = set()
+        weight = 1.0
+        if query_weights and query_index < len(query_weights):
+            weight = query_weights[query_index]
+        for rank, row in enumerate(rows[:window]):
+            url = compact(row.get("url"))
+            if not url:
+                continue
+            key = url.lower()
+            representative_by_key.setdefault(key, row)
+            score_by_key[key] = score_by_key.get(key, 0.0) + (weight / (rank_constant + rank + 1))
+            if key not in query_seen:
+                occurrence_by_key[key] = occurrence_by_key.get(key, 0) + 1
+                query_seen.add(key)
+            best_rank_by_key[key] = min(best_rank_by_key.get(key, rank), rank)
+            first_seen_by_key.setdefault(key, (query_index, rank))
+
+    consensus_keys = [key for key, count in occurrence_by_key.items() if count >= 2]
+    ordered_keys = sorted(
+        consensus_keys,
+        key=lambda key: (
+            -occurrence_by_key[key],
+            -score_by_key[key],
+            best_rank_by_key[key],
+            first_seen_by_key[key][0],
+            first_seen_by_key[key][1],
+        ),
+    )
+    return [representative_by_key[key] for key in ordered_keys[:result_depth]]
 
 
 def merge_bilibili_browser_query_rows(
     query_rows_list: list[list[dict[str, str]]],
     *,
+    queries: list[str] | None = None,
     result_depth: int,
 ) -> list[dict[str, str]]:
+    if queries and len(queries) == len(query_rows_list):
+        prioritized_rows: list[dict[str, str]] = []
+        rescue_rows: list[dict[str, str]] = []
+        coverage_rows: list[dict[str, str]] = []
+        all_rows: list[dict[str, str]] = []
+        focused_indices = sorted(
+            range(len(queries)),
+            key=lambda index: (bilibili_query_focus_rank(queries[index]), index),
+        )
+        query_weights = [1.0] * len(query_rows_list)
+        for bonus, index in zip((0.35, 0.2, 0.1), focused_indices[:3]):
+            query_weights[index] += bonus
+        deep_indices = focused_indices[:2]
+        medium_indices = focused_indices[2:3]
+        consensus_rows = rrf_consensus_query_rows(
+            query_rows_list,
+            result_depth=result_depth,
+            query_weights=query_weights,
+        )
+        for index, rows in enumerate(query_rows_list):
+            coverage_rows.extend(rows[:1])
+            if len(query_rows_list) >= 5 and index < 2:
+                coverage_rows.extend(rows[1:2])
+        seen_urls = {
+            compact(row.get("url")).lower()
+            for row in [*consensus_rows, *coverage_rows]
+            if compact(row.get("url"))
+        }
+        for index in focused_indices:
+            duplicate_prefix = 0
+            for row in query_rows_list[index][1:4]:
+                url = compact(row.get("url")).lower()
+                if not url:
+                    continue
+                if url in seen_urls:
+                    duplicate_prefix += 1
+                    continue
+                if duplicate_prefix > 0:
+                    rescue_rows.append(row)
+                    seen_urls.add(url)
+                break
+        prioritized_groups: list[list[dict[str, str]]] = []
+        for rank, index in enumerate(deep_indices):
+            prioritized_groups.append(query_rows_list[index][1 : max(2, result_depth - (3 * (rank + 1)) + 1)])
+        for index in medium_indices:
+            prioritized_groups.append(query_rows_list[index][1:3])
+        if prioritized_groups:
+            max_group_len = max(len(group) for group in prioritized_groups)
+            for offset in range(max_group_len):
+                for group in prioritized_groups:
+                    if offset < len(group):
+                        prioritized_rows.append(group[offset])
+        for index, rows in enumerate(query_rows_list):
+            all_rows.extend(rows)
+        return dedupe_rows([*consensus_rows, *coverage_rows, *rescue_rows, *prioritized_rows, *all_rows])[:result_depth]
+
+    prioritized_rows: list[dict[str, str]] = []
     coverage_rows: list[dict[str, str]] = []
     all_rows: list[dict[str, str]] = []
-    for rows in query_rows_list:
-        coverage_rows.extend(rows[:3])
+    for index, rows in enumerate(query_rows_list):
+        if index == 0:
+            prioritized_rows.extend(rows[: max(1, result_depth - 3)])
+        elif index == 1:
+            prioritized_rows.extend(rows[: max(1, result_depth - 6)])
+        else:
+            coverage_rows.extend(rows[:1])
         all_rows.extend(rows)
-    return dedupe_rows([*coverage_rows, *all_rows])[:result_depth]
+    return dedupe_rows([*prioritized_rows, *coverage_rows, *all_rows])[:result_depth]
 
 
 def merge_streaming_query_groups(
@@ -1619,21 +2508,491 @@ def select_bilibili_browser_queries(queries: list[str], *, max_queries: int = 6)
     selected_indices: set[int] = set(range(head_count))
 
     tail_capacity = max_queries - len(selected_indices)
-    tail_count = min(2, tail_capacity, max(0, len(candidates) - head_count))
+    tail_count = min(1, tail_capacity, max(0, len(candidates) - head_count))
     if tail_count:
         selected_indices.update(range(len(candidates) - tail_count, len(candidates)))
 
     remaining_slots = max_queries - len(selected_indices)
     if remaining_slots > 0:
         middle_indices = [index for index in range(head_count, len(candidates) - tail_count) if index not in selected_indices]
-        ranked_middle = sorted(
-            middle_indices,
-            key=lambda index: (bilibili_query_specificity(candidates[index]), -index),
-            reverse=True,
-        )
-        selected_indices.update(ranked_middle[:remaining_slots])
+        if middle_indices:
+            focused_middle = min(
+                middle_indices,
+                key=lambda index: (bilibili_query_focus_rank(candidates[index]), index),
+            )
+            selected_indices.add(focused_middle)
+        remaining_slots = max_queries - len(selected_indices)
+        if remaining_slots > 0:
+            middle_indices = [
+                index for index in range(head_count, len(candidates) - tail_count) if index not in selected_indices
+            ]
+            collaboration_candidates = [
+                index for index in middle_indices if bilibili_query_has_collaboration_signal(candidates[index])
+            ]
+            if collaboration_candidates:
+                collaboration_middle = min(
+                    collaboration_candidates,
+                    key=lambda index: (bilibili_query_collaboration_rank(candidates[index]), index),
+                )
+                selected_indices.add(collaboration_middle)
+        remaining_slots = max_queries - len(selected_indices)
+        if remaining_slots > 0:
+            middle_indices = [
+                index for index in range(head_count, len(candidates) - tail_count) if index not in selected_indices
+            ]
+            ranked_middle = sorted(
+                middle_indices,
+                key=lambda index: (bilibili_query_context_rank(candidates[index]), -index),
+                reverse=True,
+            )
+            selected_indices.update(ranked_middle[:remaining_slots])
 
     return [candidates[index] for index in sorted(selected_indices)]
+
+
+def prepare_bilibili_browser_queries(queries: list[str], *, max_queries: int = 3) -> list[str]:
+    seeded = select_bilibili_browser_queries(queries, max_queries=max(max_queries + 2, 6))
+    pool = dedupe_text([*seeded, *queries])
+    ranked = sorted(pool, key=bilibili_browser_runtime_rank)
+    selected = list(ranked[:max_queries])
+    if not any(bilibili_query_is_primary_work_rescue(query) for query in selected):
+        rescue_pool = [query for query in pool if bilibili_query_is_primary_work_rescue(query)]
+        if rescue_pool:
+            rescue_query = min(dedupe_text(rescue_pool), key=bilibili_primary_work_rescue_rank)
+            rescue_is_decade_bucket = bool(re.search(r"\b(?:18|19|20)\d0s\b", compact(rescue_query).lower()))
+            if rescue_is_decade_bucket and any(bilibili_query_is_primary_year_anchor(query) for query in selected):
+                if max_queries < 4 or not selected:
+                    return selected[:max_queries]
+                replace_index = len(selected) - 1
+            else:
+                replace_index = next(
+                    (
+                        index
+                        for index in range(len(selected) - 1, -1, -1)
+                        if not bilibili_query_is_primary_work_rescue(selected[index])
+                    ),
+                    len(selected) - 1,
+                )
+            if rescue_query not in selected:
+                selected[replace_index] = rescue_query
+                selected = dedupe_text(selected)
+                if len(selected) < max_queries:
+                    for query in ranked:
+                        if query in selected:
+                            continue
+                        selected.append(query)
+                        if len(selected) >= max_queries:
+                            break
+    if max_queries >= 4 and not any(bilibili_query_is_generic_plural_bundle_rescue(query) for query in selected):
+        bundle_pool = [query for query in pool if bilibili_query_is_generic_plural_bundle_rescue(query)]
+        if bundle_pool:
+            bundle_query = min(
+                dedupe_text(bundle_pool),
+                key=lambda query: bilibili_generic_plural_bundle_rescue_rank(query),
+            )
+            if bundle_query not in selected:
+                replace_index = next(
+                    (
+                        index
+                        for index in range(len(selected) - 1, -1, -1)
+                        if not bilibili_query_is_primary_work_rescue(selected[index])
+                        and not bilibili_query_is_primary_year_anchor(selected[index])
+                    ),
+                    next(
+                        (
+                            index
+                            for index in range(len(selected) - 1, -1, -1)
+                            if bilibili_query_is_primary_year_anchor(selected[index])
+                            and not bilibili_query_is_primary_work_rescue(selected[index])
+                        ),
+                        next(
+                            (
+                                index
+                                for index in range(len(selected) - 1, -1, -1)
+                                if bilibili_query_is_primary_year_anchor(selected[index])
+                            ),
+                            next(
+                                (
+                                    index
+                                    for index in range(len(selected) - 1, -1, -1)
+                                    if not bilibili_query_is_primary_work_rescue(selected[index])
+                                ),
+                                len(selected) - 1,
+                            ),
+                        ),
+                    ),
+                )
+                selected[replace_index] = bundle_query
+                selected = dedupe_text(selected)
+                if len(selected) < max_queries:
+                    for query in ranked:
+                        if query in selected:
+                            continue
+                        selected.append(query)
+                        if len(selected) >= max_queries:
+                            break
+    if max_queries >= 4 and not any(bilibili_query_is_exact_collaboration_anchor(query) for query in selected):
+        collaboration_pool = [query for query in pool if bilibili_query_is_exact_collaboration_anchor(query)]
+        if collaboration_pool:
+            collaboration_query = min(
+                dedupe_text(collaboration_pool),
+                key=bilibili_exact_collaboration_anchor_rank,
+            )
+            if collaboration_query not in selected:
+                replace_index = next(
+                    (
+                        index
+                        for index in range(len(selected) - 1, -1, -1)
+                        if not bilibili_query_has_collaboration_signal(selected[index])
+                        and not bilibili_query_is_primary_work_rescue(selected[index])
+                        and not bilibili_query_is_primary_year_anchor(selected[index])
+                        and not bilibili_query_is_generic_plural_bundle_rescue(selected[index])
+                    ),
+                    next(
+                        (
+                            index
+                            for index in range(len(selected) - 1, -1, -1)
+                            if not bilibili_query_has_collaboration_signal(selected[index])
+                            and not bilibili_query_is_primary_work_rescue(selected[index])
+                            and not bilibili_query_is_primary_year_anchor(selected[index])
+                        ),
+                        len(selected) - 1,
+                    ),
+                )
+                selected[replace_index] = collaboration_query
+                selected = dedupe_text(selected)
+                if len(selected) < max_queries:
+                    for query in ranked:
+                        if query in selected:
+                            continue
+                        selected.append(query)
+                        if len(selected) >= max_queries:
+                            break
+    return selected[:max_queries]
+
+
+def bilibili_query_is_primary_work_rescue(query: str) -> bool:
+    normalized = compact(query)
+    if not normalized:
+        return False
+    lowered = normalized.lower()
+    token_count = len(re.findall(r"[A-Za-z0-9]+|[\u4e00-\u9fff]+", normalized))
+    ensemble_markers = (
+        "orchestra",
+        "philharmonic",
+        "symphony",
+        "ensemble",
+        "\u4e50\u56e2",
+        "\u7231\u4e50",
+        "\u4ea4\u54cd",
+    )
+    work_markers = (
+        "concerto",
+        "concertos",
+        "klavierkonzert",
+        "\u94a2\u534f",
+        "\u534f\u594f\u66f2",
+    )
+    has_work_marker = any(marker in lowered or marker in normalized for marker in work_markers)
+    if not has_work_marker:
+        return False
+    has_decade_bucket = bool(re.search(r"\b(?:18|19|20)\d0s\b", lowered))
+    has_year = bool(re.search(r"\b(?:18|19|20)\d{2}\b", lowered))
+    has_ensemble = any(marker in lowered or marker in normalized for marker in ensemble_markers)
+    has_explicit_duo = "/" in normalized or " - " in normalized
+    has_cjk_short_work = "\u94a2\u534f" in normalized or "\u534f\u594f\u66f2" in normalized
+    if has_decade_bucket and not has_explicit_duo and not has_ensemble:
+        return True
+    return has_year and not has_explicit_duo and not has_ensemble and (token_count <= 4 or has_cjk_short_work)
+
+
+def bilibili_primary_work_rescue_rank(query: str) -> tuple[int, int, int, int]:
+    normalized = compact(query)
+    lowered = normalized.lower()
+    token_count = len(re.findall(r"[A-Za-z0-9]+|[\u4e00-\u9fff]+", normalized))
+    has_decade_bucket = bool(re.search(r"\b(?:18|19|20)\d0s\b", lowered))
+    has_year = bool(re.search(r"\b(?:18|19|20)\d{2}\b", lowered))
+    has_cjk_short_work = "\u94a2\u534f" in normalized or "\u534f\u594f\u66f2" in normalized
+    return (
+        0 if has_cjk_short_work and has_year else 1 if has_decade_bucket else 2 if has_year else 3,
+        token_count,
+        len(normalized),
+        0 if "/" not in normalized else 1,
+    )
+
+
+def bilibili_query_is_primary_year_anchor(query: str) -> bool:
+    normalized = compact(query)
+    if not normalized:
+        return False
+    lowered = normalized.lower()
+    token_count = len(re.findall(r"[A-Za-z0-9]+|[\u4e00-\u9fff]+", normalized))
+    has_year = bool(re.search(r"\b(?:18|19|20)\d{2}\b", lowered))
+    has_decade_bucket = bool(re.search(r"\b(?:18|19|20)\d0s\b", lowered))
+    work_markers = (
+        "concerto",
+        "concertos",
+        "klavierkonzert",
+        "\u94a2\u534f",
+        "\u534f\u594f\u66f2",
+    )
+    has_month = any(
+        month in lowered
+        for month in (
+            "january",
+            "february",
+            "march",
+            "april",
+            "may",
+            "june",
+            "july",
+            "august",
+            "september",
+            "october",
+            "november",
+            "december",
+        )
+    )
+    has_work_marker = any(marker in lowered or marker in normalized for marker in work_markers)
+    return has_year and not has_decade_bucket and not has_month and not has_work_marker and "/" not in normalized and token_count <= 4
+
+
+def bilibili_query_is_generic_plural_bundle_rescue(query: str) -> bool:
+    normalized = compact(query)
+    if not normalized:
+        return False
+    lowered = normalized.lower()
+    token_count = len(re.findall(r"[A-Za-z0-9]+|[\u4e00-\u9fff]+", normalized))
+    ensemble_markers = (
+        "orchestra",
+        "philharmonic",
+        "symphony",
+        "ensemble",
+        "\u4e50\u56e2",
+        "\u7231\u4e50",
+        "\u4ea4\u54cd",
+    )
+    if "concertos" not in lowered:
+        return False
+    if "/" in normalized or " - " in normalized:
+        return False
+    if any(marker in lowered or marker in normalized for marker in ensemble_markers):
+        return False
+    return token_count <= 4
+
+
+def bilibili_generic_plural_bundle_rescue_rank(query: str) -> tuple[int, int, int]:
+    normalized = compact(query)
+    token_count = len(re.findall(r"[A-Za-z0-9]+|[\u4e00-\u9fff]+", normalized))
+    return (
+        0 if "piano concertos" in normalized.lower() else 1,
+        token_count,
+        len(normalized),
+    )
+
+
+def bilibili_query_is_exact_collaboration_anchor(query: str) -> bool:
+    normalized = compact(query)
+    if not normalized or not bilibili_query_has_collaboration_signal(normalized):
+        return False
+    lowered = normalized.lower()
+    token_count = len(re.findall(r"[A-Za-z0-9]+|[\u4e00-\u9fff]+", normalized))
+    work_markers = (
+        "concerto",
+        "concertos",
+        "klavierkonzert",
+        "\u94a2\u534f",
+        "\u534f\u594f\u66f2",
+    )
+    has_work_marker = any(marker in lowered or marker in normalized for marker in work_markers)
+    has_year = bool(re.search(r"\b(?:18|19|20)\d{2}\b", lowered))
+    has_decade_bucket = bool(re.search(r"\b(?:18|19|20)\d0s\b", lowered))
+    has_month = any(
+        month in lowered
+        for month in (
+            "january",
+            "february",
+            "march",
+            "april",
+            "may",
+            "june",
+            "july",
+            "august",
+            "september",
+            "october",
+            "november",
+            "december",
+        )
+    )
+    latin_name_tokens = [
+        token
+        for token in re.findall(r"[A-Za-z][A-Za-z'.-]*", normalized)
+        if len(token) > 1
+        and token.lower()
+        not in {
+            "piano",
+            "concerto",
+            "concertos",
+            "op",
+            "robert",
+            "schumann",
+            "orchestra",
+            "philharmonic",
+            "symphony",
+            "ensemble",
+            "budapest",
+            "bppo",
+        }
+    ]
+    return (
+        has_work_marker
+        and not has_year
+        and not has_decade_bucket
+        and not has_month
+        and token_count <= 12
+        and len(latin_name_tokens) >= 4
+    )
+
+
+def bilibili_exact_collaboration_anchor_rank(query: str) -> tuple[int, int, int, int, int]:
+    normalized = compact(query)
+    lowered = normalized.lower()
+    ensemble_markers = (
+        "orchestra",
+        "philharmonic",
+        "symphony",
+        "ensemble",
+        "\u4e50\u56e2",
+        "\u7231\u4e50",
+        "\u4ea4\u54cd",
+        "bppo",
+    )
+    return (
+        0 if "op." in lowered else 1,
+        0 if not any(marker in lowered or marker in normalized for marker in ensemble_markers) else 1,
+        0 if "/" not in normalized else 1,
+        len(re.findall(r"[A-Za-z0-9]+|[\u4e00-\u9fff]+", normalized)),
+        len(normalized),
+    )
+
+
+def bilibili_query_focus_rank(query: str) -> tuple[int, int, int, int, int, int]:
+    normalized = compact(query)
+    lowered = normalized.lower()
+    latin_tokens = re.findall(r"[A-Za-z]{3,}", normalized)
+    ensemble_markers = (
+        "orchestra",
+        "philharmonic",
+        "symphony",
+        "ensemble",
+        "乐团",
+        "爱乐",
+        "交响",
+    )
+    work_markers = (
+        "concerto",
+        "concertos",
+        "klavierkonzert",
+        "钢协",
+        "协奏曲",
+    )
+    has_cjk_work_marker = any(marker in normalized for marker in ("钢协", "协奏曲"))
+    has_work_marker = any(marker in lowered or marker in normalized for marker in work_markers)
+    return (
+        0 if has_cjk_work_marker and latin_tokens else 1 if has_work_marker else 2,
+        0 if len(latin_tokens) >= 2 else 1,
+        0 if any(character.isdigit() for character in normalized) else 1,
+        0 if not any(marker in lowered for marker in ensemble_markers) else 1,
+        len(normalized.split()),
+        len(normalized),
+    )
+
+
+def bilibili_browser_runtime_rank(query: str) -> tuple[int, int, int, int, tuple[int, int, int, int, int, int], int]:
+    normalized = compact(query)
+    lowered = normalized.lower()
+    token_count = len(re.findall(r"[A-Za-z0-9]+|[\u4e00-\u9fff]+", normalized))
+    has_month = any(
+        month in lowered
+        for month in (
+            "january",
+            "february",
+            "march",
+            "april",
+            "may",
+            "june",
+            "july",
+            "august",
+            "september",
+            "october",
+            "november",
+            "december",
+        )
+    )
+    has_year = bool(re.search(r"\b(?:18|19|20)\d{2}\b", lowered))
+    has_decade_bucket = bool(re.search(r"\b(?:18|19|20)\d0s\b", lowered))
+    has_collaboration = bilibili_query_has_collaboration_signal(normalized)
+    very_long = len(normalized) > 56 or token_count > 10
+    longish = len(normalized) > 40 or token_count > 7
+    has_runtime_heavy_context = has_month or (has_year and len(normalized) > 32)
+    return (
+        0 if has_year and has_collaboration else 1 if has_year else 2 if has_decade_bucket else 3,
+        1 if very_long else 0,
+        1 if longish else 0,
+        1 if has_runtime_heavy_context else 0,
+        1 if "/" in normalized else 0,
+        bilibili_query_focus_rank(normalized),
+        len(normalized),
+    )
+
+
+def bilibili_query_has_collaboration_signal(query: str) -> bool:
+    normalized = compact(query)
+    if "/" in normalized:
+        return True
+    latin_tokens = [token for token in re.findall(r"[A-Za-z][A-Za-z'.-]*", normalized) if len(token) > 1]
+    return len(latin_tokens) >= 3
+
+
+def bilibili_query_collaboration_rank(query: str) -> tuple[int, int, int, int, int]:
+    normalized = compact(query)
+    lowered = normalized.lower()
+    latin_tokens = [token for token in re.findall(r"[A-Za-z][A-Za-z'.-]*", normalized) if len(token) > 1]
+    ensemble_markers = (
+        "orchestra",
+        "philharmonic",
+        "symphony",
+        "ensemble",
+        "乐团",
+        "爱乐",
+        "交响",
+    )
+    return (
+        0 if any(character.isdigit() for character in normalized) else 1,
+        0 if len(latin_tokens) >= 3 else 1,
+        0 if "/" in normalized else 1,
+        0 if not any(marker in lowered for marker in ensemble_markers) else 1,
+        len(normalized),
+    )
+
+
+def bilibili_query_context_rank(query: str) -> tuple[int, int, int, int, int]:
+    normalized = compact(query)
+    lowered = normalized.lower()
+    ensemble_markers = (
+        "orchestra",
+        "philharmonic",
+        "symphony",
+        "ensemble",
+        "乐团",
+        "爱乐",
+        "交响",
+    )
+    return (
+        1 if any(marker in lowered for marker in ensemble_markers) else 0,
+        1 if "/" not in normalized else 0,
+        *bilibili_query_specificity(normalized),
+    )
 
 
 def should_search_auxiliary_streaming_hosts(
@@ -1644,6 +3003,26 @@ def should_search_auxiliary_streaming_hosts(
         return True
     merged = merge_streaming_host_rows(non_empty)
     return len(merged) < 4
+
+
+def should_probe_apple_auxiliary_hosts(hydrated_rows: list[dict[str, Any]]) -> bool:
+    if not hydrated_rows:
+        return True
+    if any(compact(row.get("platform")) == "apple_music" for row in hydrated_rows):
+        return False
+    strong_rows = [
+        row
+        for row in hydrated_rows
+        if float(row.get("same_recording_score", 0.0) or 0.0) >= LOW_CONFIDENCE_THRESHOLD
+    ]
+    if len(strong_rows) < 2:
+        return True
+    strong_platforms = {
+        compact(row.get("platform")) or detect_platform(compact(row.get("url")))
+        for row in strong_rows
+        if compact(row.get("platform")) or compact(row.get("url"))
+    }
+    return len(strong_platforms) < 2
 
 
 def should_expand_initial_streaming_window(
@@ -1658,6 +3037,8 @@ def should_expand_initial_streaming_window(
         return False
     for host, rows in priority_non_empty:
         normalized_host = normalize_host(host.url)
+        if "apple.com" in normalized_host:
+            return True
         if ("bilibili.com" in normalized_host or "b23.tv" in normalized_host) and len(rows) >= 9:
             return True
     return False
@@ -1685,6 +3066,99 @@ def prioritize_platform_queries(values: list[str], *, draft: DraftRecordingEntry
         )
 
     return sorted(dedupe_text(values), key=sort_key)
+
+
+def ensure_catalogue_hints(values: list[str], *, draft: DraftRecordingEntry) -> list[str]:
+    return dedupe_text([append_catalogue_hint(query, draft=draft) for query in values if compact(query)])
+
+
+def append_catalogue_hint(query: str, *, draft: DraftRecordingEntry) -> str:
+    normalized_query = compact(query)
+    catalogue = compact(draft.catalogue)
+    if not normalized_query or not catalogue:
+        return normalized_query
+    normalized_catalogue = normalize_text(catalogue)
+    if normalized_catalogue and normalized_catalogue in normalize_text(normalized_query):
+        return normalized_query
+    if query_is_generic_plural_bundle_rescue(normalized_query, draft=draft):
+        return normalized_query
+    if not query_mentions_requested_work(normalized_query, draft=draft):
+        return normalized_query
+    return f"{normalized_query} {catalogue}"
+
+
+def select_generic_plural_bundle_rescue_queries(
+    values: list[str],
+    *,
+    draft: DraftRecordingEntry,
+) -> list[str]:
+    return dedupe_text([
+        query for query in values if query_is_generic_plural_bundle_rescue(query, draft=draft)
+    ])
+
+
+def query_is_generic_plural_bundle_rescue(query: str, *, draft: DraftRecordingEntry) -> bool:
+    if not compact(draft.performance_date_text):
+        return False
+    if not (draft.secondary_names or draft.secondary_names_latin):
+        return False
+    if not (draft.ensemble_names or draft.ensemble_names_latin):
+        return False
+    normalized_query = compact(query)
+    if not bilibili_query_is_generic_plural_bundle_rescue(normalized_query):
+        return False
+    if "/" in normalized_query or " - " in normalized_query:
+        return False
+    haystack = normalize_text(normalized_query)
+    primary_values = dedupe_text([*draft.primary_names_latin[:2], *draft.primary_names[:2]])
+    if primary_values and not any(name_matches(haystack, value) for value in primary_values):
+        return False
+    composer_values = dedupe_text([draft.composer_name_latin, draft.composer_name])
+    if any(name_matches(haystack, value) for value in composer_values if compact(value)):
+        return False
+    secondary_values = dedupe_text([*draft.secondary_names_latin[:2], *draft.secondary_names[:2]])
+    if any(name_matches(haystack, value) for value in secondary_values if compact(value)):
+        return False
+    ensemble_values = dedupe_text([*draft.ensemble_names_latin[:2], *draft.ensemble_names[:2]])
+    if any(ensemble_matches(haystack, value) for value in ensemble_values if compact(value)):
+        return False
+    return True
+
+
+def query_mentions_requested_work(query: str, *, draft: DraftRecordingEntry) -> bool:
+    normalized_query = normalize_text(query)
+    if not normalized_query:
+        return False
+    alias_values = {
+        normalize_text(alias)
+        for alias in [
+            *build_work_aliases(draft.work_title_latin),
+            *build_work_aliases(draft.work_title),
+            compact(build_work_query(draft, prefer_latin=True)),
+            compact(build_work_query(draft, prefer_latin=False)),
+        ]
+        if compact(alias)
+    }
+    alias_values.discard(normalize_text(compact(draft.catalogue)))
+    if any(alias in normalized_query for alias in alias_values if len(alias.replace(" ", "")) >= 4):
+        return True
+    return any(marker in normalized_query or marker in query for marker in requested_work_form_markers(draft))
+
+
+def requested_work_form_markers(draft: DraftRecordingEntry) -> tuple[str, ...]:
+    work_text = normalize_text(f"{draft.work_title_latin} {draft.work_title}")
+    markers: list[str] = []
+    if "concerto" in work_text or "\u534f\u594f\u66f2" in compact(draft.work_title):
+        markers.extend(["concerto", "concertos", "klavierkonzert", "\u94a2\u534f", "\u534f\u594f\u66f2"])
+    if "sonata" in work_text or "\u594f\u9e23\u66f2" in compact(draft.work_title):
+        markers.extend(["sonata", "\u594f\u9e23\u66f2"])
+    if "symphony" in work_text or "\u4ea4\u54cd\u66f2" in compact(draft.work_title):
+        markers.extend(["symphony", "sym", "\u4ea4\u54cd\u66f2"])
+    if "quartet" in work_text or "\u56db\u91cd\u594f" in compact(draft.work_title):
+        markers.extend(["quartet", "\u56db\u91cd\u594f"])
+    if "trio" in work_text or "\u4e09\u91cd\u594f" in compact(draft.work_title):
+        markers.extend(["trio", "\u4e09\u91cd\u594f"])
+    return tuple(dict.fromkeys(markers))
 
 
 def count_query_lead_slot_hits(query: str, lead_slots: list[list[str]]) -> int:
@@ -1724,6 +3198,28 @@ def dedupe_text(values: list[str]) -> list[str]:
         seen.add(key)
         items.append(normalized)
     return items
+
+
+def prioritize_person_query_terms(values: list[str]) -> list[str]:
+    deduped = dedupe_text(values)
+
+    def bucket(normalized: str) -> int:
+        token_count = len([token for token in normalized.split() if token])
+        if "/" in normalized:
+            return 3
+        if 2 <= token_count <= 3:
+            return 0
+        if token_count >= 4:
+            return 1
+        return 2
+
+    return [
+        value
+        for _, value in sorted(
+            enumerate(deduped),
+            key=lambda item: (bucket(item[1]), len(compact(item[1])), item[0]),
+        )
+    ]
 
 
 def is_probable_abbreviation(value: str) -> bool:
@@ -1891,13 +3387,35 @@ def extract_youtube_result_links(html_text: str) -> list[str]:
 
 
 def extract_bilibili_result_links(html_text: str) -> list[str]:
-    urls = []
-    for match in re.finditer(r'"arcurl":"([^"]+)"', html_text or ""):
-        encoded = match.group(1)
-        try:
-            urls.append(json.loads(f'"{encoded}"'))
-        except json.JSONDecodeError:
-            continue
+    urls: list[str] = []
+    seen: set[str] = set()
+
+    def append_url(value: str) -> None:
+        normalized = compact(value)
+        if normalized.startswith("//"):
+            normalized = f"https:{normalized}"
+        if not normalized.startswith("http"):
+            return
+        if normalized in seen:
+            return
+        seen.add(normalized)
+        urls.append(normalized)
+
+    for pattern in (
+        r'"arcurl":"([^"]+)"',
+        r'arcurl:"([^"]+)"',
+    ):
+        for match in re.finditer(pattern, html_text or ""):
+            encoded = match.group(1)
+            try:
+                decoded = json.loads(f'"{encoded}"')
+            except json.JSONDecodeError:
+                continue
+            append_url(decoded)
+
+    for match in re.finditer(r'href="(//www\.bilibili\.com/video/(?:BV[0-9A-Za-z]+|av\d+)/?)"', html_text or "", re.I):
+        append_url(match.group(1))
+
     return urls
 
 
@@ -1946,6 +3464,19 @@ def detect_platform(url: str) -> str:
     return "other"
 
 
+def is_generic_apple_player_text(value: str) -> bool:
+    lowered = compact(value).lower().replace("\xa0", " ")
+    if not lowered:
+        return False
+    generic_markers = (
+        "apple music 网页播放器",
+        "apple music web player",
+        "在 apple music 上畅听数千万首歌曲",
+        "listen to millions of songs ad-free",
+    )
+    return any(marker in lowered for marker in generic_markers)
+
+
 def score_recording_match(
     text: str,
     url: str,
@@ -1979,13 +3510,16 @@ def score_recording_match(
     if catalogue_tokens and contains_tokens(haystack, catalogue_tokens):
         score += 0.12
 
-    composer_value = draft.composer_name_latin or draft.composer_name
-    composer_tokens = tokenize(composer_value)
     composer_matched = False
-    if composer_tokens and (contains_tokens(haystack, composer_tokens) or name_matches(haystack, composer_value)):
-        composer_matched = True
+    composer_values = dedupe_text([draft.composer_name_latin, draft.composer_name])
+    for composer_value in composer_values:
+        composer_tokens = tokenize(composer_value)
+        if composer_tokens and (contains_tokens(haystack, composer_tokens) or name_matches(haystack, composer_value)):
+            composer_matched = True
+            break
+    if composer_matched:
         score += 0.08
-    elif composer_tokens and work_matched and (looks_latin(composer_value) or compact(draft.composer_name_latin)):
+    elif composer_values and work_matched and any(looks_latin(value) for value in composer_values):
         score -= 0.24
 
     lead_slots = build_lead_slots(draft)
@@ -2031,7 +3565,17 @@ def score_recording_match(
             group_hits += 1
     if group_hits:
         score += 0.15
-    if work_matched and lead_hits and group_hits:
+    has_explicit_secondary = bool(draft.secondary_names or draft.secondary_names_latin)
+    if (
+        has_explicit_secondary
+        and len(lead_slots) >= 2
+        and lead_hits == 1
+        and group_hits
+        and work_matched
+        and not sparse_collaboration_hint
+    ):
+        score -= 0.45
+    if work_matched and group_hits and (not lead_slots or lead_hits >= len(lead_slots)):
         score += 0.06
 
     year = infer_reference_year(draft)
@@ -2042,6 +3586,10 @@ def score_recording_match(
     performance_context_tokens = extract_performance_context_tokens(draft.performance_date_text)
     if performance_context_tokens and contains_tokens(haystack, performance_context_tokens):
         score += 0.1
+        if has_specific_date_context_tokens(performance_context_tokens) and lead_hits >= 1 and year and year in haystack:
+            score += 0.08
+            if work_matched:
+                score += 0.08
     if sparse_collaboration_hint and work_matched and lead_hits >= 1 and has_complete_work_tracklist(haystack):
         score += 0.08
         if year and year in haystack:
@@ -2054,6 +3602,8 @@ def score_recording_match(
         work_matched=work_matched,
         lead_hits=lead_hits,
     )
+    if any(marker in haystack for marker in ("new edition", "restored", "remaster", "reissue", "alt take")):
+        score -= 0.12
     if "provided to youtube by" in haystack:
         score -= 0.1
     score += score_duration_fit(draft, haystack, duration_seconds)
@@ -2118,13 +3668,18 @@ def score_recording_container_preference(
 ) -> float:
     lowered = haystack.lower()
     score = 0.0
+    is_apple_track = "music.apple.com" in compact(url).lower() and "?i=" in compact(url).lower()
     if looks_like_single_movement(haystack):
-        if looks_like_first_chapter_extract(f"{haystack} {url}") and work_matched and lead_hits >= 1:
-            score -= 0.16
+        if is_apple_track and work_matched and lead_hits >= 1:
+            score -= 0.02 if looks_like_first_chapter_extract(f"{haystack} {url}") else 0.06
+        elif looks_like_first_chapter_extract(f"{haystack} {url}") and work_matched and lead_hits >= 1:
+            score -= 0.08
         else:
             score -= 0.34
     elif looks_like_multi_work_compilation(haystack):
-        if work_matched and lead_hits >= 1:
+        if is_apple_track and work_matched and lead_hits >= 1:
+            score += 0.0
+        elif work_matched and lead_hits >= 1:
             score -= 0.12
         else:
             score -= 0.34
@@ -2154,6 +3709,407 @@ def infer_reference_year(draft: DraftRecordingEntry) -> str:
         or extract_year(draft.title)
         or extract_year(draft.raw_text)
     )
+
+
+def extract_decade_bucket(value: str) -> str:
+    year = extract_year(value)
+    if not year:
+        return ""
+    return f"{year[:3]}0s"
+
+
+def extract_person_query_keyword(value: str) -> str:
+    normalized = compact(value)
+    if not looks_latin(normalized):
+        return ""
+    tokens = [token for token in re.findall(r"[A-Za-z][A-Za-z'.-]*", normalized) if token]
+    if len(tokens) >= 2 and len(tokens[-1]) >= 4:
+        surname_particles = {"da", "de", "del", "della", "der", "di", "du", "la", "le", "ten", "ter", "van", "von"}
+        surname_parts = [tokens[-1]]
+        index = len(tokens) - 2
+        while index > 0 and tokens[index].casefold() in surname_particles:
+            surname_parts.insert(0, tokens[index])
+            index -= 1
+        return " ".join(surname_parts)
+    return normalized
+
+
+def is_distinctive_person_query_keyword(value: str) -> bool:
+    normalized = compact(value)
+    if not normalized:
+        return False
+    condensed = re.sub(r"[^A-Za-z\u4e00-\u9fff]+", "", normalized)
+    if not condensed:
+        return False
+    if contains_cjk(condensed):
+        return len(condensed) >= 3
+    return len(condensed) >= 8
+
+
+def extract_cjk_person_query_keyword(value: str) -> str:
+    normalized = compact(value)
+    if not contains_cjk(normalized):
+        return ""
+    separator_pattern = r"[·•・／/|,，、\s]+"
+    segments = [segment.strip() for segment in re.split(separator_pattern, normalized) if segment.strip()]
+    if not segments:
+        return ""
+    return segments[-1]
+
+
+def build_chinese_host_decade_rescue_queries(draft: DraftRecordingEntry) -> list[str]:
+    work_text = compact(draft.work_title_latin)
+    if "concerto" not in normalize_text(work_text):
+        return []
+    decade_bucket = extract_decade_bucket(draft.performance_date_text or draft.title or draft.raw_text or draft.source_line)
+    if not decade_bucket:
+        return []
+    primary_keywords = dedupe_text(
+        [
+            extract_person_query_keyword(value)
+            for value in prioritize_person_query_terms(getattr(draft, "primary_names_latin", []))
+        ]
+    )
+    if not primary_keywords:
+        return []
+    composer_keyword = extract_person_query_keyword(draft.composer_name_latin or draft.composer_name)
+    work_candidates: list[str] = []
+    stripped_work = compact(strip_catalogue_text(work_text))
+    if looks_latin(stripped_work) and "concerto" in normalize_text(stripped_work):
+        work_candidates.append(stripped_work)
+    work_candidates.extend(
+        sorted(
+            {
+                alias
+                for alias in build_work_aliases(work_text)
+                if looks_latin(alias) and "concerto" in alias
+            },
+            key=lambda alias: (len(alias.split()), len(alias)),
+        )
+    )
+    queries: list[str] = []
+    for primary_keyword in primary_keywords[:2]:
+        for work_candidate in dedupe_text(work_candidates)[:2]:
+            candidate_variants = [work_candidate]
+            if "Piano Concerto" in work_candidate and "Piano Concertos" not in work_candidate:
+                candidate_variants.append(work_candidate.replace("Piano Concerto", "Piano Concertos"))
+            deduped_variants = dedupe_text(candidate_variants)
+            if composer_keyword:
+                for candidate_variant in deduped_variants:
+                    queries.append(f"{primary_keyword} {composer_keyword} {candidate_variant} {decade_bucket}")
+            for candidate_variant in deduped_variants:
+                queries.append(f"{primary_keyword} {candidate_variant} {decade_bucket}")
+    return dedupe_text(queries)
+
+
+def build_chinese_host_primary_work_rescue_queries(draft: DraftRecordingEntry) -> list[str]:
+    work_text = normalize_text(draft.work_title_latin)
+    if "concerto" not in work_text:
+        return []
+    collaboration_queries = build_collaboration_surname_rescue_queries(draft)
+    primary_names = dedupe_text(prioritize_person_query_terms(getattr(draft, "primary_names_latin", [])))
+    if not primary_names:
+        return collaboration_queries
+    primary_keywords = dedupe_text(
+        [
+            extract_person_query_keyword(value)
+            for value in prioritize_person_query_terms(getattr(draft, "primary_names_latin", []))
+        ]
+    )
+    composer_keyword_latin = extract_person_query_keyword(draft.composer_name_latin or draft.composer_name)
+    composer_keyword_cjk = extract_cjk_person_query_keyword(draft.composer_name)
+    reference_year = extract_year(draft.performance_date_text or draft.title or draft.raw_text or draft.source_line)
+    stripped_work_latin = compact(strip_catalogue_text(draft.work_title_latin))
+    secondary_keywords = dedupe_text(
+        [
+            extract_person_query_keyword(value)
+            for value in prioritize_person_query_terms(
+                [
+                    *getattr(draft, "secondary_names_latin", []),
+                    *getattr(draft, "lead_names_latin", [])[1:],
+                ]
+            )
+        ]
+    )
+    queries: list[str] = collaboration_queries[:1]
+    if (
+        primary_keywords
+        and composer_keyword_latin
+        and stripped_work_latin
+        and reference_year
+        and any(is_distinctive_person_query_keyword(primary_keyword) for primary_keyword in primary_keywords[:2])
+    ):
+        for primary_keyword in primary_keywords[:2]:
+            if not is_distinctive_person_query_keyword(primary_keyword):
+                continue
+            queries.append(f"{primary_keyword} {composer_keyword_latin} {stripped_work_latin} {reference_year}")
+    for primary_name in primary_names[:2]:
+        if composer_keyword_latin:
+            queries.append(f"{primary_name} {composer_keyword_latin} concerto")
+        if composer_keyword_cjk:
+            queries.append(f"{primary_name} {composer_keyword_cjk}钢协")
+        for secondary_keyword in secondary_keywords[:1]:
+            if secondary_keyword.casefold() == primary_name.casefold():
+                continue
+            if composer_keyword_latin:
+                queries.append(f"{primary_name} {secondary_keyword} {composer_keyword_latin} concerto")
+            else:
+                queries.append(f"{primary_name} {secondary_keyword} concerto")
+    if primary_keywords and secondary_keywords and reference_year:
+        for primary_keyword in primary_keywords[:1]:
+            for secondary_keyword in secondary_keywords[:1]:
+                if secondary_keyword.casefold() == primary_keyword.casefold():
+                    continue
+                queries.append(f"{primary_keyword} {secondary_keyword} concerto {reference_year}")
+    queries.extend(collaboration_queries[1:])
+    return dedupe_text(queries)
+
+
+def build_chinese_host_primary_year_anchor_queries(draft: DraftRecordingEntry) -> list[str]:
+    reference_year = extract_year(
+        draft.performance_date_text or draft.title or draft.raw_text or draft.source_line or draft.item_id
+    )
+    if not reference_year:
+        return []
+    primary_values = dedupe_text([
+        *getattr(draft, "primary_names", [])[:2],
+        *getattr(draft, "primary_names_latin", [])[:2],
+        *draft.lead_names[:1],
+        *draft.lead_names_latin[:1],
+    ])
+    queries: list[str] = []
+    for value in primary_values:
+        normalized = compact(value)
+        if not normalized:
+            continue
+        query_term = normalized if contains_cjk(normalized) else extract_person_query_keyword(normalized)
+        query_term = compact(query_term)
+        if not query_term:
+            continue
+        queries.append(f"{query_term} {reference_year}")
+    return dedupe_text(queries)
+
+
+def build_ensemble_bundle_query_keywords(values: list[str]) -> list[str]:
+    stopwords = {
+        "orchestra",
+        "philharmonic",
+        "symphony",
+        "ensemble",
+        "choir",
+        "national",
+        "state",
+        "royal",
+        "the",
+        "of",
+        "de",
+        "la",
+    }
+    keywords: list[str] = []
+    for value in values:
+        normalized = compact(value)
+        if not normalized:
+            continue
+        if contains_cjk(normalized):
+            for marker in ("交响乐团", "管弦乐团", "爱乐乐团", "乐团"):
+                if marker not in normalized:
+                    continue
+                trimmed = compact(normalized.replace(marker, ""))
+                if len(trimmed) >= 2:
+                    keywords.append(trimmed)
+            continue
+        tokens = [token for token in re.findall(r"[A-Za-z][A-Za-z'.-]*", normalized) if token]
+        if not tokens:
+            continue
+        uppercase_tokens = [token for token in tokens if token.isupper() and 2 <= len(token) <= 5]
+        if uppercase_tokens:
+            keywords.append(uppercase_tokens[0])
+        acronym = build_acronym(tokens)
+        if 2 <= len(acronym) <= 5:
+            keywords.append(acronym)
+        significant = [token for token in tokens if token.lower() not in stopwords]
+        if significant:
+            keywords.append(significant[0])
+        if len(significant) >= 2 and len(significant[0]) + len(significant[1]) <= 24:
+            keywords.append(f"{significant[0]} {significant[1]}")
+    return dedupe_text(keywords)
+
+
+def build_cjk_ensemble_context_keywords(values: list[str]) -> list[str]:
+    markers = (
+        "国家爱乐乐团",
+        "国家交响乐团",
+        "国家管弦乐团",
+        "国家乐团",
+        "爱乐乐团",
+        "交响乐团",
+        "管弦乐团",
+        "爱乐乐队",
+        "交响乐队",
+        "管弦乐队",
+        "乐团",
+        "乐队",
+    )
+    keywords: list[str] = []
+    for value in values:
+        normalized = compact(value)
+        if not normalized or not contains_cjk(normalized):
+            continue
+        for marker in markers:
+            if marker not in normalized:
+                continue
+            trimmed = compact(normalized.replace(marker, ""))
+            if len(trimmed) >= 2:
+                keywords.append(trimmed)
+        if 2 <= len(normalized) <= 6:
+            keywords.append(normalized)
+    return dedupe_text(keywords)
+
+
+def build_chinese_host_cjk_context_rescue_queries(
+    draft: DraftRecordingEntry,
+    *,
+    ensemble_terms: list[str],
+) -> list[str]:
+    work_text = normalize_text(draft.work_title_latin or draft.work_title)
+    if "concerto" not in work_text:
+        return []
+    reference_year = extract_year(draft.performance_date_text or draft.title or draft.raw_text or draft.source_line)
+    if not reference_year:
+        return []
+    composer_keyword_cjk = extract_cjk_person_query_keyword(draft.composer_name)
+    if not composer_keyword_cjk:
+        return []
+    work_shorthand = f"{composer_keyword_cjk}钢协"
+    primary_keywords = dedupe_text(
+        extract_cjk_person_query_keyword(value)
+        for value in [
+            *getattr(draft, "primary_names", []),
+            *getattr(draft, "lead_names", [])[:1],
+        ]
+    )
+    secondary_keywords = dedupe_text(
+        extract_cjk_person_query_keyword(value)
+        for value in [
+            *getattr(draft, "secondary_names", []),
+            *getattr(draft, "lead_names", [])[1:],
+        ]
+    )
+    ensemble_keywords = build_cjk_ensemble_context_keywords(ensemble_terms)
+    if not primary_keywords or not ensemble_keywords:
+        return []
+
+    queries: list[str] = []
+    for ensemble_keyword in ensemble_keywords[:2]:
+        for primary_keyword in primary_keywords[:1]:
+            queries.append(f"{primary_keyword} {ensemble_keyword} {reference_year} {work_shorthand}")
+            for secondary_keyword in secondary_keywords[:1]:
+                if secondary_keyword == primary_keyword:
+                    continue
+                queries.append(
+                    f"{secondary_keyword} {primary_keyword} {ensemble_keyword} {reference_year} {work_shorthand}"
+                )
+    return dedupe_text(queries)
+
+
+def build_chinese_host_bundle_context_queries(
+    draft: DraftRecordingEntry,
+    *,
+    ensemble_terms: list[str],
+) -> list[str]:
+    work_text = normalize_text(draft.work_title_latin or draft.work_title)
+    if "concerto" not in work_text:
+        return []
+    reference_year = extract_year(draft.performance_date_text or draft.title or draft.raw_text or draft.source_line)
+    if not reference_year:
+        return []
+    primary_names = prioritize_person_query_terms(getattr(draft, "primary_names_latin", []))[:2]
+    primary_keywords = dedupe_text(extract_person_query_keyword(value) for value in primary_names)
+    secondary_keywords = dedupe_text(
+        extract_person_query_keyword(value)
+        for value in prioritize_person_query_terms(
+            [
+                *getattr(draft, "secondary_names_latin", []),
+                *getattr(draft, "lead_names_latin", [])[1:],
+            ]
+        )
+    )
+    composer_keyword = extract_person_query_keyword(draft.composer_name_latin or draft.composer_name)
+    ensemble_keywords = build_ensemble_bundle_query_keywords(ensemble_terms)
+    if not primary_names or not ensemble_keywords:
+        return []
+
+    work_keywords = dedupe_text(
+        alias
+        for alias in build_work_aliases(draft.work_title_latin or draft.work_title)
+        if alias in {"piano concerto", "piano concertos", "klavierkonzert"}
+    )
+
+    queries: list[str] = []
+    for ensemble_keyword in ensemble_keywords[:2]:
+        for primary_name in primary_names[:1]:
+            if composer_keyword:
+                queries.append(f"{primary_name} {ensemble_keyword} {composer_keyword} concerto {reference_year}")
+        for primary_keyword in primary_keywords[:2]:
+            if composer_keyword:
+                queries.append(f"{primary_keyword} {ensemble_keyword} {composer_keyword} concerto {reference_year}")
+            for secondary_keyword in secondary_keywords[:1]:
+                if secondary_keyword.casefold() == primary_keyword.casefold():
+                    continue
+                if composer_keyword:
+                    queries.append(
+                        f"{primary_keyword} {secondary_keyword} {ensemble_keyword} {composer_keyword} concerto {reference_year}"
+                    )
+            for work_keyword in work_keywords[:2]:
+                queries.append(f"{primary_keyword} {ensemble_keyword} {work_keyword} {reference_year}")
+    return dedupe_text(queries)
+
+
+def build_collaboration_surname_rescue_queries(draft: DraftRecordingEntry) -> list[str]:
+    work_text = normalize_text(draft.work_title_latin or draft.work_title)
+    if "concerto" not in work_text:
+        return []
+    primary_keywords = dedupe_text(
+        [
+            extract_person_query_keyword(value)
+            for value in prioritize_person_query_terms(getattr(draft, "primary_names_latin", []))
+        ]
+    )
+    secondary_keywords = dedupe_text(
+        [
+            extract_person_query_keyword(value)
+            for value in prioritize_person_query_terms(
+                [
+                    *getattr(draft, "secondary_names_latin", []),
+                    *getattr(draft, "lead_names_latin", [])[1:],
+                ]
+            )
+        ]
+    )
+    if not primary_keywords or not secondary_keywords:
+        return []
+    composer_keyword = extract_person_query_keyword(draft.composer_name_latin or draft.composer_name)
+    reference_year = extract_year(draft.performance_date_text or draft.title or draft.raw_text or draft.source_line)
+    work_keywords = dedupe_text(
+        alias
+        for alias in build_work_aliases(draft.work_title_latin or draft.work_title)
+        if alias in {"piano concerto", "klavierkonzert"}
+    )
+
+    queries: list[str] = []
+    for primary_keyword in primary_keywords[:2]:
+        for secondary_keyword in secondary_keywords[:2]:
+            if secondary_keyword.casefold() == primary_keyword.casefold():
+                continue
+            if composer_keyword and reference_year:
+                queries.append(f"{primary_keyword} {secondary_keyword} {composer_keyword} concerto {reference_year}")
+            if composer_keyword:
+                queries.append(f"{primary_keyword} {secondary_keyword} {composer_keyword} concerto")
+            if reference_year:
+                queries.append(f"{primary_keyword} {secondary_keyword} concerto {reference_year}")
+                for work_keyword in work_keywords[:1]:
+                    queries.append(f"{primary_keyword} {secondary_keyword} {work_keyword} {reference_year}")
+    return dedupe_text(queries)
 
 
 def estimate_full_work_min_duration_seconds(draft: DraftRecordingEntry) -> int:
@@ -2286,7 +4242,11 @@ def build_work_aliases(value: str) -> set[str]:
     stripped = normalize_text(strip_catalogue_text(text))
     if stripped:
         aliases.add(stripped)
+    stripped_key_text = normalize_text(strip_work_key_text(text))
+    if stripped_key_text:
+        aliases.add(stripped_key_text)
     aliases.update(build_chinese_work_shorthand_aliases(text, normalized))
+    aliases.update(build_generic_work_aliases(text))
     aliases.update(build_keyed_work_aliases(text))
     aliases.update(build_named_work_aliases(text))
 
@@ -2324,6 +4284,32 @@ def build_work_aliases(value: str) -> set[str]:
         aliases.add(f"sym {number}")
         aliases.add(f"sym{number}")
     return aliases
+
+
+def strip_work_key_text(value: str) -> str:
+    text = compact(value)
+    if not text:
+        return ""
+    stripped = re.sub(r"^[A-Ga-g]\s*(?:\u5927\u8c03|\u5c0f\u8c03)", "", text)
+    stripped = re.sub(r"\b(?:in\s+)?[A-Ga-g][#b-]?\s*(?:major|minor|maj|min)\b", "", stripped, flags=re.I)
+    stripped = re.sub(r"^[\s,;:()\-]+|[\s,;:()\-]+$", "", stripped)
+    return compact(stripped)
+
+
+def build_generic_work_aliases(value: str) -> set[str]:
+    text = compact(value)
+    normalized = normalize_text(text)
+    aliases: set[str] = set()
+    stripped_text = strip_work_key_text(text)
+    stripped_normalized = normalize_text(stripped_text)
+    if stripped_normalized:
+        aliases.add(stripped_normalized)
+    if "\u534f\u594f\u66f2" in text and "\u94a2\u7434" in text:
+        aliases.add(normalize_text("\u94a2\u7434\u534f\u594f\u66f2"))
+        aliases.add(normalize_text("\u94a2\u534f"))
+    if "concerto" in normalized and "piano" in normalized:
+        aliases.add("piano concerto")
+    return {alias for alias in aliases if alias}
 
 
 def build_chinese_work_shorthand_aliases(text: str, normalized: str) -> set[str]:
@@ -2510,6 +4496,15 @@ def extract_performance_context_tokens(value: str) -> list[str]:
     normalized = re.sub(r"(19\d{2}|20\d{2})", " ", value or "")
     tokens = tokenize(normalized)
     stopwords = {
+        "live",
+        "recorded",
+        "recording",
+    }
+    return [token for token in tokens if token not in stopwords]
+
+
+def has_specific_date_context_tokens(tokens: list[str]) -> bool:
+    month_tokens = {
         "january",
         "february",
         "march",
@@ -2522,11 +4517,8 @@ def extract_performance_context_tokens(value: str) -> list[str]:
         "october",
         "november",
         "december",
-        "live",
-        "recorded",
-        "recording",
     }
-    return [token for token in tokens if token not in stopwords and not token.isdigit()]
+    return any(token in month_tokens for token in tokens) and any(token.isdigit() for token in tokens)
 
 
 def extract_release_date(value: str) -> str:

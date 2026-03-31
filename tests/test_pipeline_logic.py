@@ -6,12 +6,18 @@ import time
 from app.models.protocol import CreateJobRequest
 from app.services.http_sources import HttpSourceProvider
 from app.services.pipeline import (
+    build_candidate_work_anchor_terms,
+    candidate_conflicting_credit_tokens,
+    candidate_mentions_names,
+    candidate_title_quality_score,
     DraftRecordingEntry,
     InputNormalizer,
     LinkCandidate,
+    person_variant_matches,
     ProfileResolver,
     RetrievalPipeline,
     SourceRecord,
+    build_latin_credit_variants,
     build_latin_work_alias,
     build_queries,
     sort_link_candidates,
@@ -449,6 +455,34 @@ def test_input_normalizer_adds_person_lookup_latin_aliases_for_query_generation(
     assert any("Walter Gieseking Wilhelm Furtwangler" in query for query in draft.query_lead_names_latin)
 
 
+def test_input_normalizer_enriches_title_inferred_secondary_latin_aliases_from_person_alias_loader() -> None:
+    class FakePersonAliasLoader:
+        def expand(self, value: str, *, role: str | None = None):
+            mapping = {
+                ("conductor", "富特文格勒"): ["富特文格勒", "Wilhelm Furtwangler"],
+            }
+            return mapping.get((role, value), [value])
+
+    payload = sample_request()
+    payload["items"][0]["workTypeHint"] = "concerto"
+    payload["items"][0]["seed"]["title"] = "富特文格勒 - 吉泽金 - 柏林爱乐乐团 - March 3, 1942 Berlin"
+    payload["items"][0]["seed"]["composerName"] = "舒曼"
+    payload["items"][0]["seed"]["composerNameLatin"] = "Robert Schumann"
+    payload["items"][0]["seed"]["workTitle"] = "a小调钢琴协奏曲"
+    payload["items"][0]["seed"]["workTitleLatin"] = "Piano Concerto, Op.54"
+    payload["items"][0]["seed"]["catalogue"] = "Op.54"
+    payload["items"][0]["seed"]["credits"] = [
+        {"role": "soloist", "displayName": "Walter Gieseking", "label": "Walter Gieseking"},
+    ]
+    request = CreateJobRequest.model_validate(payload)
+
+    draft = InputNormalizer(person_alias_loader=FakePersonAliasLoader()).normalize(request.items[0])
+
+    assert "富特文格勒" in draft.secondary_names
+    assert "Wilhelm Furtwangler" in draft.secondary_names_latin
+    assert any("Walter Gieseking Wilhelm Furtwangler" in query for query in draft.query_lead_names_latin)
+
+
 def test_input_normalizer_extracts_english_alias_from_person_lookup_name_latin_payload() -> None:
     class FakePersonNameLookup:
         def resolve(self, person_id: str):
@@ -482,6 +516,101 @@ def test_input_normalizer_extracts_english_alias_from_person_lookup_name_latin_p
 
     assert "Sviatoslav Teofilovich Richter" in draft.primary_names_latin
     assert any("Sviatoslav Teofilovich Richter" in query for query in draft.query_lead_names_latin)
+
+
+def test_person_variant_matches_when_middle_name_is_omitted() -> None:
+    assert person_variant_matches("玛丽亚·格林伯格", "玛丽亚·伊斯拉列夫娜·格林伯格")
+    assert person_variant_matches("Maria Grinberg", "Maria Israilevna Grinberg")
+
+
+def test_candidate_conflicting_credit_tokens_ignores_shorter_same_person_variant() -> None:
+    draft = DraftRecordingEntry(
+        item_id="recording-grinberg-full",
+        title="埃利亚斯伯格 - 格林伯格 - 苏联国家交响乐团 - 1958",
+        composer_name="罗伯特·舒曼",
+        composer_name_latin="Robert Schumann",
+        work_title="a小调钢琴协奏曲",
+        work_title_latin="Piano Concerto, Op.54",
+        catalogue="Op.54",
+        performance_date_text="1958",
+        venue_text="",
+        album_title="",
+        label="",
+        release_date="",
+        notes="",
+        source_line="罗伯特·舒曼 | a小调钢琴协奏曲 | 玛丽亚·伊斯拉列夫娜·格林伯格 | 卡尔·埃利亚斯伯格 | 苏联国家交响乐团 | 1958",
+        raw_text="罗伯特·舒曼 | a小调钢琴协奏曲 | 玛丽亚·伊斯拉列夫娜·格林伯格 | 卡尔·埃利亚斯伯格 | 苏联国家交响乐团 | 1958",
+        existing_links=[],
+        primary_names=["玛丽亚·伊斯拉列夫娜·格林伯格"],
+        primary_names_latin=["Maria Grinberg", "Maria Israilevna Grinberg"],
+        secondary_names=["卡尔·埃利亚斯伯格"],
+        secondary_names_latin=["Carl Eliasberg"],
+        query_lead_names=["玛丽亚·伊斯拉列夫娜·格林伯格", "卡尔·埃利亚斯伯格"],
+        query_lead_names_latin=["Maria Grinberg Carl Eliasberg", "Maria Grinberg / Carl Eliasberg"],
+        lead_names=["玛丽亚·伊斯拉列夫娜·格林伯格", "卡尔·埃利亚斯伯格"],
+        lead_names_latin=["Maria Grinberg", "Maria Israilevna Grinberg", "Carl Eliasberg"],
+        ensemble_names=["苏联国家交响乐团"],
+        ensemble_names_latin=["USSR State Symphony Orchestra"],
+    )
+
+    title = "【玛丽亚·格林伯格 | 舒曼钢协】Maria Grinberg plays Schumann Piano Concerto Op. 54"
+
+    assert candidate_conflicting_credit_tokens(draft, title) == set()
+
+
+def test_build_latin_credit_variants_prefers_condensed_alias_for_long_person_name() -> None:
+    variants = build_latin_credit_variants("Wilhelm Walter Friedrich Kempff", [])
+
+    assert variants[0] == "Wilhelm Kempff"
+    assert "Wilhelm Walter Friedrich Kempff" in variants
+
+
+def test_input_normalizer_falls_back_to_year_hint_from_item_id_when_date_missing() -> None:
+    payload = sample_request()
+    payload["items"][0]["itemId"] = "recording-demo-1954-full"
+    payload["items"][0]["workTypeHint"] = "concerto"
+    payload["items"][0]["seed"]["title"] = "Richter Budapest Academy"
+    payload["items"][0]["seed"]["composerName"] = "Robert Schumann"
+    payload["items"][0]["seed"]["composerNameLatin"] = "Robert Schumann"
+    payload["items"][0]["seed"]["workTitle"] = "Piano Concerto in A minor"
+    payload["items"][0]["seed"]["workTitleLatin"] = "Piano Concerto, Op.54"
+    payload["items"][0]["seed"]["catalogue"] = "Op.54"
+    payload["items"][0]["seed"]["performanceDateText"] = ""
+    payload["items"][0]["sourceLine"] = "Robert Schumann | Piano Concerto in A minor | Sviatoslav Richter | Janos Ferencsik | Hungarian National Philharmonic Orchestra | -"
+    payload["items"][0]["seed"]["credits"] = [
+        {"role": "soloist", "displayName": "Sviatoslav Richter", "label": ""},
+        {"role": "conductor", "displayName": "Janos Ferencsik", "label": ""},
+        {"role": "orchestra", "displayName": "Hungarian National Philharmonic Orchestra", "label": ""},
+    ]
+    request = CreateJobRequest.model_validate(payload)
+
+    draft = InputNormalizer().normalize(request.items[0])
+
+    assert draft.performance_date_text == "1954"
+
+
+def test_input_normalizer_extracts_year_hint_from_production_style_item_id() -> None:
+    payload = sample_request()
+    payload["items"][0]["itemId"] = "recording-a小调钢琴协奏曲-里赫特-and-费伦奇克1954-full"
+    payload["items"][0]["workTypeHint"] = "concerto"
+    payload["items"][0]["seed"]["title"] = "费伦奇克 - 里赫特 - 匈牙利国家爱乐乐团 - 布达佩斯音乐学院"
+    payload["items"][0]["seed"]["composerName"] = "罗伯特·舒曼"
+    payload["items"][0]["seed"]["composerNameLatin"] = "Robert Schumann"
+    payload["items"][0]["seed"]["workTitle"] = "a小调钢琴协奏曲"
+    payload["items"][0]["seed"]["workTitleLatin"] = "Piano Concerto, Op.54"
+    payload["items"][0]["seed"]["catalogue"] = "Op.54"
+    payload["items"][0]["seed"]["performanceDateText"] = ""
+    payload["items"][0]["sourceLine"] = "罗伯特·舒曼 | a小调钢琴协奏曲 | 斯维亚托斯拉夫·特奥菲洛维奇·里赫特 | 费伦奇克·亚诺什 | 匈牙利国家爱乐乐团 | -"
+    payload["items"][0]["seed"]["credits"] = [
+        {"role": "soloist", "displayName": "斯维亚托斯拉夫·特奥菲洛维奇·里赫特", "label": ""},
+        {"role": "conductor", "displayName": "费伦奇克·亚诺什", "label": ""},
+        {"role": "orchestra", "displayName": "匈牙利国家爱乐乐团", "label": ""},
+    ]
+    request = CreateJobRequest.model_validate(payload)
+
+    draft = InputNormalizer().normalize(request.items[0])
+
+    assert draft.performance_date_text == "1954"
 
 
 def test_input_normalizer_recovers_concerto_collaborator_group_and_date_from_title() -> None:
@@ -720,6 +849,382 @@ def test_pipeline_promotes_llm_accepted_candidate_into_final_result() -> None:
     assert result.result.links
     assert result.result.links[0].url == "https://stream.example/borderline"
     assert result.result.images
+
+
+def test_pipeline_promotes_single_exact_low_confidence_platform_candidate() -> None:
+    class SingleExactSourceProvider:
+        async def inspect_existing_links(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_high_quality(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_streaming(self, draft, profile):
+            del draft, profile
+            return [
+                {
+                    "url": "https://www.youtube.com/watch?v=exactlow001",
+                    "source_label": "YouTube Search",
+                    "source_kind": "streaming",
+                    "title": "Schumann - Piano Concerto, op.54 Eliso Virsaladze",
+                    "description": "Historic upload",
+                    "platform": "youtube",
+                    "weight": 0.68,
+                    "same_recording_score": 0.45,
+                    "duration_seconds": 1920,
+                    "uploader": "Archive",
+                    "view_count": 2400,
+                    "fields": {},
+                    "images": [],
+                }
+            ]
+
+        async def search_fallback(self, draft, profile):
+            del draft, profile
+            return []
+
+    payload = sample_request()
+    payload["items"][0]["workTypeHint"] = "concerto"
+    payload["items"][0]["sourceLine"] = (
+        "Robert Schumann | Piano Concerto in A minor, Op.54 | Eliso Virsaladze | "
+        "Alexander Rudin | - | -"
+    )
+    payload["items"][0]["seed"]["title"] = "Eliso Virsaladze"
+    payload["items"][0]["seed"]["composerNameLatin"] = "Robert Schumann"
+    payload["items"][0]["seed"]["workTitleLatin"] = "Piano Concerto in A minor, Op.54"
+    payload["items"][0]["seed"]["catalogue"] = "Op.54"
+    payload["items"][0]["seed"]["credits"] = [
+        {"role": "soloist", "displayName": "Eliso Virsaladze", "label": "Eliso Virsaladze"},
+        {"role": "conductor", "displayName": "Alexander Rudin", "label": "Alexander Rudin"},
+    ]
+    request = CreateJobRequest.model_validate(payload)
+    pipeline = RetrievalPipeline(source_provider=SingleExactSourceProvider(), llm_client=None)
+
+    result = asyncio.run(pipeline.retrieve(request.items[0]))
+
+    assert [link.url for link in result.result.links] == ["https://www.youtube.com/watch?v=exactlow001"]
+
+
+def test_pipeline_promotes_exact_low_confidence_candidate_over_same_score_noise() -> None:
+    class SparseVirsaladzeProvider:
+        async def inspect_existing_links(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_high_quality(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_streaming(self, draft, profile):
+            del draft, profile
+            return [
+                {
+                    "url": "https://www.youtube.com/watch?v=tDxa2aOQ0w0",
+                    "source_label": "YouTube Search",
+                    "source_kind": "streaming",
+                    "title": "Schumann - Piano Concerto, op.54 Eliso Virsaladze",
+                    "description": "Historic upload",
+                    "platform": "youtube",
+                    "weight": 0.68,
+                    "same_recording_score": 0.45,
+                    "duration_seconds": 1920,
+                    "uploader": "Archive",
+                    "view_count": 2400,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://www.youtube.com/watch?v=pzS7WUTh8Sc",
+                    "source_label": "YouTube Search",
+                    "source_kind": "streaming",
+                    "title": "Eliso Virsaladze plays Rachmaninov Concerto No.2",
+                    "description": "Wrong work upload",
+                    "platform": "youtube",
+                    "weight": 0.68,
+                    "same_recording_score": 0.45,
+                    "duration_seconds": 2010,
+                    "uploader": "Archive",
+                    "view_count": 5100,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://www.bilibili.com/video/BV1TJ411a7E8/",
+                    "source_label": "Bilibili Search",
+                    "source_kind": "streaming",
+                    "title": "Elisso Virsaladze & Moscow Chamber Orchestra",
+                    "description": "Wrong repertoire upload",
+                    "platform": "bilibili",
+                    "weight": 0.68,
+                    "same_recording_score": 0.45,
+                    "duration_seconds": 2050,
+                    "uploader": "Archive",
+                    "view_count": 1800,
+                    "fields": {},
+                    "images": [],
+                },
+            ]
+
+        async def search_fallback(self, draft, profile):
+            del draft, profile
+            return []
+
+    payload = sample_request()
+    payload["items"][0]["workTypeHint"] = "concerto"
+    payload["items"][0]["sourceLine"] = (
+        "Robert Schumann | Piano Concerto in A minor, Op.54 | Eliso Virsaladze | "
+        "Alexander Rudin | - | -"
+    )
+    payload["items"][0]["seed"]["title"] = "Eliso Virsaladze"
+    payload["items"][0]["seed"]["composerNameLatin"] = "Robert Schumann"
+    payload["items"][0]["seed"]["workTitleLatin"] = "Piano Concerto in A minor, Op.54"
+    payload["items"][0]["seed"]["catalogue"] = "Op.54"
+    payload["items"][0]["seed"]["credits"] = [
+        {"role": "soloist", "displayName": "Eliso Virsaladze", "label": "Eliso Virsaladze"},
+        {"role": "conductor", "displayName": "Alexander Rudin", "label": "Alexander Rudin"},
+    ]
+    request = CreateJobRequest.model_validate(payload)
+    pipeline = RetrievalPipeline(source_provider=SparseVirsaladzeProvider(), llm_client=None)
+
+    result = asyncio.run(pipeline.retrieve(request.items[0]))
+
+    assert [link.url for link in result.result.links] == ["https://www.youtube.com/watch?v=tDxa2aOQ0w0"]
+
+
+def test_pipeline_keeps_best_low_confidence_candidate_when_sparse_exact_cluster_has_no_clear_gap() -> None:
+    class SparseExactClusterProvider:
+        async def inspect_existing_links(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_high_quality(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_streaming(self, draft, profile):
+            del draft, profile
+            return [
+                {
+                    "url": "https://www.youtube.com/watch?v=tDxa2aOQ0w0",
+                    "source_label": "YouTube Search",
+                    "source_kind": "streaming",
+                    "title": "Schumann - Piano Concerto, op.54 Eliso Virsaladze",
+                    "description": "Historic upload",
+                    "platform": "youtube",
+                    "weight": 0.68,
+                    "same_recording_score": 0.45,
+                    "duration_seconds": 1920,
+                    "uploader": "Archive",
+                    "view_count": 2400,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://www.youtube.com/watch?v=CLElMqoOT6I",
+                    "source_label": "YouTube Search",
+                    "source_kind": "streaming",
+                    "title": "Eliso Virsaladze - Schumann Piano Concerto in A minor",
+                    "description": "Alternate upload",
+                    "platform": "youtube",
+                    "weight": 0.68,
+                    "same_recording_score": 0.45,
+                    "duration_seconds": 1935,
+                    "uploader": "Collector",
+                    "view_count": 1800,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://www.bilibili.com/video/BV1h7411z71D/",
+                    "source_label": "Bilibili Search",
+                    "source_kind": "streaming",
+                    "title": "【钢琴】Eliso Virsaladze演奏 舒曼 钢琴协奏曲Op.54",
+                    "description": "Mirror upload",
+                    "platform": "bilibili",
+                    "weight": 0.68,
+                    "same_recording_score": 0.45,
+                    "duration_seconds": 1910,
+                    "uploader": "Archive",
+                    "view_count": 900,
+                    "fields": {},
+                    "images": [],
+                },
+            ]
+
+        async def search_fallback(self, draft, profile):
+            del draft, profile
+            return []
+
+    payload = sample_request()
+    payload["items"][0]["workTypeHint"] = "concerto"
+    payload["items"][0]["sourceLine"] = (
+        "Robert Schumann | Piano Concerto in A minor, Op.54 | Eliso Virsaladze | "
+        "Alexander Rudin | - | -"
+    )
+    payload["items"][0]["seed"]["title"] = "Eliso Virsaladze"
+    payload["items"][0]["seed"]["composerNameLatin"] = "Robert Schumann"
+    payload["items"][0]["seed"]["workTitleLatin"] = "Piano Concerto in A minor, Op.54"
+    payload["items"][0]["seed"]["catalogue"] = "Op.54"
+    payload["items"][0]["seed"]["credits"] = [
+        {"role": "soloist", "displayName": "Eliso Virsaladze", "label": "Eliso Virsaladze"},
+        {"role": "conductor", "displayName": "Alexander Rudin", "label": "Alexander Rudin"},
+    ]
+    request = CreateJobRequest.model_validate(payload)
+    pipeline = RetrievalPipeline(source_provider=SparseExactClusterProvider(), llm_client=None)
+
+    result = asyncio.run(pipeline.retrieve(request.items[0]))
+
+    final_urls = [link.url for link in result.result.links]
+    candidate_urls = [link.url for link in result.link_candidates]
+    assert "https://www.youtube.com/watch?v=tDxa2aOQ0w0" in final_urls
+    assert "https://www.bilibili.com/video/BV1h7411z71D/" in candidate_urls
+    assert "https://www.youtube.com/watch?v=CLElMqoOT6I" not in final_urls
+
+
+def test_pipeline_uses_description_context_to_promote_generic_title_candidate() -> None:
+    class DescriptionAwareProvider:
+        async def inspect_existing_links(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_high_quality(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_streaming(self, draft, profile):
+            del draft, profile
+            return [
+                {
+                    "url": "https://www.youtube.com/watch?v=descgood001",
+                    "source_label": "YouTube Search",
+                    "source_kind": "streaming",
+                    "title": "Schumann Piano Concerto",
+                    "description": "Wilhelm Kempff Antal Dorati Concertgebouw Orchestra Amsterdam 1959 live full performance",
+                    "platform": "youtube",
+                    "weight": 0.68,
+                    "same_recording_score": 0.45,
+                    "duration_seconds": 1910,
+                    "uploader": "Archive",
+                    "view_count": 2100,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://www.youtube.com/watch?v=descbad001",
+                    "source_label": "YouTube Search",
+                    "source_kind": "streaming",
+                    "title": "Schumann Piano Concerto",
+                    "description": "Historic concerto upload Clara Haskil 1960 studio recording",
+                    "platform": "youtube",
+                    "weight": 0.68,
+                    "same_recording_score": 0.45,
+                    "duration_seconds": 1910,
+                    "uploader": "Archive",
+                    "view_count": 2100,
+                    "fields": {},
+                    "images": [],
+                },
+            ]
+
+        async def search_fallback(self, draft, profile):
+            del draft, profile
+            return []
+
+    payload = sample_request()
+    payload["items"][0]["workTypeHint"] = "concerto"
+    payload["items"][0]["sourceLine"] = (
+        "Robert Schumann | Piano Concerto in A minor, Op.54 | Wilhelm Kempff | "
+        "Antal Dorati | Concertgebouw Orchestra Amsterdam | 1959"
+    )
+    payload["items"][0]["seed"]["title"] = "Wilhelm Kempff 1959"
+    payload["items"][0]["seed"]["composerNameLatin"] = "Robert Schumann"
+    payload["items"][0]["seed"]["workTitleLatin"] = "Piano Concerto in A minor, Op.54"
+    payload["items"][0]["seed"]["catalogue"] = "Op.54"
+    payload["items"][0]["seed"]["performanceDateText"] = "1959"
+    payload["items"][0]["seed"]["credits"] = [
+        {"role": "soloist", "displayName": "Wilhelm Kempff", "label": "Wilhelm Kempff"},
+        {"role": "conductor", "displayName": "Antal Dorati", "label": "Antal Dorati"},
+    ]
+    request = CreateJobRequest.model_validate(payload)
+    pipeline = RetrievalPipeline(source_provider=DescriptionAwareProvider(), llm_client=None)
+
+    result = asyncio.run(pipeline.retrieve(request.items[0]))
+
+    assert [link.url for link in result.result.links] == ["https://www.youtube.com/watch?v=descgood001"]
+
+
+def test_pipeline_description_support_does_not_promote_wrong_work_candidate() -> None:
+    class DescriptionGuardProvider:
+        async def inspect_existing_links(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_high_quality(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_streaming(self, draft, profile):
+            del draft, profile
+            return [
+                {
+                    "url": "https://www.youtube.com/watch?v=descgood002",
+                    "source_label": "YouTube Search",
+                    "source_kind": "streaming",
+                    "title": "Historic concerto performance",
+                    "description": "Sviatoslav Richter Janos Ferencsik Budapest 1954 Schumann Piano Concerto",
+                    "platform": "youtube",
+                    "weight": 0.68,
+                    "same_recording_score": 0.45,
+                    "duration_seconds": 2400,
+                    "uploader": "Archive",
+                    "view_count": 5200,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://www.youtube.com/watch?v=descbad002",
+                    "source_label": "YouTube Search",
+                    "source_kind": "streaming",
+                    "title": "Historic concerto performance",
+                    "description": "Sviatoslav Richter Budapest 1954 Rachmaninov Concerto No.2",
+                    "platform": "youtube",
+                    "weight": 0.68,
+                    "same_recording_score": 0.45,
+                    "duration_seconds": 2400,
+                    "uploader": "Archive",
+                    "view_count": 5200,
+                    "fields": {},
+                    "images": [],
+                },
+            ]
+
+        async def search_fallback(self, draft, profile):
+            del draft, profile
+            return []
+
+    payload = sample_request()
+    payload["items"][0]["workTypeHint"] = "concerto"
+    payload["items"][0]["sourceLine"] = (
+        "Robert Schumann | Piano Concerto in A minor, Op.54 | Sviatoslav Richter | "
+        "Janos Ferencsik | Budapest | 1954"
+    )
+    payload["items"][0]["seed"]["title"] = "Richter Budapest 1954"
+    payload["items"][0]["seed"]["composerNameLatin"] = "Robert Schumann"
+    payload["items"][0]["seed"]["workTitleLatin"] = "Piano Concerto in A minor, Op.54"
+    payload["items"][0]["seed"]["catalogue"] = "Op.54"
+    payload["items"][0]["seed"]["performanceDateText"] = "1954 Budapest"
+    payload["items"][0]["seed"]["credits"] = [
+        {"role": "soloist", "displayName": "Sviatoslav Richter", "label": "Sviatoslav Richter"},
+        {"role": "conductor", "displayName": "Janos Ferencsik", "label": "Janos Ferencsik"},
+    ]
+    request = CreateJobRequest.model_validate(payload)
+    pipeline = RetrievalPipeline(source_provider=DescriptionGuardProvider(), llm_client=None)
+
+    result = asyncio.run(pipeline.retrieve(request.items[0]))
+
+    assert [link.url for link in result.result.links] == ["https://www.youtube.com/watch?v=descgood002"]
 
 
 def test_pipeline_keeps_multiple_equivalent_upload_links_when_llm_confirms_same_version() -> None:
@@ -1037,6 +1542,175 @@ def test_pipeline_skips_llm_synthesis_for_unambiguous_top_candidate() -> None:
     assert result.result.links
     assert result.result.links[0].url == "https://stream.example/exact"
     assert llm.calls == 0
+
+
+def test_sort_link_candidates_prefers_exact_collaboration_credit_over_compilation_packaging() -> None:
+    draft = DraftRecordingEntry(
+        item_id="recording-kempff-dorati-ordering",
+        title="Wilhelm Kempff & Antal Dorati",
+        composer_name="舒曼",
+        composer_name_latin="Robert Schumann",
+        work_title="a小调钢琴协奏曲",
+        work_title_latin="Piano Concerto, Op.54",
+        catalogue="Op.54",
+        performance_date_text="1959",
+        venue_text="",
+        album_title="",
+        label="",
+        release_date="",
+        notes="",
+        source_line="Robert Schumann | Piano Concerto in A minor, Op.54 | Wilhelm Kempff | Antal Dorati | Concertgebouw Orchestra Amsterdam | 1959",
+        raw_text="Robert Schumann | Piano Concerto in A minor, Op.54 | Wilhelm Kempff | Antal Dorati | Concertgebouw Orchestra Amsterdam | 1959",
+        existing_links=[],
+        primary_names=["肯普夫"],
+        primary_names_latin=["Wilhelm Kempff"],
+        secondary_names=["多拉蒂"],
+        secondary_names_latin=["Antal Dorati"],
+        lead_names=["肯普夫", "多拉蒂"],
+        lead_names_latin=["Wilhelm Kempff", "Antal Dorati"],
+        ensemble_names=["阿姆斯特丹皇家音乐厅管弦乐团"],
+        ensemble_names_latin=["Concertgebouw Orchestra Amsterdam", "Royal Concertgebouw Orchestra"],
+    )
+    record_map = {
+        "https://www.bilibili.com/video/BV1exact/": SourceRecord(
+            url="https://www.bilibili.com/video/BV1exact/",
+            source_label="Bilibili Search Browser Search",
+            source_kind="streaming",
+            title="Wilhelm Kempff Antal Dorati Schumann Piano Concerto Op.54 1959 complete",
+            description="Concertgebouw Orchestra Amsterdam 1959 live full performance",
+            platform="bilibili",
+            weight=0.68,
+            same_recording_score=0.79,
+            duration_seconds=1880,
+            uploader="Classical Vault",
+            view_count=2200,
+        ),
+        "https://www.bilibili.com/video/BV1compilation/": SourceRecord(
+            url="https://www.bilibili.com/video/BV1compilation/",
+            source_label="Bilibili Search Browser Search",
+            source_kind="streaming",
+            title="Wilhelm Kempff plays Schumann Piano Concertos 1950s",
+            description="Compilation upload with multiple concerto performances",
+            platform="bilibili",
+            weight=0.68,
+            same_recording_score=0.79,
+            duration_seconds=5400,
+            uploader="Archive Channel",
+            view_count=2200,
+        ),
+    }
+    candidates = [
+        LinkCandidate(
+            platform=record.platform,
+            url=record.url,
+            title=record.title,
+            sourceLabel=record.source_label,
+            confidence=round(record.same_recording_score, 2),
+        )
+        for record in record_map.values()
+    ]
+
+    ordered = sort_link_candidates(draft, candidates, record_map, prefer_exactness=True)
+
+    assert [candidate.url for candidate in ordered] == [
+        "https://www.bilibili.com/video/BV1exact/",
+        "https://www.bilibili.com/video/BV1compilation/",
+    ]
+
+
+def test_candidate_mentions_names_does_not_mistake_clara_for_lara() -> None:
+    assert candidate_mentions_names("clara schumann piano concerto in a minor", ["Adelina de Lara"]) is False
+    assert candidate_mentions_names("adelina de lara 舒曼钢协", ["Adelina de Lara"]) is True
+
+
+def test_candidate_work_anchor_terms_include_generic_piano_concerto() -> None:
+    payload = sample_request()
+    payload["items"][0]["workTypeHint"] = "concerto"
+    payload["items"][0]["sourceLine"] = (
+        "Robert Schumann | Piano Concerto in A minor, Op.54 | Adelina de Lara | Ian Whyte | "
+        "BBC Scottish Symphony Orchestra | May 29, 1951"
+    )
+    payload["items"][0]["seed"]["title"] = "Adelina de Lara & Ian Whyte"
+    payload["items"][0]["seed"]["composerNameLatin"] = "Robert Schumann"
+    payload["items"][0]["seed"]["workTitleLatin"] = "Piano Concerto in A minor, Op.54"
+    payload["items"][0]["seed"]["catalogue"] = "Op.54"
+    payload["items"][0]["seed"]["credits"] = [
+        {"role": "soloist", "displayName": "Adelina de Lara", "label": "Adelina de Lara"},
+        {"role": "conductor", "displayName": "Ian Whyte", "label": "Ian Whyte"},
+    ]
+    request = CreateJobRequest.model_validate(payload)
+    draft = InputNormalizer().normalize(request.items[0])
+
+    assert "piano concerto" in build_candidate_work_anchor_terms(draft)
+
+
+def test_candidate_title_quality_score_recognizes_delara_cjk_work_shorthand() -> None:
+    draft = DraftRecordingEntry(
+        item_id="recording-delara-title-quality",
+        title="Adelina de Lara & Ian Whyte",
+        composer_name="舒曼",
+        composer_name_latin="Robert Schumann",
+        work_title="a小调钢琴协奏曲",
+        work_title_latin="Piano Concerto, Op.54",
+        catalogue="Op.54",
+        performance_date_text="May 29, 1951",
+        venue_text="",
+        album_title="",
+        label="",
+        release_date="",
+        notes="",
+        source_line="Robert Schumann | Piano Concerto in A minor, Op.54 | Adelina de Lara | Ian Whyte | BBC Scottish Symphony Orchestra | May 29, 1951",
+        raw_text="Robert Schumann | Piano Concerto in A minor, Op.54 | Adelina de Lara | Ian Whyte | BBC Scottish Symphony Orchestra | May 29, 1951",
+        existing_links=[],
+        primary_names=["阿德利纳·德·劳拉"],
+        primary_names_latin=["Adelina de Lara"],
+        secondary_names=["伊恩·怀特"],
+        secondary_names_latin=["Ian Whyte"],
+        lead_names=["阿德利纳·德·劳拉", "伊恩·怀特"],
+        lead_names_latin=["Adelina de Lara", "Ian Whyte"],
+        ensemble_names=["英国广播公司苏格兰交响乐团"],
+        ensemble_names_latin=["BBC Scottish Symphony Orchestra"],
+    )
+
+    actual_title = "【Adelina de Lara】克拉拉的爱徒会如何演奏舒曼钢协？"
+    wrong_title = "Clara Schumann Piano Concerto in A minor"
+
+    assert candidate_title_quality_score(draft, actual_title) > candidate_title_quality_score(draft, wrong_title)
+
+
+def test_candidate_title_quality_score_rewards_expected_composer_for_sparse_virsaladze_titles() -> None:
+    draft = DraftRecordingEntry(
+        item_id="recording-virsaladze-title-quality",
+        title="亚历山大·鲁丁 - 维尔萨拉泽 - 莫斯科音乐学院大音乐厅",
+        composer_name="罗伯特·舒曼",
+        composer_name_latin="Robert Schumann",
+        work_title="a小调钢琴协奏曲",
+        work_title_latin="Piano Concerto, Op.54",
+        catalogue="",
+        performance_date_text="",
+        venue_text="",
+        album_title="",
+        label="",
+        release_date="",
+        notes="",
+        source_line="罗伯特·舒曼 | a小调钢琴协奏曲 | 埃莉索·维尔萨拉泽 | 亚历山大·鲁丁 | -",
+        raw_text="罗伯特·舒曼 | a小调钢琴协奏曲 | 埃莉索·维尔萨拉泽 | 亚历山大·鲁丁 | -",
+        existing_links=[],
+        primary_names=["埃莉索·维尔萨拉泽"],
+        primary_names_latin=[],
+        secondary_names=["亚历山大·鲁丁"],
+        secondary_names_latin=[],
+        lead_names=["埃莉索·维尔萨拉泽", "亚历山大·鲁丁"],
+        lead_names_latin=[],
+        ensemble_names=[],
+        ensemble_names_latin=[],
+    )
+
+    correct_title = "Schumann - Piano Concerto, op.54 Eliso Virsaladze"
+    wrong_title = "Eliso Virsaladze plays Rachmaninov Concerto No.2"
+
+    assert candidate_title_quality_score(draft, correct_title) >= 0.08
+    assert candidate_title_quality_score(draft, correct_title) > candidate_title_quality_score(draft, wrong_title)
 
 
 def test_pipeline_isolates_access_events_between_concurrent_retrievals() -> None:
@@ -1398,6 +2072,670 @@ def test_pipeline_keeps_sparse_heifetz_canonical_alternate_upload_when_cluster_s
     assert "https://www.youtube.com/watch?v=9YWr1UcbZE8" in final_urls
 
 
+def test_pipeline_keeps_cross_platform_exact_heifetz_links_when_llm_is_missing() -> None:
+    class CrossPlatformHeifetzProvider:
+        async def inspect_existing_links(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_high_quality(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_streaming(self, draft, profile):
+            del draft, profile
+            return [
+                {
+                    "url": "https://www.bilibili.com/video/BV1vp421U7kw/",
+                    "source_label": "Bilibili Search",
+                    "source_kind": "streaming",
+                    "title": "贝多芬op.61《D大调小提琴协奏曲》海菲兹+托斯卡尼尼1940+NBC交响乐团 Beethoven Violin Concerto in D Major",
+                    "description": "Chinese exact upload",
+                    "platform": "bilibili",
+                    "weight": 0.68,
+                    "same_recording_score": 0.96,
+                    "duration_seconds": 2308,
+                    "uploader": "Uploader A",
+                    "view_count": 84,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://www.youtube.com/watch?v=8Aclk_O4bSc",
+                    "source_label": "YouTube Search",
+                    "source_kind": "streaming",
+                    "title": "Beethoven: Violin Concerto (Heifetz/Toscanini 1940)",
+                    "description": "Historic upload",
+                    "platform": "youtube",
+                    "weight": 0.68,
+                    "same_recording_score": 0.78,
+                    "duration_seconds": 2307,
+                    "uploader": "Collector A",
+                    "view_count": 1292,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://www.youtube.com/watch?v=9YWr1UcbZE8",
+                    "source_label": "YouTube Search",
+                    "source_kind": "streaming",
+                    "title": "Beethoven: Violin Concerto (1940) Heifetz/Toscanini",
+                    "description": "Canonical upload title",
+                    "platform": "youtube",
+                    "weight": 0.68,
+                    "same_recording_score": 0.71,
+                    "duration_seconds": 2315,
+                    "uploader": "Classical Archive",
+                    "view_count": 9696,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://www.bilibili.com/video/BV1Fm4y1G7NA/",
+                    "source_label": "Bilibili Search",
+                    "source_kind": "streaming",
+                    "title": "[骑熊净谱对照]贝多芬D大调小提琴协奏曲｜Jascha Heifetz演奏",
+                    "description": "Score-following upload",
+                    "platform": "bilibili",
+                    "weight": 0.68,
+                    "same_recording_score": 0.45,
+                    "duration_seconds": 2088,
+                    "uploader": "Uploader B",
+                    "view_count": 1622,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://www.youtube.com/watch?v=_N15_3_TP7I",
+                    "source_label": "YouTube Search",
+                    "source_kind": "streaming",
+                    "title": "Jascha Heifetz \"Violin Concerto\" Beethoven",
+                    "description": "Generic upload",
+                    "platform": "youtube",
+                    "weight": 0.68,
+                    "same_recording_score": 0.59,
+                    "duration_seconds": 2343,
+                    "uploader": "Uploader C",
+                    "view_count": 205590,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://www.youtube.com/watch?v=-rUNkiGgJx8",
+                    "source_label": "YouTube Search",
+                    "source_kind": "streaming",
+                    "title": "Beethoven: Violin Concerto (1940) Heifetz/Toscanini NEW EDITION",
+                    "description": "Remaster upload",
+                    "platform": "youtube",
+                    "weight": 0.68,
+                    "same_recording_score": 0.59,
+                    "duration_seconds": 2316,
+                    "uploader": "Archive C",
+                    "view_count": 361,
+                    "fields": {},
+                    "images": [],
+                },
+            ]
+
+        async def search_fallback(self, draft, profile):
+            del draft, profile
+            return []
+
+    payload = sample_request()
+    payload["items"][0]["workTypeHint"] = "concerto"
+    payload["items"][0]["sourceLine"] = "Ludwig van Beethoven | Violin Concerto in D major, Op. 61 | Jascha Heifetz | - | -"
+    payload["items"][0]["seed"]["title"] = "Toscanini - Heifetz - NBC Symphony Orchestra - March 11, 1940, in Studio 8H, Radio City"
+    payload["items"][0]["seed"]["composerNameLatin"] = "Ludwig van Beethoven"
+    payload["items"][0]["seed"]["workTitleLatin"] = "Violin Concerto in D major, Op. 61"
+    payload["items"][0]["seed"]["catalogue"] = "Op.61"
+    payload["items"][0]["seed"]["performanceDateText"] = ""
+    payload["items"][0]["seed"]["credits"] = [
+        {"role": "soloist", "displayName": "Jascha Heifetz", "label": "Jascha Heifetz"},
+    ]
+    request = CreateJobRequest.model_validate(payload)
+    pipeline = RetrievalPipeline(source_provider=CrossPlatformHeifetzProvider(), llm_client=None)
+
+    result = asyncio.run(pipeline.retrieve(request.items[0]))
+
+    final_urls = [link.url for link in result.result.links]
+    assert "https://www.youtube.com/watch?v=8Aclk_O4bSc" in final_urls
+    assert "https://www.youtube.com/watch?v=9YWr1UcbZE8" in final_urls
+    assert "https://www.youtube.com/watch?v=_N15_3_TP7I" not in final_urls
+    assert "https://www.youtube.com/watch?v=-rUNkiGgJx8" not in final_urls
+
+
+def test_pipeline_adds_missing_youtube_link_when_cross_platform_candidate_is_more_specific() -> None:
+    class RichterProvider:
+        async def inspect_existing_links(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_high_quality(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_streaming(self, draft, profile):
+            del draft, profile
+            return [
+                {
+                    "url": "https://www.bilibili.com/video/BV1HP411m7JC/",
+                    "source_label": "Bilibili Search",
+                    "source_kind": "streaming",
+                    "title": "Sviatoslav Richter/里赫特在匈牙利（1954.3.8）：舒曼钢协/勃拉姆斯间奏曲",
+                    "description": "Historic Bilibili upload",
+                    "platform": "bilibili",
+                    "weight": 0.68,
+                    "same_recording_score": 0.81,
+                    "duration_seconds": 2410,
+                    "uploader": "Uploader A",
+                    "view_count": 1300,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://www.youtube.com/watch?v=OoHkA74RPLU",
+                    "source_label": "YouTube Search",
+                    "source_kind": "streaming",
+                    "title": "Sviatoslav Richter in Budapest, 1954 - Schumann Piano Concerto",
+                    "description": "Cross-platform upload with exact year and city",
+                    "platform": "youtube",
+                    "weight": 0.68,
+                    "same_recording_score": 0.55,
+                    "duration_seconds": 2402,
+                    "uploader": "Archive YT",
+                    "view_count": 5200,
+                    "fields": {},
+                    "images": [],
+                },
+            ]
+
+        async def search_fallback(self, draft, profile):
+            del draft, profile
+            return []
+
+    class SingleBilibiliLlm:
+        minimum_synthesis_timeout_seconds = 0.0
+        allow_realtime_synthesis = True
+
+        async def synthesize(self, draft, profile, records):
+            del draft, profile, records
+            return {
+                "summary": "",
+                "notes": "",
+                "warnings": [],
+                "acceptedUrls": ["https://www.bilibili.com/video/BV1HP411m7JC/"],
+            }
+
+    payload = sample_request()
+    payload["items"][0]["workTypeHint"] = "concerto"
+    payload["items"][0]["sourceLine"] = (
+        "Robert Schumann | Piano Concerto in A minor, Op.54 | Sviatoslav Richter | "
+        "Janos Ferencsik | Hungarian State Philharmonic Orchestra | March 8, 1954 Budapest"
+    )
+    payload["items"][0]["seed"]["title"] = "Richter Budapest 1954"
+    payload["items"][0]["seed"]["composerNameLatin"] = "Robert Schumann"
+    payload["items"][0]["seed"]["workTitleLatin"] = "Piano Concerto in A minor, Op.54"
+    payload["items"][0]["seed"]["catalogue"] = "Op.54"
+    payload["items"][0]["seed"]["performanceDateText"] = "March 8, 1954 Budapest"
+    payload["items"][0]["seed"]["credits"] = [
+        {"role": "soloist", "displayName": "Sviatoslav Richter", "label": "Sviatoslav Richter"},
+        {"role": "conductor", "displayName": "Janos Ferencsik", "label": "Janos Ferencsik"},
+    ]
+    request = CreateJobRequest.model_validate(payload)
+    pipeline = RetrievalPipeline(source_provider=RichterProvider(), llm_client=SingleBilibiliLlm())
+
+    result = asyncio.run(pipeline.retrieve(request.items[0]))
+
+    final_urls = [link.url for link in result.result.links]
+    assert "https://www.bilibili.com/video/BV1HP411m7JC/" in final_urls
+    assert "https://www.youtube.com/watch?v=OoHkA74RPLU" in final_urls
+
+
+def test_pipeline_does_not_add_wrong_youtube_platform_completion_when_specificity_is_not_better() -> None:
+    class AnnieProvider:
+        async def inspect_existing_links(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_high_quality(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_streaming(self, draft, profile):
+            del draft, profile
+            return [
+                {
+                    "url": "https://www.bilibili.com/video/BV1TE411f7uh/",
+                    "source_label": "Bilibili Search",
+                    "source_kind": "streaming",
+                    "title": "【安妮·费舍尔】舒曼钢协现场视频 Annie Fischer plays Schumann Piano Concerto Op. 54",
+                    "description": "Bilibili target upload",
+                    "platform": "bilibili",
+                    "weight": 0.68,
+                    "same_recording_score": 0.65,
+                    "duration_seconds": 1905,
+                    "uploader": "Uploader A",
+                    "view_count": 4000,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://www.youtube.com/watch?v=R4YZRoHbrCw",
+                    "source_label": "YouTube Search",
+                    "source_kind": "streaming",
+                    "title": "Schumann, Piano Concerto in A Minor, Op.54 / Fischer & Giulini",
+                    "description": "Wrong conductor upload",
+                    "platform": "youtube",
+                    "weight": 0.68,
+                    "same_recording_score": 0.61,
+                    "duration_seconds": 1910,
+                    "uploader": "Uploader YT",
+                    "view_count": 6200,
+                    "fields": {},
+                    "images": [],
+                },
+            ]
+
+        async def search_fallback(self, draft, profile):
+            del draft, profile
+            return []
+
+    class SingleBilibiliLlm:
+        minimum_synthesis_timeout_seconds = 0.0
+        allow_realtime_synthesis = True
+
+        async def synthesize(self, draft, profile, records):
+            del draft, profile, records
+            return {
+                "summary": "",
+                "notes": "",
+                "warnings": [],
+                "acceptedUrls": ["https://www.bilibili.com/video/BV1TE411f7uh/"],
+            }
+
+    payload = sample_request()
+    payload["items"][0]["workTypeHint"] = "concerto"
+    payload["items"][0]["sourceLine"] = (
+        "Robert Schumann | Piano Concerto in A minor, Op.54 | Annie Fischer | "
+        "Paul Kletzki | - | -"
+    )
+    payload["items"][0]["seed"]["title"] = "Annie Fischer"
+    payload["items"][0]["seed"]["composerNameLatin"] = "Robert Schumann"
+    payload["items"][0]["seed"]["workTitleLatin"] = "Piano Concerto in A minor, Op.54"
+    payload["items"][0]["seed"]["catalogue"] = "Op.54"
+    payload["items"][0]["seed"]["performanceDateText"] = ""
+    payload["items"][0]["seed"]["credits"] = [
+        {"role": "soloist", "displayName": "Annie Fischer", "label": "Annie Fischer"},
+        {"role": "conductor", "displayName": "Paul Kletzki", "label": "Paul Kletzki"},
+    ]
+    request = CreateJobRequest.model_validate(payload)
+    pipeline = RetrievalPipeline(source_provider=AnnieProvider(), llm_client=SingleBilibiliLlm())
+
+    result = asyncio.run(pipeline.retrieve(request.items[0]))
+
+    final_urls = [link.url for link in result.result.links]
+    assert final_urls == ["https://www.bilibili.com/video/BV1TE411f7uh/"]
+
+
+def test_pipeline_adds_missing_apple_music_link_when_cross_platform_candidate_is_more_specific() -> None:
+    class RichterAppleProvider:
+        async def inspect_existing_links(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_high_quality(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_streaming(self, draft, profile):
+            del draft, profile
+            return [
+                {
+                    "url": "https://www.bilibili.com/video/BV1HP411m7JC/",
+                    "source_label": "Bilibili Search",
+                    "source_kind": "streaming",
+                    "title": "里赫特 1954 舒曼钢协",
+                    "description": "Sviatoslav Richter 1954",
+                    "platform": "bilibili",
+                    "weight": 0.68,
+                    "same_recording_score": 0.93,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://music.apple.com/us/album/schumann-piano-concerto/123456789?i=987654321",
+                    "source_label": "Apple Music Search",
+                    "source_kind": "streaming",
+                    "title": "Piano Concerto in A Minor, Op. 54",
+                    "description": "Sviatoslav Richter | Hungarian State Orchestra | Janos Ferencsik | 1954",
+                    "platform": "apple_music",
+                    "weight": 0.68,
+                    "same_recording_score": 0.89,
+                    "fields": {},
+                    "images": [],
+                },
+            ]
+
+        async def search_fallback(self, draft, profile):
+            del draft, profile
+            return []
+
+    class SingleBilibiliLlm:
+        minimum_synthesis_timeout_seconds = 0.0
+        allow_realtime_synthesis = True
+
+        async def synthesize(self, draft, profile, records):
+            del draft, profile, records
+            return {
+                "summary": "",
+                "notes": "",
+                "warnings": [],
+                "acceptedUrls": ["https://www.bilibili.com/video/BV1HP411m7JC/"],
+            }
+
+    payload = sample_request()
+    payload["items"][0]["workTypeHint"] = "concerto"
+    payload["items"][0]["sourceLine"] = (
+        "Robert Schumann | Piano Concerto in A minor, Op.54 | Sviatoslav Richter | "
+        "Janos Ferencsik | Hungarian State Orchestra | 1954"
+    )
+    payload["items"][0]["seed"]["title"] = "Richter 1954"
+    payload["items"][0]["seed"]["composerNameLatin"] = "Robert Schumann"
+    payload["items"][0]["seed"]["workTitleLatin"] = "Piano Concerto, Op.54"
+    payload["items"][0]["seed"]["catalogue"] = "Op.54"
+    payload["items"][0]["seed"]["performanceDateText"] = "1954"
+    payload["items"][0]["seed"]["credits"] = [
+        {"role": "soloist", "displayName": "Sviatoslav Richter", "label": "Sviatoslav Richter"},
+        {"role": "conductor", "displayName": "Janos Ferencsik", "label": "Janos Ferencsik"},
+    ]
+    request = CreateJobRequest.model_validate(payload)
+    pipeline = RetrievalPipeline(source_provider=RichterAppleProvider(), llm_client=SingleBilibiliLlm())
+
+    result = asyncio.run(pipeline.retrieve(request.items[0]))
+
+    final_urls = [link.url for link in result.result.links]
+    assert "https://www.bilibili.com/video/BV1HP411m7JC/" in final_urls
+    assert "https://music.apple.com/us/album/schumann-piano-concerto/123456789?i=987654321" in final_urls
+
+
+def test_pipeline_keeps_high_evidence_apple_track_in_final_links_as_independent_primary_platform() -> None:
+    class KleiberAppleProvider:
+        async def inspect_existing_links(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_high_quality(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_streaming(self, draft, profile):
+            del draft, profile
+            return [
+                {
+                    "url": "https://www.youtube.com/watch?v=lsLNUwLLNq8",
+                    "source_label": "YouTube Search",
+                    "source_kind": "streaming",
+                    "title": "L. van Beethoven: Symphony No. 7 / Carlos Kleiber (Vienna, 1976)",
+                    "description": "Carlos Kleiber Vienna Philharmonic 1976",
+                    "platform": "youtube",
+                    "weight": 0.68,
+                    "same_recording_score": 0.97,
+                    "duration_seconds": 2312,
+                    "uploader": "Archive A",
+                    "view_count": 34000,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://www.bilibili.com/video/BV1PG4y1L7ir/",
+                    "source_label": "Bilibili Search",
+                    "source_kind": "streaming",
+                    "title": "贝多芬 第七交响曲 Op.92 卡洛斯 克莱伯 维也纳爱乐乐团 1976",
+                    "description": "Carlos Kleiber Vienna Philharmonic 1976",
+                    "platform": "bilibili",
+                    "weight": 0.68,
+                    "same_recording_score": 0.97,
+                    "duration_seconds": 2310,
+                    "uploader": "Uploader Bili",
+                    "view_count": 5400,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://music.apple.com/us/album/symphony-no-7-in-a-major-op-92-i-poco-sostenuto-vivace/1644892939?i=1644892962",
+                    "source_label": "Apple Music Search",
+                    "source_kind": "streaming",
+                    "title": "Symphony No. 7 in A Major, Op. 92: I. Poco sostenuto - Vivace",
+                    "description": (
+                        "Vienna Philharmonic & Carlos Kleiber | Beethoven: Symphonies Nos. 5 & 7 | "
+                        "Classical | 1995-02-20T12:00:00Z"
+                    ),
+                    "platform": "apple_music",
+                    "weight": 0.68,
+                    "same_recording_score": 0.56,
+                    "duration_seconds": 814,
+                    "uploader": "Vienna Philharmonic & Carlos Kleiber",
+                    "view_count": 1200,
+                    "fields": {},
+                    "images": [],
+                },
+            ]
+
+        async def search_fallback(self, draft, profile):
+            del draft, profile
+            return []
+
+    payload = sample_request()
+    payload["items"][0]["workTypeHint"] = "orchestral"
+    payload["items"][0]["sourceLine"] = (
+        "Ludwig van Beethoven | Symphony No.7 in A major,Op.92 | Carlos Kleiber | "
+        "Vienna Philharmonic | 1976"
+    )
+    payload["items"][0]["seed"]["title"] = "Carlos Kleiber 1976"
+    payload["items"][0]["seed"]["composerNameLatin"] = "Ludwig van Beethoven"
+    payload["items"][0]["seed"]["workTitleLatin"] = "Symphony No.7 in A major,Op.92"
+    payload["items"][0]["seed"]["catalogue"] = "Op.92"
+    payload["items"][0]["seed"]["performanceDateText"] = "1976"
+    payload["items"][0]["seed"]["credits"] = [
+        {"role": "conductor", "displayName": "Carlos Kleiber", "label": "Carlos Kleiber"},
+        {"role": "orchestra", "displayName": "Vienna Philharmonic", "label": "Vienna Philharmonic"},
+    ]
+    request = CreateJobRequest.model_validate(payload)
+    pipeline = RetrievalPipeline(source_provider=KleiberAppleProvider(), llm_client=None)
+
+    result = asyncio.run(pipeline.retrieve(request.items[0]))
+
+    final_urls = [link.url for link in result.result.links]
+    assert "https://www.youtube.com/watch?v=lsLNUwLLNq8" in final_urls
+    assert "https://www.bilibili.com/video/BV1PG4y1L7ir/" in final_urls
+    assert (
+        "https://music.apple.com/us/album/symphony-no-7-in-a-major-op-92-i-poco-sostenuto-vivace/1644892939?i=1644892962"
+        in final_urls
+    )
+
+
+def test_pipeline_adds_version_rescue_candidate_when_low_confidence_accepted_apple_track_would_hide_strict_version_hit() -> None:
+    class VirsaladzeAppleProvider:
+        async def inspect_existing_links(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_high_quality(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_streaming(self, draft, profile):
+            del draft, profile
+            return [
+                {
+                    "url": "https://music.apple.com/us/album/piano-concerto-in-a-minor-op-54-i-allegro-affettuoso-live/1563042200?i=1563042205",
+                    "source_label": "Apple Music Search",
+                    "source_kind": "streaming",
+                    "title": "Piano Concerto in A Minor, Op. 54: I. Allegro affettuoso (Live)",
+                    "description": "Eliso Virsaladze | Schumann | Live | 2019-01-01T00:00:00Z",
+                    "platform": "apple_music",
+                    "weight": 0.68,
+                    "same_recording_score": 0.56,
+                    "duration_seconds": 871,
+                    "uploader": "Eliso Virsaladze",
+                    "view_count": 0,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://www.youtube.com/watch?v=tDxa2aOQ0w0",
+                    "source_label": "YouTube Search",
+                    "source_kind": "streaming",
+                    "title": "Schumann - Piano Concerto, op.54 Eliso Virsaladze",
+                    "description": "Historic upload",
+                    "platform": "youtube",
+                    "weight": 0.68,
+                    "same_recording_score": 0.45,
+                    "duration_seconds": 1920,
+                    "uploader": "Archive",
+                    "view_count": 2400,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://www.bilibili.com/video/BV18Sc6eREgV/",
+                    "source_label": "Bilibili Search",
+                    "source_kind": "streaming",
+                    "title": "【钢琴】Eliso Virsaladze演奏 舒曼 钢琴协奏曲Op.54",
+                    "description": "Mirror upload",
+                    "platform": "bilibili",
+                    "weight": 0.68,
+                    "same_recording_score": 0.45,
+                    "duration_seconds": 1910,
+                    "uploader": "Archive",
+                    "view_count": 900,
+                    "fields": {},
+                    "images": [],
+                },
+            ]
+
+        async def search_fallback(self, draft, profile):
+            del draft, profile
+            return []
+
+    class AcceptedAppleOnlyLlm:
+        minimum_synthesis_timeout_seconds = 0.0
+        allow_realtime_synthesis = True
+
+        async def synthesize(self, draft, profile, records):
+            del draft, profile, records
+            return {
+                "summary": "",
+                "notes": "",
+                "warnings": [],
+                "acceptedUrls": [
+                    "https://music.apple.com/us/album/piano-concerto-in-a-minor-op-54-i-allegro-affettuoso-live/1563042200?i=1563042205"
+                ],
+            }
+
+    payload = sample_request()
+    payload["items"][0]["workTypeHint"] = "concerto"
+    payload["items"][0]["sourceLine"] = (
+        "Robert Schumann | Piano Concerto in A minor, Op.54 | Eliso Virsaladze | "
+        "Alexander Rudin | - | -"
+    )
+    payload["items"][0]["seed"]["title"] = "Alexander Rudin - Eliso Virsaladze"
+    payload["items"][0]["seed"]["composerNameLatin"] = "Robert Schumann"
+    payload["items"][0]["seed"]["workTitleLatin"] = "Piano Concerto in A minor, Op.54"
+    payload["items"][0]["seed"]["catalogue"] = "Op.54"
+    payload["items"][0]["seed"]["credits"] = [
+        {"role": "soloist", "displayName": "Eliso Virsaladze", "label": "Eliso Virsaladze"},
+        {"role": "conductor", "displayName": "Alexander Rudin", "label": "Alexander Rudin"},
+    ]
+    request = CreateJobRequest.model_validate(payload)
+    pipeline = RetrievalPipeline(source_provider=VirsaladzeAppleProvider(), llm_client=AcceptedAppleOnlyLlm())
+
+    result = asyncio.run(pipeline.retrieve(request.items[0]))
+
+    final_urls = [link.url for link in result.result.links]
+    assert (
+        "https://music.apple.com/us/album/piano-concerto-in-a-minor-op-54-i-allegro-affettuoso-live/1563042200?i=1563042205"
+        in final_urls
+    )
+    assert "https://www.youtube.com/watch?v=tDxa2aOQ0w0" in final_urls
+
+
+def test_pipeline_keeps_youtube_full_version_alongside_independently_finalizable_apple_first_movement() -> None:
+    class VirsaladzeAppleMovementProvider:
+        async def inspect_existing_links(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_high_quality(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_streaming(self, draft, profile):
+            del draft, profile
+            return [
+                {
+                    "url": "https://music.apple.com/us/album/piano-concerto-in-a-minor-op-54-i-allegro-affettuoso-live/1563042200?i=1563042205",
+                    "source_label": "Apple Music Search",
+                    "source_kind": "streaming",
+                    "title": "Piano Concerto in A Minor, Op. 54: I. Allegro affettuoso (Live)",
+                    "description": "Eliso Virsaladze | Schumann | Live performance",
+                    "platform": "apple_music",
+                    "weight": 0.68,
+                    "same_recording_score": 0.71,
+                    "duration_seconds": 871,
+                    "uploader": "Eliso Virsaladze",
+                    "view_count": 0,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://www.youtube.com/watch?v=tDxa2aOQ0w0",
+                    "source_label": "YouTube Search",
+                    "source_kind": "streaming",
+                    "title": "Schumann - Piano Concerto, op.54 Eliso Virsaladze",
+                    "description": "Historic full concerto upload",
+                    "platform": "youtube",
+                    "weight": 0.68,
+                    "same_recording_score": 0.45,
+                    "duration_seconds": 1920,
+                    "uploader": "Archive",
+                    "view_count": 2400,
+                    "fields": {},
+                    "images": [],
+                },
+            ]
+
+        async def search_fallback(self, draft, profile):
+            del draft, profile
+            return []
+
+    payload = sample_request()
+    payload["items"][0]["workTypeHint"] = "concerto"
+    payload["items"][0]["sourceLine"] = (
+        "Robert Schumann | Piano Concerto in A minor, Op.54 | Eliso Virsaladze | "
+        "Alexander Rudin | - | -"
+    )
+    payload["items"][0]["seed"]["title"] = "Alexander Rudin - Eliso Virsaladze"
+    payload["items"][0]["seed"]["composerNameLatin"] = "Robert Schumann"
+    payload["items"][0]["seed"]["workTitleLatin"] = "Piano Concerto in A minor, Op.54"
+    payload["items"][0]["seed"]["catalogue"] = "Op.54"
+    payload["items"][0]["seed"]["credits"] = [
+        {"role": "soloist", "displayName": "Eliso Virsaladze", "label": "Eliso Virsaladze"},
+        {"role": "conductor", "displayName": "Alexander Rudin", "label": "Alexander Rudin"},
+    ]
+    request = CreateJobRequest.model_validate(payload)
+    pipeline = RetrievalPipeline(source_provider=VirsaladzeAppleMovementProvider(), llm_client=None)
+
+    result = asyncio.run(pipeline.retrieve(request.items[0]))
+
+    final_urls = [link.url for link in result.result.links]
+    assert (
+        "https://music.apple.com/us/album/piano-concerto-in-a-minor-op-54-i-allegro-affettuoso-live/1563042200?i=1563042205"
+        in final_urls
+    )
+    assert "https://www.youtube.com/watch?v=tDxa2aOQ0w0" in final_urls
+
+
 def test_pipeline_keeps_sparse_heifetz_alternate_upload_even_when_llm_accepts_only_top_four() -> None:
     class SparseHeifetzAltProvider:
         async def inspect_existing_links(self, draft, profile):
@@ -1529,6 +2867,151 @@ def test_pipeline_keeps_sparse_heifetz_alternate_upload_even_when_llm_accepts_on
 
     final_urls = [link.url for link in result.result.links]
     assert "https://www.youtube.com/watch?v=9YWr1UcbZE8" in final_urls
+
+
+def test_pipeline_keeps_close_same_platform_heifetz_alternate_when_fast_llm_accepts_single_youtube() -> None:
+    class SparseHeifetzProvider:
+        async def inspect_existing_links(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_high_quality(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_streaming(self, draft, profile):
+            del draft, profile
+            return [
+                {
+                    "url": "https://www.bilibili.com/video/BV1vp421U7kw/",
+                    "source_label": "Bilibili Search",
+                    "source_kind": "streaming",
+                    "title": "贝多芬op.61《D大调小提琴协奏曲》海菲兹+托斯卡尼尼1940+NBC交响乐团 Beethoven Violin Concerto in D Major",
+                    "description": "Chinese exact upload",
+                    "platform": "bilibili",
+                    "weight": 0.68,
+                    "same_recording_score": 0.96,
+                    "duration_seconds": 2308,
+                    "uploader": "Uploader A",
+                    "view_count": 84,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://www.youtube.com/watch?v=8Aclk_O4bSc",
+                    "source_label": "YouTube Search",
+                    "source_kind": "streaming",
+                    "title": "Beethoven: Violin Concerto (Heifetz/Toscanini 1940)",
+                    "description": "Historic upload",
+                    "platform": "youtube",
+                    "weight": 0.68,
+                    "same_recording_score": 0.78,
+                    "duration_seconds": 2307,
+                    "uploader": "Collector A",
+                    "view_count": 1292,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://www.youtube.com/watch?v=9YWr1UcbZE8",
+                    "source_label": "YouTube Search",
+                    "source_kind": "streaming",
+                    "title": "Beethoven: Violin Concerto (1940) Heifetz/Toscanini",
+                    "description": "Canonical upload title",
+                    "platform": "youtube",
+                    "weight": 0.68,
+                    "same_recording_score": 0.71,
+                    "duration_seconds": 2315,
+                    "uploader": "Classical Archive",
+                    "view_count": 9696,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://www.bilibili.com/video/BV1Fm4y1G7NA/",
+                    "source_label": "Bilibili Search",
+                    "source_kind": "streaming",
+                    "title": "[骑熊净谱对照]贝多芬D大调小提琴协奏曲｜Jascha Heifetz演奏",
+                    "description": "Score-following upload",
+                    "platform": "bilibili",
+                    "weight": 0.68,
+                    "same_recording_score": 0.45,
+                    "duration_seconds": 2088,
+                    "uploader": "Uploader B",
+                    "view_count": 1622,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://www.youtube.com/watch?v=_N15_3_TP7I",
+                    "source_label": "YouTube Search",
+                    "source_kind": "streaming",
+                    "title": "Jascha Heifetz \"Violin Concerto\" Beethoven",
+                    "description": "Generic upload",
+                    "platform": "youtube",
+                    "weight": 0.68,
+                    "same_recording_score": 0.59,
+                    "duration_seconds": 2343,
+                    "uploader": "Uploader C",
+                    "view_count": 205590,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://www.youtube.com/watch?v=-rUNkiGgJx8",
+                    "source_label": "YouTube Search",
+                    "source_kind": "streaming",
+                    "title": "Beethoven: Violin Concerto (1940) Heifetz/Toscanini NEW EDITION",
+                    "description": "Remaster upload",
+                    "platform": "youtube",
+                    "weight": 0.68,
+                    "same_recording_score": 0.59,
+                    "duration_seconds": 2316,
+                    "uploader": "Archive C",
+                    "view_count": 361,
+                    "fields": {},
+                    "images": [],
+                },
+            ]
+
+        async def search_fallback(self, draft, profile):
+            del draft, profile
+            return []
+
+    class SingleYoutubeFastLlm:
+        minimum_synthesis_timeout_seconds = 4.0
+        allow_realtime_synthesis = True
+
+        async def synthesize(self, draft, profile, records):
+            del draft, profile, records
+            return {
+                "summary": "保留明确接受的一条YouTube上传。",
+                "notes": "",
+                "warnings": [],
+                "acceptedUrls": ["https://www.youtube.com/watch?v=8Aclk_O4bSc"],
+            }
+
+    payload = sample_request()
+    payload["items"][0]["workTypeHint"] = "concerto"
+    payload["items"][0]["sourceLine"] = "Ludwig van Beethoven | Violin Concerto in D major, Op. 61 | Jascha Heifetz | - | -"
+    payload["items"][0]["seed"]["title"] = "Toscanini - Heifetz - NBC Symphony Orchestra - March 11, 1940, in Studio 8H, Radio City"
+    payload["items"][0]["seed"]["composerNameLatin"] = "Ludwig van Beethoven"
+    payload["items"][0]["seed"]["workTitleLatin"] = "Violin Concerto in D major, Op. 61"
+    payload["items"][0]["seed"]["catalogue"] = "Op.61"
+    payload["items"][0]["seed"]["performanceDateText"] = ""
+    payload["items"][0]["seed"]["credits"] = [
+        {"role": "soloist", "displayName": "Jascha Heifetz", "label": "Jascha Heifetz"},
+    ]
+    request = CreateJobRequest.model_validate(payload)
+    pipeline = RetrievalPipeline(source_provider=SparseHeifetzProvider(), llm_client=SingleYoutubeFastLlm())
+
+    result = asyncio.run(pipeline.retrieve(request.items[0]))
+
+    final_urls = [link.url for link in result.result.links]
+    assert "https://www.youtube.com/watch?v=8Aclk_O4bSc" in final_urls
+    assert "https://www.youtube.com/watch?v=9YWr1UcbZE8" in final_urls
+    assert "https://www.youtube.com/watch?v=_N15_3_TP7I" not in final_urls
+    assert "https://www.youtube.com/watch?v=-rUNkiGgJx8" not in final_urls
 
 
 def test_pipeline_aclose_closes_source_provider() -> None:
@@ -1720,3 +3203,850 @@ def test_pipeline_promotes_exact_annie_upload_from_candidate_only_tie() -> None:
 
     assert result.result.links
     assert result.result.links[0].url == "https://www.youtube.com/watch?v=wkMQ1q4V4Vs"
+
+
+def test_pipeline_keeps_kempff_exact_upload_in_final_links_but_leaves_compilation_as_candidate_only() -> None:
+    class KempffProvider:
+        async def inspect_existing_links(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_high_quality(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_streaming(self, draft, profile):
+            del draft, profile
+            return [
+                {
+                    "url": "https://www.bilibili.com/video/BV1NY411y7Wc/",
+                    "source_label": "Bilibili Search",
+                    "source_kind": "streaming",
+                    "title": "Wilhelm Kempff Antal Dorati Schumann Piano Concerto Op.54 1959 complete",
+                    "description": "Concertgebouw Orchestra Amsterdam 1959 live full performance",
+                    "platform": "bilibili",
+                    "weight": 0.68,
+                    "same_recording_score": 0.79,
+                    "duration_seconds": 1880,
+                    "uploader": "Classical Vault",
+                    "view_count": 2200,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://www.bilibili.com/video/BV135411e7JL/",
+                    "source_label": "Bilibili Search",
+                    "source_kind": "streaming",
+                    "title": "Wilhelm Kempff Antal Dorati Schumann Piano Concertos 1950s",
+                    "description": "Compilation upload with multiple concerto performances",
+                    "platform": "bilibili",
+                    "weight": 0.68,
+                    "same_recording_score": 0.78,
+                    "duration_seconds": 5400,
+                    "uploader": "Archive Channel",
+                    "view_count": 2200,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://www.bilibili.com/video/BV1FW4y1s7e8/",
+                    "source_label": "Bilibili Search",
+                    "source_kind": "streaming",
+                    "title": "Schumann Piano Concerto Op.54 Wilhelm Kempff Antal Dorati 1959 Amsterdam",
+                    "description": "Alternate upload of the same live performance",
+                    "platform": "bilibili",
+                    "weight": 0.68,
+                    "same_recording_score": 0.77,
+                    "duration_seconds": 1874,
+                    "uploader": "Historic Archive",
+                    "view_count": 2100,
+                    "fields": {},
+                    "images": [],
+                },
+            ]
+
+        async def search_fallback(self, draft, profile):
+            del draft, profile
+            return []
+
+    payload = sample_request()
+    payload["items"][0]["workTypeHint"] = "concerto"
+    payload["items"][0]["sourceLine"] = (
+        "Robert Schumann | Piano Concerto in A minor, Op.54 | Wilhelm Kempff | Antal Dorati | "
+        "Concertgebouw Orchestra Amsterdam | 1959"
+    )
+    payload["items"][0]["seed"]["title"] = "Wilhelm Kempff & Antal Dorati"
+    payload["items"][0]["seed"]["composerName"] = "舒曼"
+    payload["items"][0]["seed"]["composerNameLatin"] = "Robert Schumann"
+    payload["items"][0]["seed"]["workTitle"] = "a小调钢琴协奏曲"
+    payload["items"][0]["seed"]["workTitleLatin"] = "Piano Concerto, Op.54"
+    payload["items"][0]["seed"]["catalogue"] = "Op.54"
+    payload["items"][0]["seed"]["performanceDateText"] = "1959"
+    payload["items"][0]["seed"]["credits"] = [
+        {"role": "soloist", "displayName": "Wilhelm Kempff", "label": "Wilhelm Kempff"},
+        {"role": "conductor", "displayName": "Antal Dorati", "label": "Antal Dorati"},
+        {
+            "role": "orchestra",
+            "displayName": "Concertgebouw Orchestra Amsterdam",
+            "label": "Concertgebouw Orchestra Amsterdam",
+        },
+    ]
+    request = CreateJobRequest.model_validate(payload)
+    pipeline = RetrievalPipeline(source_provider=KempffProvider(), llm_client=None)
+
+    result = asyncio.run(pipeline.retrieve(request.items[0]))
+
+    final_urls = [link.url for link in result.result.links]
+    candidate_urls = [link.url for link in result.link_candidates]
+
+    assert final_urls == [
+        "https://www.bilibili.com/video/BV1NY411y7Wc/",
+        "https://www.bilibili.com/video/BV1FW4y1s7e8/",
+    ]
+    assert "https://www.bilibili.com/video/BV135411e7JL/" in candidate_urls
+    assert "https://www.bilibili.com/video/BV135411e7JL/" not in final_urls
+
+
+def test_pipeline_prefers_llm_accepted_delara_target_over_wrong_higher_confidence_upload() -> None:
+    class DeLaraProvider:
+        async def inspect_existing_links(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_high_quality(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_streaming(self, draft, profile):
+            del draft, profile
+            return [
+                {
+                    "url": "https://www.bilibili.com/video/BV1Za9QYnE9D/",
+                    "source_label": "Bilibili Search Browser Search",
+                    "source_kind": "streaming",
+                    "title": "Clara Schumann Piano Concerto in A minor",
+                    "description": "Piano: Michal Tal Conductor: Keren Kagarlitsky Israel Camerata Jerusalem Orchestra",
+                    "platform": "bilibili",
+                    "weight": 0.68,
+                    "same_recording_score": 0.65,
+                    "duration_seconds": 1378,
+                    "uploader": "Amy-yui",
+                    "view_count": 68,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://www.bilibili.com/video/BV1CWb7eHENQ/",
+                    "source_label": "Bilibili Search Browser Search",
+                    "source_kind": "streaming",
+                    "title": "【Adelina de Lara】克拉拉的爱徒会如何演奏舒曼钢协？",
+                    "description": "BBC broadcast; 29 May 1951",
+                    "platform": "bilibili",
+                    "weight": 0.68,
+                    "same_recording_score": 0.45,
+                    "duration_seconds": 1991,
+                    "uploader": "_HideousLight_",
+                    "view_count": 2018,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://www.bilibili.com/video/BV1qc41157iE/",
+                    "source_label": "Bilibili Search Browser Search",
+                    "source_kind": "streaming",
+                    "title": "深沉而隽永 爱德琳娜·黛·劳拉夫人五十年代的录音室风貌 Adelina de Lara plays Beethoven, Brahms and Schumann",
+                    "description": "1951-1952 London Musical Club recordings",
+                    "platform": "bilibili",
+                    "weight": 0.68,
+                    "same_recording_score": 0.49,
+                    "duration_seconds": 18552,
+                    "uploader": "_HideousLight_",
+                    "view_count": 3856,
+                    "fields": {},
+                    "images": [],
+                },
+            ]
+
+        async def search_fallback(self, draft, profile):
+            del draft, profile
+            return []
+
+    class AcceptedTargetLlm:
+        minimum_synthesis_timeout_seconds = 0.0
+        allow_realtime_synthesis = True
+
+        async def synthesize(self, draft, profile, records):
+            del draft, profile, records
+            return {
+                "summary": "",
+                "notes": "",
+                "warnings": [],
+                "acceptedUrls": ["https://www.bilibili.com/video/BV1CWb7eHENQ/"],
+            }
+
+    payload = sample_request()
+    payload["items"][0]["workTypeHint"] = "concerto"
+    payload["items"][0]["sourceLine"] = (
+        "Robert Schumann | Piano Concerto in A minor, Op.54 | Adelina de Lara | Ian Whyte | "
+        "BBC Scottish Symphony Orchestra | May 29, 1951"
+    )
+    payload["items"][0]["seed"]["title"] = "Adelina de Lara & Ian Whyte"
+    payload["items"][0]["seed"]["composerName"] = "舒曼"
+    payload["items"][0]["seed"]["composerNameLatin"] = "Robert Schumann"
+    payload["items"][0]["seed"]["workTitle"] = "a小调钢琴协奏曲"
+    payload["items"][0]["seed"]["workTitleLatin"] = "Piano Concerto, Op.54"
+    payload["items"][0]["seed"]["catalogue"] = "Op.54"
+    payload["items"][0]["seed"]["performanceDateText"] = "May 29, 1951"
+    payload["items"][0]["seed"]["credits"] = [
+        {"role": "soloist", "displayName": "Adelina de Lara", "label": "Adelina de Lara"},
+        {"role": "conductor", "displayName": "Ian Whyte", "label": "Ian Whyte"},
+        {
+            "role": "orchestra",
+            "displayName": "BBC Scottish Symphony Orchestra",
+            "label": "BBC Scottish Symphony Orchestra",
+        },
+    ]
+    request = CreateJobRequest.model_validate(payload)
+    pipeline = RetrievalPipeline(source_provider=DeLaraProvider(), llm_client=AcceptedTargetLlm())
+
+    result = asyncio.run(pipeline.retrieve(request.items[0]))
+
+    final_urls = [candidate.url for candidate in result.result.links]
+    candidate_urls = [candidate.url for candidate in result.link_candidates]
+
+    assert "https://www.bilibili.com/video/BV1CWb7eHENQ/" in candidate_urls
+    assert final_urls == ["https://www.bilibili.com/video/BV1CWb7eHENQ/"]
+
+
+def test_pipeline_excludes_conflicting_clara_candidate_from_candidate_links() -> None:
+    class DeLaraProvider:
+        async def inspect_existing_links(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_high_quality(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_streaming(self, draft, profile):
+            del draft, profile
+            return [
+                {
+                    "url": "https://www.bilibili.com/video/BV1Za9QYnE9D/",
+                    "source_label": "Bilibili Search",
+                    "source_kind": "streaming",
+                    "title": "Clara Schumann Piano Concerto in A minor",
+                    "description": "Wrong pianist and conductor",
+                    "platform": "bilibili",
+                    "weight": 0.68,
+                    "same_recording_score": 0.65,
+                    "duration_seconds": 1378,
+                    "uploader": "Amy-yui",
+                    "view_count": 68,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://www.bilibili.com/video/BV1CWb7eHENQ/",
+                    "source_label": "Bilibili Search",
+                    "source_kind": "streaming",
+                    "title": "Adelina de Lara plays Schumann Piano Concerto (BBC, 1951)",
+                    "description": "BBC broadcast; 29 May 1951",
+                    "platform": "bilibili",
+                    "weight": 0.68,
+                    "same_recording_score": 0.52,
+                    "duration_seconds": 1991,
+                    "uploader": "_HideousLight_",
+                    "view_count": 2018,
+                    "fields": {},
+                    "images": [],
+                },
+            ]
+
+        async def search_fallback(self, draft, profile):
+            del draft, profile
+            return []
+
+    payload = sample_request()
+    payload["items"][0]["workTypeHint"] = "concerto"
+    payload["items"][0]["sourceLine"] = (
+        "Robert Schumann | Piano Concerto in A minor, Op.54 | Adelina de Lara | Ian Whyte | "
+        "BBC Scottish Symphony Orchestra | May 29, 1951"
+    )
+    payload["items"][0]["seed"]["title"] = "Adelina de Lara & Ian Whyte"
+    payload["items"][0]["seed"]["composerNameLatin"] = "Robert Schumann"
+    payload["items"][0]["seed"]["workTitleLatin"] = "Piano Concerto, Op.54"
+    payload["items"][0]["seed"]["catalogue"] = "Op.54"
+    payload["items"][0]["seed"]["performanceDateText"] = "May 29, 1951"
+    payload["items"][0]["seed"]["credits"] = [
+        {"role": "soloist", "displayName": "Adelina de Lara", "label": "Adelina de Lara"},
+        {"role": "conductor", "displayName": "Ian Whyte", "label": "Ian Whyte"},
+    ]
+    request = CreateJobRequest.model_validate(payload)
+    pipeline = RetrievalPipeline(source_provider=DeLaraProvider(), llm_client=None)
+
+    result = asyncio.run(pipeline.retrieve(request.items[0]))
+
+    candidate_urls = [candidate.url for candidate in result.link_candidates]
+    assert "https://www.bilibili.com/video/BV1CWb7eHENQ/" in candidate_urls
+    assert "https://www.bilibili.com/video/BV1Za9QYnE9D/" not in candidate_urls
+
+
+def test_pipeline_excludes_conflicting_clara_candidate_from_final_links() -> None:
+    class DeLaraProvider:
+        async def inspect_existing_links(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_high_quality(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_streaming(self, draft, profile):
+            del draft, profile
+            return [
+                {
+                    "url": "https://www.bilibili.com/video/BV1Za9QYnE9D/",
+                    "source_label": "Bilibili Search",
+                    "source_kind": "streaming",
+                    "title": "Clara Schumann Piano Concerto in A minor",
+                    "description": "Wrong pianist and conductor",
+                    "platform": "bilibili",
+                    "weight": 0.68,
+                    "same_recording_score": 0.65,
+                    "duration_seconds": 1378,
+                    "uploader": "Amy-yui",
+                    "view_count": 68,
+                    "fields": {},
+                    "images": [],
+                },
+            ]
+
+        async def search_fallback(self, draft, profile):
+            del draft, profile
+            return []
+
+    payload = sample_request()
+    payload["items"][0]["workTypeHint"] = "concerto"
+    payload["items"][0]["sourceLine"] = (
+        "Robert Schumann | Piano Concerto in A minor, Op.54 | Adelina de Lara | Ian Whyte | "
+        "BBC Scottish Symphony Orchestra | May 29, 1951"
+    )
+    payload["items"][0]["seed"]["title"] = "Adelina de Lara & Ian Whyte"
+    payload["items"][0]["seed"]["composerNameLatin"] = "Robert Schumann"
+    payload["items"][0]["seed"]["workTitleLatin"] = "Piano Concerto, Op.54"
+    payload["items"][0]["seed"]["catalogue"] = "Op.54"
+    payload["items"][0]["seed"]["performanceDateText"] = "May 29, 1951"
+    payload["items"][0]["seed"]["credits"] = [
+        {"role": "soloist", "displayName": "Adelina de Lara", "label": "Adelina de Lara"},
+        {"role": "conductor", "displayName": "Ian Whyte", "label": "Ian Whyte"},
+    ]
+    request = CreateJobRequest.model_validate(payload)
+    pipeline = RetrievalPipeline(source_provider=DeLaraProvider(), llm_client=None)
+
+    result = asyncio.run(pipeline.retrieve(request.items[0]))
+
+    assert [candidate.url for candidate in result.result.links] == []
+
+
+def test_pipeline_excludes_conflicting_giulini_candidate_but_keeps_same_platform_alternate() -> None:
+    class AnnieProvider:
+        async def inspect_existing_links(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_high_quality(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_streaming(self, draft, profile):
+            del draft, profile
+            return [
+                {
+                    "url": "https://www.bilibili.com/video/BV1TE411f7uh/",
+                    "source_label": "Bilibili Search",
+                    "source_kind": "streaming",
+                    "title": "Annie Fischer plays Schumann Piano Concerto Op. 54",
+                    "description": "Target upload",
+                    "platform": "bilibili",
+                    "weight": 0.68,
+                    "same_recording_score": 0.65,
+                    "duration_seconds": 1905,
+                    "uploader": "Uploader A",
+                    "view_count": 4000,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://www.youtube.com/watch?v=R4YZRoHbrCw",
+                    "source_label": "YouTube Search",
+                    "source_kind": "streaming",
+                    "title": "Schumann, Piano Concerto in A Minor, Op.54 / Fischer & Giulini",
+                    "description": "Wrong conductor upload",
+                    "platform": "youtube",
+                    "weight": 0.68,
+                    "same_recording_score": 0.61,
+                    "duration_seconds": 1910,
+                    "uploader": "Uploader YT",
+                    "view_count": 6200,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://www.bilibili.com/video/BV1altkletzki/",
+                    "source_label": "Bilibili Search",
+                    "source_kind": "streaming",
+                    "title": "Annie Fischer / Kletzki - Schumann Piano Concerto",
+                    "description": "Same recording alternate upload",
+                    "platform": "bilibili",
+                    "weight": 0.68,
+                    "same_recording_score": 0.58,
+                    "duration_seconds": 1908,
+                    "uploader": "Uploader B",
+                    "view_count": 2100,
+                    "fields": {},
+                    "images": [],
+                },
+            ]
+
+        async def search_fallback(self, draft, profile):
+            del draft, profile
+            return []
+
+    payload = sample_request()
+    payload["items"][0]["workTypeHint"] = "concerto"
+    payload["items"][0]["sourceLine"] = (
+        "Robert Schumann | Piano Concerto in A minor, Op.54 | Annie Fischer | "
+        "Paul Kletzki | - | -"
+    )
+    payload["items"][0]["seed"]["title"] = "Annie Fischer"
+    payload["items"][0]["seed"]["composerNameLatin"] = "Robert Schumann"
+    payload["items"][0]["seed"]["workTitleLatin"] = "Piano Concerto in A minor, Op.54"
+    payload["items"][0]["seed"]["catalogue"] = "Op.54"
+    payload["items"][0]["seed"]["performanceDateText"] = ""
+    payload["items"][0]["seed"]["credits"] = [
+        {"role": "soloist", "displayName": "Annie Fischer", "label": "Annie Fischer"},
+        {"role": "conductor", "displayName": "Paul Kletzki", "label": "Paul Kletzki"},
+    ]
+    request = CreateJobRequest.model_validate(payload)
+    pipeline = RetrievalPipeline(source_provider=AnnieProvider(), llm_client=None)
+
+    result = asyncio.run(pipeline.retrieve(request.items[0]))
+
+    candidate_urls = [candidate.url for candidate in result.link_candidates]
+    assert "https://www.bilibili.com/video/BV1TE411f7uh/" in candidate_urls
+    assert "https://www.bilibili.com/video/BV1altkletzki/" in candidate_urls
+    assert "https://www.youtube.com/watch?v=R4YZRoHbrCw" not in candidate_urls
+
+
+def test_pipeline_caps_candidate_links_to_three_high_confidence_and_two_review_needed_per_platform() -> None:
+    class MultiPlatformCandidateProvider:
+        async def inspect_existing_links(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_high_quality(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_streaming(self, draft, profile):
+            del draft, profile
+            return [
+                *[
+                    {
+                        "url": f"https://www.youtube.com/watch?v=ytcand{i}",
+                        "source_label": "YouTube Search",
+                        "source_kind": "streaming",
+                        "title": f"Richter Schumann 1954 candidate {i}",
+                        "description": "YouTube candidate",
+                        "platform": "youtube",
+                        "weight": 0.7 if i < 3 else 0.52,
+                        "same_recording_score": 0.78 - i * 0.04,
+                        "duration_seconds": 2400,
+                        "uploader": "Uploader YT",
+                        "view_count": 1000 + i,
+                        "fields": {},
+                        "images": [],
+                    }
+                    for i in range(6)
+                ],
+                *[
+                    {
+                        "url": f"https://www.bilibili.com/video/BV1cap{i}/",
+                        "source_label": "Bilibili Search",
+                        "source_kind": "streaming",
+                        "title": f"Richter Schumann 1954 bilibili {i}",
+                        "description": "Bilibili candidate",
+                        "platform": "bilibili",
+                        "weight": 0.7 if i < 3 else 0.52,
+                        "same_recording_score": 0.77 - i * 0.04,
+                        "duration_seconds": 2400,
+                        "uploader": "Uploader Bili",
+                        "view_count": 900 + i,
+                        "fields": {},
+                        "images": [],
+                    }
+                    for i in range(6)
+                ],
+            ]
+
+        async def search_fallback(self, draft, profile):
+            del draft, profile
+            return []
+
+    payload = sample_request()
+    payload["items"][0]["workTypeHint"] = "concerto"
+    payload["items"][0]["sourceLine"] = (
+        "Robert Schumann | Piano Concerto in A minor, Op.54 | Sviatoslav Richter | "
+        "Janos Ferencsik | Hungarian State Philharmonic Orchestra | March 8, 1954 Budapest"
+    )
+    payload["items"][0]["seed"]["title"] = "Richter Budapest 1954"
+    payload["items"][0]["seed"]["composerNameLatin"] = "Robert Schumann"
+    payload["items"][0]["seed"]["workTitleLatin"] = "Piano Concerto in A minor, Op.54"
+    payload["items"][0]["seed"]["catalogue"] = "Op.54"
+    payload["items"][0]["seed"]["performanceDateText"] = "March 8, 1954 Budapest"
+    payload["items"][0]["seed"]["credits"] = [
+        {"role": "soloist", "displayName": "Sviatoslav Richter", "label": "Sviatoslav Richter"},
+        {"role": "conductor", "displayName": "Janos Ferencsik", "label": "Janos Ferencsik"},
+    ]
+    request = CreateJobRequest.model_validate(payload)
+    pipeline = RetrievalPipeline(source_provider=MultiPlatformCandidateProvider(), llm_client=None)
+
+    result = asyncio.run(pipeline.retrieve(request.items[0]))
+
+    candidate_urls = [candidate.url for candidate in result.link_candidates]
+    youtube_candidates = [url for url in candidate_urls if "youtube.com" in url]
+    bilibili_candidates = [url for url in candidate_urls if "bilibili.com" in url]
+    youtube_zones = [candidate.zone for candidate in result.link_candidates if "youtube.com" in candidate.url]
+    bilibili_zones = [candidate.zone for candidate in result.link_candidates if "bilibili.com" in candidate.url]
+
+    assert len(youtube_candidates) == 5
+    assert len(bilibili_candidates) == 5
+    assert youtube_candidates[:3] == [
+        "https://www.youtube.com/watch?v=ytcand0",
+        "https://www.youtube.com/watch?v=ytcand1",
+        "https://www.youtube.com/watch?v=ytcand2",
+    ]
+    assert bilibili_candidates[:3] == [
+        "https://www.bilibili.com/video/BV1cap0/",
+        "https://www.bilibili.com/video/BV1cap1/",
+        "https://www.bilibili.com/video/BV1cap2/",
+    ]
+    assert set(youtube_candidates[3:]).issubset(
+        {
+            "https://www.youtube.com/watch?v=ytcand3",
+            "https://www.youtube.com/watch?v=ytcand4",
+            "https://www.youtube.com/watch?v=ytcand5",
+        }
+    )
+    assert set(bilibili_candidates[3:]).issubset(
+        {
+            "https://www.bilibili.com/video/BV1cap3/",
+            "https://www.bilibili.com/video/BV1cap4/",
+            "https://www.bilibili.com/video/BV1cap5/",
+        }
+    )
+    assert youtube_zones == ["green", "green", "green", "yellow", "yellow"]
+    assert bilibili_zones == ["green", "green", "green", "yellow", "yellow"]
+
+
+def test_pipeline_final_links_select_one_independent_winner_per_primary_platform() -> None:
+    class ThreePlatformProvider:
+        async def inspect_existing_links(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_high_quality(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_streaming(self, draft, profile):
+            del draft, profile
+            return [
+                {
+                    "url": "https://www.bilibili.com/video/BV1bestbili/",
+                    "source_label": "Bilibili Search",
+                    "source_kind": "streaming",
+                    "title": "Sviatoslav Richter Janos Ferencsik Schumann Piano Concerto 1954",
+                    "description": "Budapest 1954 exact upload",
+                    "platform": "bilibili",
+                    "weight": 0.7,
+                    "same_recording_score": 0.97,
+                    "duration_seconds": 2400,
+                    "uploader": "Uploader Bili A",
+                    "view_count": 5000,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://www.bilibili.com/video/BV1altbili/",
+                    "source_label": "Bilibili Search",
+                    "source_kind": "streaming",
+                    "title": "Richter Schumann Piano Concerto 1954",
+                    "description": "Same platform alternate upload",
+                    "platform": "bilibili",
+                    "weight": 0.7,
+                    "same_recording_score": 0.96,
+                    "duration_seconds": 2390,
+                    "uploader": "Uploader Bili B",
+                    "view_count": 4200,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://www.youtube.com/watch?v=ytbest001",
+                    "source_label": "YouTube Search",
+                    "source_kind": "streaming",
+                    "title": "Richter Ferencsik Schumann Piano Concerto 1954 Budapest",
+                    "description": "Hungarian State Philharmonic Orchestra",
+                    "platform": "youtube",
+                    "weight": 0.7,
+                    "same_recording_score": 0.86,
+                    "duration_seconds": 2410,
+                    "uploader": "Uploader YT",
+                    "view_count": 8200,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://music.apple.com/us/album/piano-concerto-in-a-minor-op-54/123456789?i=987654321",
+                    "source_label": "Apple Music Search",
+                    "source_kind": "streaming",
+                    "title": "Piano Concerto in A Minor, Op. 54",
+                    "description": "Sviatoslav Richter | Janos Ferencsik | Budapest 1954",
+                    "platform": "apple_music",
+                    "weight": 0.7,
+                    "same_recording_score": 0.83,
+                    "duration_seconds": 2405,
+                    "uploader": "Sviatoslav Richter",
+                    "view_count": 0,
+                    "fields": {},
+                    "images": [],
+                },
+            ]
+
+        async def search_fallback(self, draft, profile):
+            del draft, profile
+            return []
+
+    payload = sample_request()
+    payload["items"][0]["workTypeHint"] = "concerto"
+    payload["items"][0]["sourceLine"] = (
+        "Robert Schumann | Piano Concerto in A minor, Op.54 | Sviatoslav Richter | "
+        "Janos Ferencsik | Hungarian State Philharmonic Orchestra | March 8, 1954 Budapest"
+    )
+    payload["items"][0]["seed"]["title"] = "Richter Budapest 1954"
+    payload["items"][0]["seed"]["composerNameLatin"] = "Robert Schumann"
+    payload["items"][0]["seed"]["workTitleLatin"] = "Piano Concerto in A minor, Op.54"
+    payload["items"][0]["seed"]["catalogue"] = "Op.54"
+    payload["items"][0]["seed"]["performanceDateText"] = "March 8, 1954 Budapest"
+    payload["items"][0]["seed"]["credits"] = [
+        {"role": "soloist", "displayName": "Sviatoslav Richter", "label": "Sviatoslav Richter"},
+        {"role": "conductor", "displayName": "Janos Ferencsik", "label": "Janos Ferencsik"},
+    ]
+    request = CreateJobRequest.model_validate(payload)
+    pipeline = RetrievalPipeline(source_provider=ThreePlatformProvider(), llm_client=None)
+
+    result = asyncio.run(pipeline.retrieve(request.items[0]))
+
+    final_urls = [candidate.url for candidate in result.result.links]
+    assert final_urls == [
+        "https://www.bilibili.com/video/BV1bestbili/",
+        "https://www.youtube.com/watch?v=ytbest001",
+        "https://music.apple.com/us/album/piano-concerto-in-a-minor-op-54/123456789?i=987654321",
+    ]
+
+
+def test_pipeline_final_links_do_not_keep_same_platform_alternates_once_primary_platforms_are_covered() -> None:
+    class ThreePlatformAltProvider:
+        async def inspect_existing_links(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_high_quality(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_streaming(self, draft, profile):
+            del draft, profile
+            return [
+                {
+                    "url": "https://www.bilibili.com/video/BV1bestbili/",
+                    "source_label": "Bilibili Search",
+                    "source_kind": "streaming",
+                    "title": "Richter Ferencsik Schumann Piano Concerto",
+                    "description": "Budapest exact upload",
+                    "platform": "bilibili",
+                    "weight": 0.7,
+                    "same_recording_score": 0.97,
+                    "duration_seconds": 2400,
+                    "uploader": "Uploader Bili A",
+                    "view_count": 5000,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://www.bilibili.com/video/BV1altbili/",
+                    "source_label": "Bilibili Search",
+                    "source_kind": "streaming",
+                    "title": "Richter / Ferencsik Schumann archive upload",
+                    "description": "Same platform alternate upload",
+                    "platform": "bilibili",
+                    "weight": 0.7,
+                    "same_recording_score": 0.96,
+                    "duration_seconds": 2390,
+                    "uploader": "Uploader Bili B",
+                    "view_count": 4200,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://www.youtube.com/watch?v=ytbest001",
+                    "source_label": "YouTube Search",
+                    "source_kind": "streaming",
+                    "title": "Richter Ferencsik Schumann Piano Concerto",
+                    "description": "Budapest exact upload",
+                    "platform": "youtube",
+                    "weight": 0.7,
+                    "same_recording_score": 0.86,
+                    "duration_seconds": 2410,
+                    "uploader": "Uploader YT",
+                    "view_count": 8200,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://music.apple.com/us/album/piano-concerto-in-a-minor-op-54/123456789?i=987654321",
+                    "source_label": "Apple Music Search",
+                    "source_kind": "streaming",
+                    "title": "Piano Concerto in A Minor, Op. 54",
+                    "description": "Sviatoslav Richter | Janos Ferencsik | Budapest exact upload",
+                    "platform": "apple_music",
+                    "weight": 0.7,
+                    "same_recording_score": 0.83,
+                    "duration_seconds": 2405,
+                    "uploader": "Sviatoslav Richter",
+                    "view_count": 0,
+                    "fields": {},
+                    "images": [],
+                },
+            ]
+
+        async def search_fallback(self, draft, profile):
+            del draft, profile
+            return []
+
+    class AcceptedBilibiliAlternatesLlm:
+        minimum_synthesis_timeout_seconds = 0.0
+        allow_realtime_synthesis = True
+
+        async def synthesize(self, draft, profile, records):
+            del draft, profile, records
+            return {
+                "summary": "",
+                "notes": "",
+                "warnings": [],
+                "acceptedUrls": [
+                    "https://www.bilibili.com/video/BV1bestbili/",
+                    "https://www.bilibili.com/video/BV1altbili/",
+                ],
+            }
+
+    payload = sample_request()
+    payload["items"][0]["workTypeHint"] = "concerto"
+    payload["items"][0]["sourceLine"] = (
+        "Robert Schumann | Piano Concerto in A minor, Op.54 | Sviatoslav Richter | "
+        "Janos Ferencsik | - | -"
+    )
+    payload["items"][0]["seed"]["title"] = "Sviatoslav Richter / Janos Ferencsik"
+    payload["items"][0]["seed"]["composerNameLatin"] = "Robert Schumann"
+    payload["items"][0]["seed"]["workTitleLatin"] = "Piano Concerto in A minor, Op.54"
+    payload["items"][0]["seed"]["catalogue"] = "Op.54"
+    payload["items"][0]["seed"]["credits"] = [
+        {"role": "soloist", "displayName": "Sviatoslav Richter", "label": "Sviatoslav Richter"},
+        {"role": "conductor", "displayName": "Janos Ferencsik", "label": "Janos Ferencsik"},
+    ]
+    request = CreateJobRequest.model_validate(payload)
+    pipeline = RetrievalPipeline(source_provider=ThreePlatformAltProvider(), llm_client=AcceptedBilibiliAlternatesLlm())
+
+    result = asyncio.run(pipeline.retrieve(request.items[0]))
+
+    assert [candidate.url for candidate in result.result.links] == [
+        "https://www.bilibili.com/video/BV1bestbili/",
+        "https://www.youtube.com/watch?v=ytbest001",
+        "https://music.apple.com/us/album/piano-concerto-in-a-minor-op-54/123456789?i=987654321",
+    ]
+
+
+def test_pipeline_candidate_links_still_filters_red_zone_even_with_review_slots() -> None:
+    class RedZoneProvider:
+        async def inspect_existing_links(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_high_quality(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_streaming(self, draft, profile):
+            del draft, profile
+            return [
+                {
+                    "url": "https://www.youtube.com/watch?v=good1",
+                    "source_label": "YouTube Search",
+                    "source_kind": "streaming",
+                    "title": "Sviatoslav Richter Schumann Piano Concerto 1954",
+                    "description": "Good candidate",
+                    "platform": "youtube",
+                    "weight": 0.72,
+                    "same_recording_score": 0.82,
+                    "duration_seconds": 2400,
+                    "uploader": "Uploader YT",
+                    "view_count": 1000,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://www.youtube.com/watch?v=wrongclara",
+                    "source_label": "YouTube Search",
+                    "source_kind": "streaming",
+                    "title": "Clara Schumann Piano Concerto 1835",
+                    "description": "Wrong composer family candidate",
+                    "platform": "youtube",
+                    "weight": 0.75,
+                    "same_recording_score": 0.84,
+                    "duration_seconds": 2400,
+                    "uploader": "Uploader Wrong",
+                    "view_count": 900,
+                    "fields": {},
+                    "images": [],
+                },
+            ]
+
+        async def search_fallback(self, draft, profile):
+            del draft, profile
+            return []
+
+    payload = sample_request()
+    payload["items"][0]["workTypeHint"] = "concerto"
+    payload["items"][0]["sourceLine"] = (
+        "Robert Schumann | Piano Concerto in A minor, Op.54 | Sviatoslav Richter | "
+        "Janos Ferencsik | Hungarian State Philharmonic Orchestra | March 8, 1954 Budapest"
+    )
+    payload["items"][0]["seed"]["title"] = "Richter Budapest 1954"
+    payload["items"][0]["seed"]["composerNameLatin"] = "Robert Schumann"
+    payload["items"][0]["seed"]["workTitleLatin"] = "Piano Concerto in A minor, Op.54"
+    payload["items"][0]["seed"]["catalogue"] = "Op.54"
+    payload["items"][0]["seed"]["performanceDateText"] = "March 8, 1954 Budapest"
+    payload["items"][0]["seed"]["credits"] = [
+        {"role": "soloist", "displayName": "Sviatoslav Richter", "label": "Sviatoslav Richter"},
+        {"role": "conductor", "displayName": "Janos Ferencsik", "label": "Janos Ferencsik"},
+    ]
+    request = CreateJobRequest.model_validate(payload)
+    pipeline = RetrievalPipeline(source_provider=RedZoneProvider(), llm_client=None)
+
+    result = asyncio.run(pipeline.retrieve(request.items[0]))
+
+    candidate_urls = [candidate.url for candidate in result.link_candidates]
+    assert "https://www.youtube.com/watch?v=good1" in candidate_urls
+    assert "https://www.youtube.com/watch?v=wrongclara" not in candidate_urls

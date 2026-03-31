@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from scripts.real_data_regression import build_access_report_payload, sample_scenarios
+from scripts.real_data_regression import build_access_report_payload, canonicalize_url, sample_scenarios
 
 
 def test_build_access_report_payload_summarizes_scenarios_and_hosts() -> None:
@@ -64,3 +64,10 @@ def test_sample_scenarios_include_expanded_sparse_variants() -> None:
         "bernstein-fantastique-conductor-only",
         "kreisler-spring-full",
     } <= scenario_ids
+
+
+def test_real_data_regression_canonicalize_url_supports_apple_music() -> None:
+    assert (
+        canonicalize_url("https://music.apple.com/cn/album/demo/123456789?i=987654321&uo=4")
+        == "apple_music:/cn/album/demo/123456789?i=987654321"
+    )

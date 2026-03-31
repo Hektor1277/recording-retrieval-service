@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import re
 import json
+from html import unescape
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -15,6 +17,7 @@ from app.services.parent_work_eval import (
     classify_target_link_audit,
     find_work_id,
     load_library_indices,
+    normalize_ground_truth_platform,
     summarize_link_audit,
 )
 from app.services.pipeline import InputNormalizer
@@ -111,6 +114,46 @@ async def fetch_bilibili_view(client: httpx.AsyncClient, url: str) -> dict[str, 
     }
 
 
+def _extract_meta_content(html_text: str, property_name: str) -> str:
+    patterns = [
+        rf'<meta[^>]+property="{re.escape(property_name)}"[^>]+content="([^"]*)"',
+        rf"<meta[^>]+property='{re.escape(property_name)}'[^>]+content='([^']*)'",
+        rf'<meta[^>]+content="([^"]*)"[^>]+property="{re.escape(property_name)}"',
+        rf"<meta[^>]+content='([^']*)'[^>]+property='{re.escape(property_name)}'",
+        rf'<meta[^>]+name="{re.escape(property_name)}"[^>]+content="([^"]*)"',
+        rf"<meta[^>]+name='{re.escape(property_name)}'[^>]+content='([^']*)'",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, html_text or "", flags=re.IGNORECASE)
+        if match:
+            return unescape(match.group(1)).strip()
+    return ""
+
+
+async def fetch_apple_music_page(client: httpx.AsyncClient, url: str) -> dict[str, object]:
+    response = await client.get(url)
+    if response.status_code != 200:
+        return {
+            "available": False,
+            "statusCode": response.status_code,
+            "resolvedCanonical": "",
+            "title": "",
+            "description": "",
+            "uploader": "",
+            "message": response.text[:200],
+        }
+    html_text = response.text or ""
+    return {
+        "available": True,
+        "statusCode": response.status_code,
+        "resolvedCanonical": canonicalize_url(url),
+        "title": _extract_meta_content(html_text, "og:title"),
+        "description": _extract_meta_content(html_text, "og:description"),
+        "uploader": _extract_meta_content(html_text, "og:site_name"),
+        "message": "",
+    }
+
+
 async def audit_link(
     client: httpx.AsyncClient,
     *,
@@ -118,10 +161,13 @@ async def audit_link(
     url: str,
     drafts: list[object],
 ) -> dict[str, object]:
-    if platform == "youtube":
+    normalized_platform = normalize_ground_truth_platform(platform)
+    if normalized_platform == "youtube":
         metadata = await fetch_youtube_oembed(client, url)
-    elif platform == "bilibili":
+    elif normalized_platform == "bilibili":
         metadata = await fetch_bilibili_view(client, url)
+    elif normalized_platform == "apple_music":
+        metadata = await fetch_apple_music_page(client, url)
     else:
         return {
             "available": False,
@@ -190,8 +236,8 @@ async def main() -> None:
             drafts = [normalizer.normalize(scenario.item) for scenario in scenarios]
             primary_scenario = scenarios[0]
             for link in recording.get("links") or []:
-                platform = str(link.get("platform") or "").strip().lower()
-                if platform not in {"youtube", "bilibili"}:
+                platform = normalize_ground_truth_platform(str(link.get("platform") or ""))
+                if platform not in {"youtube", "bilibili", "apple_music"}:
                     continue
                 audit = await audit_link(
                     client,

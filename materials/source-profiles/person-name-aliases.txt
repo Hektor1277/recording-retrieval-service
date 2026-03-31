@@ -7,10 +7,15 @@
 # 5. #global 中的映射适用于所有角色；角色分组中的映射会在对应角色里优先使用。
 
 #global
+Ferencsik Janos = Janos Ferencsik
 # 例：西贝柳斯 = 西贝留士 = Sibelius = Jean Sibelius
 
 #conductor
 Kletzki = Paul Kletzki
+富特文格勒 = Wilhelm Furtwangler = Wilhelm Furtwängler
+约胡姆 = Eugen Jochum
+费伦茨·弗里乔伊 = 弗里乔伊 = Ferenc Fricsay
+埃利亚斯伯格 = Carl Eliasberg
 # 例：蒙都 = 蒙特 = Monteux = Pierre Monteux
 
 #soloist

@@ -20,8 +20,12 @@ REQUESTED_FIELDS = [
     "notes",
 ]
 
-GROUND_TRUTH_PLATFORMS = {"youtube", "bilibili"}
+GROUND_TRUTH_PLATFORMS = {"youtube", "bilibili", "apple_music"}
 GROUP_ROLES = {"orchestra", "ensemble", "choir"}
+GROUND_TRUTH_PLATFORM_ALIASES = {
+    "apple-music": "apple_music",
+    "apple_music": "apple_music",
+}
 
 
 @dataclass(slots=True)
@@ -83,6 +87,13 @@ def canonicalize_url(url: str) -> str:
         parts = [part for part in path.split("/") if part]
         if len(parts) >= 2 and parts[0] == "video":
             return f"bilibili:{parts[1]}"
+    if host.endswith("music.apple.com"):
+        params = parse_qs(parsed.query)
+        track_id = params.get("i", [""])[0].strip()
+        canonical = f"apple_music:{path}" if path else "apple_music:"
+        if track_id:
+            canonical = f"{canonical}?i={track_id}"
+        return canonical
     return normalized.split("#", 1)[0].split("?", 1)[0]
 
 
@@ -92,7 +103,14 @@ def platform_from_canonical_url(value: str) -> str:
         return "youtube"
     if normalized.startswith("bilibili:"):
         return "bilibili"
+    if normalized.startswith("apple_music:"):
+        return "apple_music"
     return ""
+
+
+def normalize_ground_truth_platform(value: str) -> str:
+    normalized = compact(value).lower().replace(" ", "_")
+    return GROUND_TRUTH_PLATFORM_ALIASES.get(normalized, normalized)
 
 
 def find_work_id(*, works: dict[str, dict], work_id: str = "", title_latin: str = "", title: str = "") -> str:
@@ -189,7 +207,7 @@ def supported_target_urls(recording: dict) -> list[str]:
     seen: set[str] = set()
     for link in recording.get("links") or []:
         url = str(link.get("url") or "").strip()
-        platform = str(link.get("platform") or "").strip().lower()
+        platform = normalize_ground_truth_platform(str(link.get("platform") or ""))
         if not url or platform not in GROUND_TRUTH_PLATFORMS:
             continue
         canonical = canonicalize_url(url)
@@ -351,6 +369,8 @@ def summarize_results(results: list[dict]) -> dict[str, dict[str, int]]:
         "candidateHit": 0,
         "relaxedFinalHit": 0,
         "relaxedCandidateHit": 0,
+        "versionFinalHit": 0,
+        "versionCandidateHit": 0,
     }
     by_variant: dict[str, dict[str, int]] = defaultdict(
         lambda: {
@@ -360,6 +380,8 @@ def summarize_results(results: list[dict]) -> dict[str, dict[str, int]]:
             "candidateHit": 0,
             "relaxedFinalHit": 0,
             "relaxedCandidateHit": 0,
+            "versionFinalHit": 0,
+            "versionCandidateHit": 0,
         }
     )
     strict_miss_reasons: dict[str, int] = defaultdict(int)
@@ -384,6 +406,12 @@ def summarize_results(results: list[dict]) -> dict[str, dict[str, int]]:
         if bool(result.get("relaxedCandidateHit")):
             overall["relaxedCandidateHit"] += 1
             by_variant[variant]["relaxedCandidateHit"] += 1
+        if bool(result.get("versionFinalHit")):
+            overall["versionFinalHit"] += 1
+            by_variant[variant]["versionFinalHit"] += 1
+        if bool(result.get("versionCandidateHit")):
+            overall["versionCandidateHit"] += 1
+            by_variant[variant]["versionCandidateHit"] += 1
         miss_reason = compact(result.get("strictMissReason"))
         if miss_reason and miss_reason not in {"none", "not_evaluable"}:
             strict_miss_reasons[miss_reason] += 1
@@ -456,6 +484,22 @@ def classify_link_match(
     return False, "none"
 
 
+def classify_version_link_match(
+    *,
+    targets: list[str],
+    links: list[dict[str, object]],
+    cross_platform_confidence_threshold: float = 0.9,
+) -> tuple[bool, str]:
+    strict_hit, strict_match_type = classify_link_match(targets=targets, links=links)
+    if strict_hit:
+        return True, strict_match_type
+    for link in links:
+        confidence = float(link.get("confidence", 0.0) or 0.0)
+        if confidence >= cross_platform_confidence_threshold:
+            return True, "cross_platform_version_equivalent"
+    return False, "none"
+
+
 def evaluate_hit_metrics(
     *,
     targets: list[str],
@@ -467,13 +511,25 @@ def evaluate_hit_metrics(
         targets=targets,
         links=[*final_links, *candidate_links],
     )
+    version_final_hit, final_version_match_type = classify_version_link_match(
+        targets=targets,
+        links=final_links,
+    )
+    version_candidate_hit, candidate_version_match_type = classify_version_link_match(
+        targets=targets,
+        links=[*final_links, *candidate_links],
+    )
     return {
         "finalHit": final_match_type == "strict",
         "candidateHit": candidate_match_type == "strict",
         "relaxedFinalHit": final_hit,
         "relaxedCandidateHit": candidate_hit,
+        "versionFinalHit": version_final_hit,
+        "versionCandidateHit": version_candidate_hit,
         "finalMatchType": final_match_type,
         "candidateMatchType": candidate_match_type,
+        "finalVersionMatchType": final_version_match_type,
+        "candidateVersionMatchType": candidate_version_match_type,
     }
 
 

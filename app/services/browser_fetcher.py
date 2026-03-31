@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import atexit
 import asyncio
+import hashlib
+import time
 import sys
 import weakref
 from contextlib import asynccontextmanager
@@ -15,6 +17,51 @@ from urllib.parse import urlparse
 
 class BrowserFetchUnavailable(RuntimeError):
     pass
+
+
+BROWSER_DIAGNOSTIC_MAX_FILES = 40
+BROWSER_DIAGNOSTIC_MAX_TOTAL_BYTES = 20 * 1024 * 1024
+BROWSER_DIAGNOSTIC_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
+
+_SEARCH_LINK_PAYLOAD_SCRIPT = """(patterns) => {
+    const regexes = (patterns || []).map((pattern) => new RegExp(pattern, 'i'));
+    const toHref = (node) => {
+      try {
+        return new URL(node.getAttribute('href') || '', window.location.href).href;
+      } catch (error) {
+        return '';
+      }
+    };
+    const anchors = Array.from(document.querySelectorAll('a[href]'));
+    const values = anchors
+      .map((node) => toHref(node))
+      .filter((href) => /^https?:/i.test(href));
+    const matches = (href) => !regexes.length || regexes.some((pattern) => pattern.test(href));
+    const filtered = values.filter((href) => matches(href));
+    const host = window.location.hostname || '';
+    let resultCardLinks = [];
+    if (host.includes('search.bilibili.com')) {
+      const selectors = [
+        '.bili-video-card a[href]',
+        '.video-list-item a[href]',
+        '[class*="video-card"] a[href]',
+        '[class*="video-item"] a[href]',
+        '[class*="search-result"] a[href]',
+      ];
+      const collected = selectors.flatMap((selector) =>
+        Array.from(document.querySelectorAll(selector)).map((node) => toHref(node))
+      );
+      resultCardLinks = collected.filter((href) => /^https?:/i.test(href) && matches(href));
+    }
+    const bodyText = (document.body?.innerText || '').replace(/\\s+/g, ' ').trim();
+    return {
+      title: String(document.title || '').trim(),
+      allLinks: Array.from(new Set(filtered)),
+      resultCardLinks: Array.from(new Set(resultCardLinks)),
+      anchorCount: values.length,
+      bodyTextSample: bodyText.slice(0, 500),
+    };
+}"""
 
 
 @dataclass(slots=True)
@@ -61,7 +108,8 @@ class PlaywrightBrowserFetcher:
 
     async def fetch_page(self, url: str, timeout_seconds: float | None = None) -> dict[str, str]:
         async with self._semaphore:
-            return await self._run_with_timeout(self._fetch_page_inner(url), timeout_seconds or 8.0)
+            effective_timeout = timeout_seconds or 8.0
+            return await self._run_with_timeout(self._fetch_page_inner(url, timeout_seconds=effective_timeout), effective_timeout)
 
     async def fetch_links(
         self,
@@ -71,9 +119,30 @@ class PlaywrightBrowserFetcher:
         timeout_seconds: float | None = None,
     ) -> list[str]:
         async with self._semaphore:
+            effective_timeout = timeout_seconds or 8.0
             return await self._run_with_timeout(
-                self._fetch_links_inner(url, url_patterns or []),
-                timeout_seconds or 8.0,
+                self._fetch_links_inner(url, url_patterns or [], timeout_seconds=effective_timeout),
+                effective_timeout,
+            )
+
+    async def fetch_search_evidence(
+        self,
+        url: str,
+        *,
+        url_patterns: list[str] | None = None,
+        timeout_seconds: float | None = None,
+        capture_screenshot: bool = False,
+    ) -> dict[str, Any]:
+        async with self._semaphore:
+            effective_timeout = timeout_seconds or 8.0
+            return await self._run_with_timeout(
+                self._fetch_search_evidence_inner(
+                    url,
+                    url_patterns or [],
+                    timeout_seconds=effective_timeout,
+                    capture_screenshot=capture_screenshot,
+                ),
+                effective_timeout,
             )
 
     async def _run_with_timeout(self, coroutine: Any, timeout_seconds: float):
@@ -85,7 +154,7 @@ class PlaywrightBrowserFetcher:
             task.add_done_callback(_silence_task_exception)
             raise TimeoutError("browser fetch timed out") from error
 
-    async def _fetch_page_inner(self, url: str) -> dict[str, str]:
+    async def _fetch_page_inner(self, url: str, *, timeout_seconds: float) -> dict[str, str]:
         try:
             from playwright.async_api import Error as PlaywrightError
         except ImportError as error:  # pragma: no cover - environment dependent
@@ -93,7 +162,7 @@ class PlaywrightBrowserFetcher:
 
         try:
             async with self._open_page(url) as page:
-                await self._goto_with_retry(page, url, PlaywrightError)
+                await self._goto_with_retry(page, url, PlaywrightError, timeout_seconds=timeout_seconds)
                 await self._wait_for_page_snapshot(page, url)
 
                 snapshot = BrowserPageSnapshot(
@@ -165,7 +234,7 @@ class PlaywrightBrowserFetcher:
         except PlaywrightError as error:  # pragma: no cover - environment dependent
             raise BrowserFetchUnavailable(str(error)) from error
 
-    async def _fetch_links_inner(self, url: str, url_patterns: list[str]) -> list[str]:
+    async def _fetch_links_inner(self, url: str, url_patterns: list[str], *, timeout_seconds: float) -> list[str]:
         try:
             from playwright.async_api import Error as PlaywrightError
         except ImportError as error:  # pragma: no cover - environment dependent
@@ -173,29 +242,59 @@ class PlaywrightBrowserFetcher:
 
         try:
             async with self._open_page(url) as page:
-                await self._goto_with_retry(page, url, PlaywrightError)
+                await self._goto_with_retry(page, url, PlaywrightError, timeout_seconds=timeout_seconds)
                 await self._wait_for_link_results(page, url)
 
-                links = await page.evaluate(
-                    """(patterns) => {
-                        const regexes = (patterns || []).map((pattern) => new RegExp(pattern, 'i'));
-                        const values = Array.from(document.querySelectorAll('a[href]'))
-                          .map((node) => {
-                            try {
-                              return new URL(node.getAttribute('href') || '', window.location.href).href;
-                            } catch (error) {
-                              return '';
-                            }
-                          })
-                          .filter((href) => /^https?:/i.test(href));
-                        const filtered = regexes.length
-                          ? values.filter((href) => regexes.some((pattern) => pattern.test(href)))
-                          : values;
-                        return Array.from(new Set(filtered));
-                    }""",
+                payload = await page.evaluate(
+                    _SEARCH_LINK_PAYLOAD_SCRIPT,
                     url_patterns,
                 )
-                return [str(value).strip() for value in links or [] if str(value or "").strip()]
+                normalized = normalize_search_result_payload(url, payload)
+                return [str(value).strip() for value in normalized.get("matchedLinks") or [] if str(value or "").strip()]
+        except PlaywrightError as error:  # pragma: no cover - environment dependent
+            raise BrowserFetchUnavailable(str(error)) from error
+
+    async def _fetch_search_evidence_inner(
+        self,
+        url: str,
+        url_patterns: list[str],
+        *,
+        timeout_seconds: float,
+        capture_screenshot: bool,
+    ) -> dict[str, Any]:
+        try:
+            from playwright.async_api import Error as PlaywrightError
+        except ImportError as error:  # pragma: no cover - environment dependent
+            raise BrowserFetchUnavailable("playwright is not installed") from error
+
+        try:
+            async with self._open_page(url) as page:
+                await self._goto_with_retry(page, url, PlaywrightError, timeout_seconds=timeout_seconds)
+                await self._wait_for_link_results(page, url)
+                payload = await page.evaluate(
+                    _SEARCH_LINK_PAYLOAD_SCRIPT,
+                    url_patterns,
+                )
+                normalized = normalize_search_result_payload(url, payload)
+                html_length = len(await page.content())
+                screenshot_path = ""
+                if capture_screenshot:
+                    screenshot_path = await self._save_search_screenshot(page, url)
+                return {
+                    "title": str(normalized.get("title") or "").strip(),
+                    "matchedLinks": [
+                        str(value).strip()
+                        for value in normalized.get("matchedLinks") or []
+                        if str(value or "").strip()
+                    ],
+                    "matchedLinkCount": int(normalized.get("matchedLinkCount", 0) or 0),
+                    "anchorCount": int(normalized.get("anchorCount", 0) or 0),
+                    "resultCardCount": int(normalized.get("resultCardCount", 0) or 0),
+                    "extractionMode": str(normalized.get("extractionMode") or "").strip(),
+                    "bodyTextSample": str(normalized.get("bodyTextSample") or "").strip(),
+                    "htmlLength": html_length,
+                    "screenshotPath": screenshot_path,
+                }
         except PlaywrightError as error:  # pragma: no cover - environment dependent
             raise BrowserFetchUnavailable(str(error)) from error
 
@@ -331,20 +430,40 @@ class PlaywrightBrowserFetcher:
             return
         await page.wait_for_timeout(800)
 
-    async def _goto_with_retry(self, page: Any, url: str, playwright_error: type[Exception]) -> None:
+    async def _goto_with_retry(
+        self,
+        page: Any,
+        url: str,
+        playwright_error: type[Exception],
+        *,
+        timeout_seconds: float,
+    ) -> None:
+        goto_timeout_ms = max(5000, int(timeout_seconds * 1000))
         try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=12000)
+            await page.goto(url, wait_until="domcontentloaded", timeout=goto_timeout_ms)
             return
         except playwright_error as error:
             if not should_retry_navigation_error(str(error), url):
                 raise
         await page.wait_for_timeout(450)
-        await page.goto(url, wait_until="domcontentloaded", timeout=12000)
+        await page.goto(url, wait_until="domcontentloaded", timeout=goto_timeout_ms)
 
     async def _safe_close(self, handle: Any) -> None:
         with suppress(Exception):
             if handle is not None:
                 await handle.close()
+
+    async def _save_search_screenshot(self, page: Any, url: str) -> str:
+        output_dir = Path(__file__).resolve().parents[2] / "output" / "browser-diagnostics"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        parsed = urlparse(url)
+        host_slug = _slugify_filename_fragment(parsed.netloc or "page")
+        digest = hashlib.sha1(url.encode("utf-8")).hexdigest()[:12]
+        target = output_dir / f"{host_slug}-{digest}.png"
+        with suppress(Exception):
+            await page.screenshot(path=str(target), full_page=True)
+        prune_browser_diagnostic_files(output_dir)
+        return str(target) if target.exists() else ""
 
 
 def _silence_task_exception(task: asyncio.Task) -> None:
@@ -358,3 +477,109 @@ def should_retry_navigation_error(message: str, url: str) -> bool:
         return False
     lowered = (message or "").lower()
     return "err_aborted" in lowered or "frame was detached" in lowered
+
+
+def _slugify_filename_fragment(value: str) -> str:
+    cleaned = "".join(character if character.isalnum() else "-" for character in (value or "").strip().lower())
+    collapsed = "-".join(segment for segment in cleaned.split("-") if segment)
+    return collapsed or "page"
+
+
+def normalize_search_result_payload(url: str, payload: dict[str, Any] | None) -> dict[str, Any]:
+    raw = payload or {}
+    all_links = _clean_http_links(raw.get("allLinks") or raw.get("matchedLinks") or [])
+    result_card_links = _clean_http_links(raw.get("resultCardLinks") or [])
+    host = urlparse(url).netloc.lower()
+
+    extraction_mode = "anchor-scan"
+    matched_links = list(all_links)
+    if "search.bilibili.com" in host:
+        all_links = [value for value in all_links if _is_bilibili_video_link(value)]
+        result_card_links = [value for value in result_card_links if _is_bilibili_video_link(value)]
+        matched_links = list(all_links)
+    if "search.bilibili.com" in host and result_card_links:
+        matched_links = _dedupe_preserve_order([*result_card_links, *all_links])
+        extraction_mode = "result-card-priority"
+
+    return {
+        "title": str(raw.get("title") or "").strip(),
+        "matchedLinks": matched_links[:8],
+        "matchedLinkCount": len(matched_links),
+        "anchorCount": int(raw.get("anchorCount", 0) or 0),
+        "resultCardCount": len(result_card_links),
+        "extractionMode": extraction_mode,
+        "bodyTextSample": str(raw.get("bodyTextSample") or "").strip(),
+    }
+
+
+def prune_browser_diagnostic_files(
+    output_dir: Path,
+    *,
+    max_files: int = BROWSER_DIAGNOSTIC_MAX_FILES,
+    max_total_bytes: int = BROWSER_DIAGNOSTIC_MAX_TOTAL_BYTES,
+    max_age_seconds: float = BROWSER_DIAGNOSTIC_MAX_AGE_SECONDS,
+) -> None:
+    files = [path for path in output_dir.glob("*.png") if path.is_file()]
+    if not files:
+        return
+
+    now = time.time()
+    for path in files:
+        with suppress(OSError):
+            if max_age_seconds > 0 and now - path.stat().st_mtime > max_age_seconds:
+                path.unlink(missing_ok=True)
+
+    files = [path for path in output_dir.glob("*.png") if path.is_file()]
+    if not files:
+        return
+
+    files.sort(key=lambda path: (path.stat().st_mtime, path.name), reverse=True)
+
+    if max_files > 0:
+        for stale in files[max_files:]:
+            with suppress(OSError):
+                stale.unlink(missing_ok=True)
+        files = files[:max_files]
+
+    if max_total_bytes <= 0:
+        for path in files:
+            with suppress(OSError):
+                path.unlink(missing_ok=True)
+        return
+
+    total_size = 0
+    kept: list[Path] = []
+    for path in files:
+        with suppress(OSError):
+            size = path.stat().st_size
+            if total_size + size <= max_total_bytes or not kept:
+                kept.append(path)
+                total_size += size
+                continue
+            path.unlink(missing_ok=True)
+
+
+def _clean_http_links(values: list[Any]) -> list[str]:
+    cleaned: list[str] = []
+    for value in values:
+        text = str(value or "").strip()
+        if text.startswith("http://") or text.startswith("https://"):
+            cleaned.append(text)
+    return _dedupe_preserve_order(cleaned)
+
+
+def _dedupe_preserve_order(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for value in values:
+        normalized = value.rstrip("/")
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(value)
+    return deduped
+
+
+def _is_bilibili_video_link(value: str) -> bool:
+    lowered = value.lower()
+    return "/video/bv" in lowered or "/video/av" in lowered

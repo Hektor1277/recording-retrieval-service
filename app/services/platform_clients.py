@@ -4,6 +4,7 @@ import hashlib
 import re
 import time
 from dataclasses import dataclass
+from dataclasses import field
 from urllib.parse import quote
 
 import httpx
@@ -11,10 +12,32 @@ import httpx
 from app.services.platform_search_config import PlatformSearchConfig
 
 
+def parse_bilibili_duration_seconds(value: object) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, (int, float)):
+        return max(0, int(value))
+    text = str(value).strip()
+    if not text:
+        return 0
+    if text.isdigit():
+        return max(0, int(text))
+    if ":" not in text:
+        return 0
+    parts = text.split(":")
+    if not all(part.isdigit() for part in parts):
+        return 0
+    total = 0
+    for part in parts:
+        total = total * 60 + int(part)
+    return max(0, total)
+
+
 @dataclass(slots=True)
 class ApiSearchResult:
     endpoint_url: str
     links: list[str]
+    rows: list[dict[str, object]] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -145,13 +168,35 @@ class PlatformSearchClients:
         response.raise_for_status()
         payload = response.json()
         links: list[str] = []
+        rows: list[dict[str, object]] = []
         for bucket_name in ("songs", "albums", "playlists"):
             bucket = (((payload.get("results") or {}).get(bucket_name) or {}).get("data") or [])
             for item in bucket:
-                url = str(((item.get("attributes") or {}).get("url") or "")).strip()
+                attributes = (item.get("attributes") or {}) if isinstance(item, dict) else {}
+                url = str(attributes.get("url") or "").strip()
                 if url:
                     links.append(url)
-        return ApiSearchResult(endpoint_url=str(response.request.url), links=links)
+                    title = str(attributes.get("name") or "").strip()
+                    artist_name = str(attributes.get("artistName") or "").strip()
+                    album_name = str(attributes.get("albumName") or "").strip()
+                    composer_name = str(attributes.get("composerName") or "").strip()
+                    editorial_notes = attributes.get("editorialNotes") if isinstance(attributes.get("editorialNotes"), dict) else {}
+                    note_text = str(
+                        editorial_notes.get("standard") or editorial_notes.get("short") or ""
+                    ).strip()
+                    description = " | ".join(
+                        part for part in [artist_name, album_name, composer_name, note_text] if part
+                    )
+                    rows.append(
+                        {
+                            "url": url,
+                            "title": title,
+                            "description": description,
+                            "uploader": artist_name,
+                            "duration_seconds": int(attributes.get("durationInMillis") or 0) // 1000,
+                        }
+                    )
+        return ApiSearchResult(endpoint_url=str(response.request.url), links=links, rows=rows)
 
     async def search_apple_music_public(self, query: str, *, result_limit: int) -> ApiSearchResult:
         endpoint = "https://itunes.apple.com/search"
@@ -166,13 +211,30 @@ class PlatformSearchClients:
         response.raise_for_status()
         payload = response.json()
         links: list[str] = []
+        rows: list[dict[str, object]] = []
         for item in payload.get("results", []):
-            for key in ("trackViewUrl", "collectionViewUrl", "artistViewUrl"):
-                url = str(item.get(key) or "").strip()
-                if url:
-                    links.append(url)
-                    break
-        return ApiSearchResult(endpoint_url=str(response.request.url), links=links)
+            url = str(item.get("trackViewUrl") or item.get("collectionViewUrl") or "").strip()
+            if not url:
+                continue
+            links.append(url)
+            title = str(item.get("trackName") or item.get("collectionName") or "").strip()
+            artist_name = str(item.get("artistName") or "").strip()
+            collection_name = str(item.get("collectionName") or "").strip()
+            genre_name = str(item.get("primaryGenreName") or "").strip()
+            release_date = str(item.get("releaseDate") or "").strip()
+            description = " | ".join(
+                part for part in [artist_name, collection_name, genre_name, release_date] if part
+            )
+            rows.append(
+                {
+                    "url": url,
+                    "title": title,
+                    "description": description,
+                    "uploader": artist_name,
+                    "duration_seconds": int(item.get("trackTimeMillis") or 0) // 1000,
+                }
+            )
+        return ApiSearchResult(endpoint_url=str(response.request.url), links=links, rows=rows)
 
     async def search_bilibili(self, query: str, *, result_limit: int) -> ApiSearchResult:
         await self._seed_bilibili_session()
@@ -201,11 +263,23 @@ class PlatformSearchClients:
             message = str(payload.get("message") or payload.get("msg") or "unknown error").strip()
             raise RuntimeError(f"Bilibili WBI search failed with code {code}: {message}")
         links = []
+        rows: list[dict[str, object]] = []
         for item in (((payload.get("data") or {}).get("result") or [])[:result_limit]):
             url = str(item.get("arcurl") or "").strip()
             if url:
                 links.append(url)
-        return ApiSearchResult(endpoint_url=str(response.request.url), links=links)
+                rows.append(
+                    {
+                        "url": url,
+                        "title": str(item.get("title") or "").strip(),
+                        "description": str(item.get("description") or item.get("desc") or "").strip(),
+                        "uploader": str(item.get("author") or item.get("up_name") or "").strip(),
+                        "duration_seconds": parse_bilibili_duration_seconds(item.get("duration")),
+                        "view_count": int(item.get("play") or item.get("view") or 0),
+                        "bvid": str(item.get("bvid") or "").strip(),
+                    }
+                )
+        return ApiSearchResult(endpoint_url=str(response.request.url), links=links, rows=rows)
 
     async def fetch_bilibili_video_detail(self, url: str) -> BilibiliVideoDetail | None:
         bvid_match = re.search(r"/(BV[0-9A-Za-z]+)/?", url, re.I)
@@ -243,7 +317,7 @@ class PlatformSearchClients:
             image_url=str(data.get("pic") or "").strip(),
             uploader=str(owner.get("name") or "").strip(),
             bvid=str(data.get("bvid") or params.get("bvid") or "").strip(),
-            duration_seconds=int(data.get("duration") or 0),
+            duration_seconds=parse_bilibili_duration_seconds(data.get("duration")),
             view_count=int(stat.get("view") or 0),
             page_parts=[str(page.get("part") or "").strip() for page in pages if isinstance(page, dict)],
         )

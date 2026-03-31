@@ -6,9 +6,9 @@ import json
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
 
 from app.models.protocol import Credit, LinkSeed, RetrievalItem, Seed
+from app.services.parent_work_eval import canonicalize_url
 from app.services.retrieval import build_default_retriever
 
 
@@ -60,26 +60,6 @@ def composer_index() -> dict[str, dict]:
 
 def work_index() -> dict[str, dict]:
     return {item["id"]: item for item in load_json("works.json")}
-
-
-def canonicalize_url(url: str) -> str:
-    normalized = (url or "").strip()
-    if not normalized:
-        return ""
-    parsed = urlparse(normalized)
-    host = parsed.netloc.lower()
-    path = parsed.path.rstrip("/")
-    if "youtube.com" in host or "youtu.be" in host:
-        if "youtu.be" in host and path:
-            return f"youtube:{path.lstrip('/')}"
-        video_id = parse_qs(parsed.query).get("v", [""])[0]
-        if video_id:
-            return f"youtube:{video_id}"
-    if "bilibili.com" in host:
-        parts = [part for part in path.split("/") if part]
-        if len(parts) >= 2 and parts[0] == "video":
-            return f"bilibili:{parts[1]}"
-    return normalized.split("#", 1)[0].split("?", 1)[0]
 
 
 def sample_scenarios() -> list[Scenario]:

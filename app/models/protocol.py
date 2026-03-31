@@ -167,6 +167,8 @@ class LinkCandidate(StrictModel):
     title: str | None = None
     source_label: str | None = Field(default=None, alias="sourceLabel")
     confidence: float | None = None
+    zone: str | None = None
+    note: str | None = None
 
 
 class ImageCandidate(StrictModel):

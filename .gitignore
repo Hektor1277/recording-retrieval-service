@@ -5,6 +5,7 @@ output/
 .codex-handoff/
 __pycache__/
 .pytest_cache/
+tmp-pytest-wrapper/
 *.pyc
 *.egg-info/
 logs/*
