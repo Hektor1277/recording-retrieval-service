@@ -14,6 +14,84 @@
   box-sizing: border-box;
 }
 
+html,
+body,
+textarea {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(113, 86, 54, 0.72) transparent;
+}
+
+html::-webkit-scrollbar,
+body::-webkit-scrollbar,
+textarea::-webkit-scrollbar {
+  width: 0.48rem;
+  height: 0.48rem;
+  background: transparent;
+}
+
+html::-webkit-scrollbar-track,
+body::-webkit-scrollbar-track,
+textarea::-webkit-scrollbar-track {
+  background: transparent;
+  border: 0;
+}
+
+html::-webkit-scrollbar-corner,
+body::-webkit-scrollbar-corner,
+textarea::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+html::-webkit-scrollbar-thumb,
+body::-webkit-scrollbar-thumb,
+textarea::-webkit-scrollbar-thumb {
+  background: rgba(113, 86, 54, 0.72);
+  border-radius: 999px;
+  border: 0;
+}
+
+html::-webkit-scrollbar-button:single-button:vertical:decrement,
+body::-webkit-scrollbar-button:single-button:vertical:decrement,
+textarea::-webkit-scrollbar-button:single-button:vertical:decrement,
+html::-webkit-scrollbar-button:single-button:vertical:increment,
+body::-webkit-scrollbar-button:single-button:vertical:increment,
+textarea::-webkit-scrollbar-button:single-button:vertical:increment {
+  display: block;
+  height: 0.66rem;
+  background-color: transparent;
+  background-repeat: no-repeat;
+  background-position: center;
+  background-size: 0.34rem 0.24rem;
+}
+
+html::-webkit-scrollbar-button:single-button:vertical:decrement,
+body::-webkit-scrollbar-button:single-button:vertical:decrement,
+textarea::-webkit-scrollbar-button:single-button:vertical:decrement {
+  background-image:
+    linear-gradient(135deg, transparent 50%, rgba(113, 86, 54, 0.62) 50%),
+    linear-gradient(225deg, transparent 50%, rgba(113, 86, 54, 0.62) 50%);
+  background-position:
+    calc(50% - 0.12rem) 55%,
+    calc(50% + 0.12rem) 55%;
+}
+
+html::-webkit-scrollbar-button:single-button:vertical:increment,
+body::-webkit-scrollbar-button:single-button:vertical:increment,
+textarea::-webkit-scrollbar-button:single-button:vertical:increment {
+  background-image:
+    linear-gradient(315deg, transparent 50%, rgba(113, 86, 54, 0.62) 50%),
+    linear-gradient(45deg, transparent 50%, rgba(113, 86, 54, 0.62) 50%);
+  background-position:
+    calc(50% - 0.12rem) 45%,
+    calc(50% + 0.12rem) 45%;
+}
+
+html::-webkit-scrollbar-track,
+body::-webkit-scrollbar-track,
+textarea::-webkit-scrollbar-track {
+  margin-block: 0.75rem;
+}
+
 body {
   margin: 0;
   min-height: 100vh;

@@ -26,7 +26,7 @@
 
 ## 写入配置
 
-将 [platform-search.example.json](/E:/Workspace/codex/Introduction%20to%20Classical%20Music/tools/recording-retrieval-service/app/config/platform-search.example.json) 复制为本地配置后，在 `bilibili` 段加入：
+将 `config/platform-search.example.json` 复制为本地配置后，在 `bilibili` 段加入：
 
 ```json
 {

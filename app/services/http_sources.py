@@ -17,7 +17,7 @@ import httpx
 
 from app.services.browser_fetcher import BrowserFetchUnavailable, PlaywrightBrowserFetcher
 from app.services.platform_clients import BilibiliVideoDetail, PlatformSearchClients
-from app.services.platform_search_config import PlatformSearchConfig, load_platform_search_config
+from app.services.platform_search_config import PlatformSearchConfig, load_platform_search_config, runtime_config_root
 from app.services.pipeline import (
     DraftRecordingEntry,
     LOW_CONFIDENCE_THRESHOLD,
@@ -46,6 +46,9 @@ ENGINE_RESULT_DEPTH = 6
 STREAMING_RESULT_DEPTH = 8
 HYDRATE_DEPTH = 12
 HOST_SEARCH_DEPTH = 5
+HIGH_QUALITY_QUERY_DEPTH = 2
+HIGH_QUALITY_TOTAL_ENGINE_QUERY_BUDGET = 8
+PRIMARY_STREAMING_HOST_TIMEOUT_CAP = 18.0
 BILIBILI_BROWSER_SEARCH_BASE_TIMEOUT = 10.0
 BILIBILI_BROWSER_SEARCH_MAX_TIMEOUT = 14.0
 BILIBILI_HOST_STABILITY_MIN_REQUESTS = 6
@@ -127,11 +130,14 @@ class HttpSourceProvider:
         self._orchestra_alias_loader = orchestra_alias_loader or OrchestraAliasLoader(default_orchestra_alias_path())
         self._person_alias_loader = person_alias_loader or PersonAliasLoader(default_person_alias_path())
         self._platform_search_config = platform_search_config or load_platform_search_config()
+        bilibili_storage_state_path = self._platform_search_config.bilibili.storage_state_path
+        if bilibili_storage_state_path and not Path(bilibili_storage_state_path).is_absolute():
+            bilibili_storage_state_path = str((runtime_config_root() / bilibili_storage_state_path).resolve())
         self._browser_fetcher = browser_fetcher or PlaywrightBrowserFetcher(
             bilibili_cookie=self._platform_search_config.bilibili.cookie,
             bilibili_user_agent=self._platform_search_config.bilibili.user_agent,
             bilibili_referer=self._platform_search_config.bilibili.referer,
-            bilibili_storage_state_path=self._platform_search_config.bilibili.storage_state_path,
+            bilibili_storage_state_path=bilibili_storage_state_path,
         )
         self._disabled_platform_apis: set[str] = set()
         self._text_cache: dict[str, str] = {}
@@ -736,7 +742,10 @@ class HttpSourceProvider:
         query_count = len(self._queries_for_host(draft, profile, host))
         query_depth = min(query_count, self._recommended_query_depth(normalized_host, HOST_QUERY_DEPTH))
         timeout_scale = 1.0 + max(0, query_depth - 1) * 0.28
-        return round(min(30.0, max(10.0, base_timeout * timeout_scale)), 1)
+        timeout_seconds = min(30.0, max(10.0, base_timeout * timeout_scale))
+        if any(token in normalized_host for token in ("youtube.com", "youtu.be", "bilibili.com", "b23.tv", "apple.com")):
+            timeout_seconds = min(timeout_seconds, PRIMARY_STREAMING_HOST_TIMEOUT_CAP)
+        return round(timeout_seconds, 1)
 
     async def search_fallback(self, draft: DraftRecordingEntry, profile: RetrievalProfile) -> list[dict[str, Any]]:
         self._reset_warnings()
@@ -765,13 +774,18 @@ class HttpSourceProvider:
         source_kind: str,
     ) -> list[dict[str, Any]]:
         tasks = []
+        total_query_budget = HIGH_QUALITY_TOTAL_ENGINE_QUERY_BUDGET if source_kind == "high-quality" else None
         for host in hosts:
             normalized_host = normalize_host(host.url)
             if self._should_skip_host(normalized_host, min_requests=2):
                 self._warn(f"{normalized_host} 已因连续失败暂时跳过。")
                 continue
             query_depth = self._recommended_query_depth(normalized_host, HOST_QUERY_DEPTH)
+            if source_kind == "high-quality":
+                query_depth = min(query_depth, HIGH_QUALITY_QUERY_DEPTH)
             for query in self._queries_for_host(draft, profile, host)[:query_depth]:
+                if total_query_budget is not None and len(tasks) >= total_query_budget:
+                    break
                 tasks.append(
                     self._search_query_via_engines(
                         query=f"site:{normalized_host} {query}",
@@ -779,6 +793,8 @@ class HttpSourceProvider:
                         source_kind=source_kind,
                     )
                 )
+            if total_query_budget is not None and len(tasks) >= total_query_budget:
+                break
         rows: list[dict[str, str]] = []
         for group in await asyncio.gather(*tasks, return_exceptions=False):
             rows.extend(group)
@@ -1023,13 +1039,37 @@ class HttpSourceProvider:
                 api_search=self._run_bilibili_api_search if self._can_use_bilibili_api() else None,
                 api_source_label="Bilibili API Search",
             )
-        if not rows and not browser_rows:
+        force_chamber_duo_second_pass = should_force_chamber_duo_second_pass_for_bilibili(
+            queries=prioritized_queries,
+            api_rows=rows,
+            browser_rows=browser_rows,
+        )
+        force_chamber_solo_second_pass = should_force_chamber_solo_second_pass_for_bilibili(
+            queries=prioritized_queries,
+            api_rows=rows,
+            browser_rows=browser_rows,
+        )
+        force_chamber_second_pass = force_chamber_duo_second_pass or force_chamber_solo_second_pass
+        if (not rows and not browser_rows) or force_chamber_second_pass:
             remaining_queries = [
                 query
                 for query in prioritized_queries
                 if query not in primary_queries and query not in browser_queries
             ]
-            second_pass_primary_queries = remaining_queries[:BILIBILI_SECOND_PASS_QUERY_DEPTH]
+            chamber_probe_queries: list[str] = []
+            if force_chamber_duo_second_pass:
+                chamber_probe_queries.extend(
+                    build_bilibili_chamber_duo_trailer_probe_queries(prioritized_queries)
+                )
+            if force_chamber_solo_second_pass:
+                chamber_probe_queries.extend(
+                    build_bilibili_chamber_solo_opus_probe_queries(prioritized_queries)
+                )
+            if force_chamber_second_pass:
+                chamber_probe_queries = dedupe_text(chamber_probe_queries)
+            second_pass_primary_queries = dedupe_text(
+                [*chamber_probe_queries, *remaining_queries]
+            )[:BILIBILI_SECOND_PASS_QUERY_DEPTH]
             second_pass_browser_queries = prepare_bilibili_browser_queries(
                 remaining_queries,
                 max_queries=min(BILIBILI_SECOND_PASS_QUERY_DEPTH, BILIBILI_BROWSER_QUERY_DEPTH),
@@ -1049,18 +1089,21 @@ class HttpSourceProvider:
                         "selectedQueries": list(second_pass_primary_queries),
                         "selectedBrowserQueries": list(second_pass_browser_queries),
                         "selectedBrowserQueryCount": len(second_pass_browser_queries),
+                        "forceChamberDuoSecondPass": force_chamber_duo_second_pass,
+                        "forceChamberSoloSecondPass": force_chamber_solo_second_pass,
                     },
                     track_stats=False,
                 )
                 if second_pass_browser_queries:
-                    browser_rows = await self._search_platform_via_browser_pages(
+                    second_pass_browser_rows = await self._search_platform_via_browser_pages(
                         queries=second_pass_browser_queries,
                         url_builders=builders,
                         source_label="Bilibili Search",
                         url_patterns=[r"https://www\.bilibili\.com/video/(?:BV[0-9A-Za-z]+|av\d+)/?"],
                     )
-                if second_pass_primary_queries and not rows:
-                    rows = await self._search_streaming_platform(
+                    browser_rows = dedupe_rows([*browser_rows, *second_pass_browser_rows])
+                if second_pass_primary_queries and (not rows or force_chamber_second_pass):
+                    second_pass_rows = await self._search_streaming_platform(
                         queries=second_pass_primary_queries,
                         url_builders=builders,
                         parser=extract_bilibili_result_links,
@@ -1068,6 +1111,7 @@ class HttpSourceProvider:
                         api_search=self._run_bilibili_api_search if self._can_use_bilibili_api() else None,
                         api_source_label="Bilibili API Search",
                     )
+                    rows = dedupe_rows([*rows, *second_pass_rows])
         engine_rows: list[dict[str, str]] = []
         if not rows and not browser_rows:
             engine_rows = await self._search_platform_via_site_engines(
@@ -1163,6 +1207,14 @@ class HttpSourceProvider:
                 selected_browser_queries=list(browser_queries),
                 rendered_evidence=rendered_evidence,
             )
+        if force_chamber_second_pass and rows:
+            promoted_probe_rows = select_bilibili_chamber_duo_bundle_probe_rows(
+                rows,
+                queries=prioritized_queries,
+                limit=1,
+            )
+            if promoted_probe_rows:
+                browser_rows = dedupe_rows([*promoted_probe_rows, *browser_rows])
         return merge_bilibili_search_rows(
             rows,
             browser_rows,
@@ -1411,9 +1463,20 @@ class HttpSourceProvider:
             query_rows_list: list[list[dict[str, str]]] = []
             query_row_queries: list[str] = []
             browser_url_builders = list(url_builders[:2] or url_builders[:1])
+            skip_all_search_builder = False
             for query in queries[:query_depth]:
                 query_rows: list[dict[str, str]] = []
-                for build_url in browser_url_builders:
+                query_timeout_failures = 0
+                builders_for_query = list(browser_url_builders)
+                if skip_all_search_builder:
+                    filtered_builders = []
+                    for build_url in builders_for_query:
+                        sample_search_url = build_url(query)
+                        if "search.bilibili.com/all?" in sample_search_url:
+                            continue
+                        filtered_builders.append(build_url)
+                    builders_for_query = filtered_builders or builders_for_query[-1:]
+                for build_url in builders_for_query:
                     search_url = build_url(query)
                     started = time.perf_counter()
                     try:
@@ -1434,6 +1497,10 @@ class HttpSourceProvider:
                             query=query,
                             error=str(error),
                         )
+                        if "search.bilibili.com/all?" in search_url:
+                            skip_all_search_builder = True
+                        if isinstance(error, TimeoutError):
+                            query_timeout_failures += 1
                         continue
                     self._record_access_event(
                         url=search_url,
@@ -1459,6 +1526,9 @@ class HttpSourceProvider:
                 if query_rows:
                     query_rows_list.append(query_rows[:result_depth])
                     query_row_queries.append(query)
+                    continue
+                if builders_for_query and query_timeout_failures >= len(builders_for_query):
+                    break
             return merge_bilibili_browser_query_rows(
                 query_rows_list,
                 queries=query_row_queries,
@@ -1583,8 +1653,50 @@ class HttpSourceProvider:
         )
         if not latin_queries:
             latin_queries = profile.latin_queries or profile.queries
+        is_chamber_profile = profile.category in {"chamber_solo", "chamber_duo"}
+        if is_chamber_profile:
+            latin_leads = prioritize_chamber_collaboration_query_terms(draft, latin_leads)
+        chamber_latin_anchor_queries = (
+            build_chamber_work_anchor_queries(
+                draft,
+                prefer_latin=True,
+                composer_query=compact(draft.composer_name_latin or draft.composer_name),
+                lead_terms=dedupe_text([*draft.query_lead_names_latin, *draft.query_lead_names]),
+            )
+            if is_chamber_profile
+            else []
+        )
 
         if host.is_chinese:
+            chamber_cjk_anchor_queries = (
+                build_chamber_work_anchor_queries(
+                    draft,
+                    prefer_latin=False,
+                    composer_query=compact(draft.composer_name or draft.composer_name_latin),
+                    lead_terms=dedupe_text([*draft.query_lead_names, *draft.query_lead_names_latin]),
+                )
+                if is_chamber_profile
+                else []
+            )
+            chamber_named_work_surname_queries = (
+                build_chamber_named_work_surname_rescue_queries(draft)
+                if is_chamber_profile
+                else []
+            )
+            chamber_named_work_full_name_year_queries = (
+                build_chamber_named_work_full_name_year_rescue_queries(draft)
+                if is_chamber_profile
+                else []
+            )
+            chamber_solo_opus_queries = (
+                build_chamber_solo_opus_queries(
+                    draft,
+                    composer_query=compact(draft.composer_name_latin or draft.composer_name),
+                    lead_terms=dedupe_text([*draft.query_lead_names_latin, *draft.query_lead_names]),
+                )
+                if is_chamber_profile
+                else []
+            )
             bilingual_primary_terms = prioritize_person_query_terms(
                 draft.primary_names_latin or [value for value in latin_leads if looks_latin(value)]
             )
@@ -1646,6 +1758,11 @@ class HttpSourceProvider:
             )
             generated_queries = prioritize_platform_queries(
                 [
+                    *chamber_cjk_anchor_queries[:2],
+                    *chamber_named_work_surname_queries[:2],
+                    *chamber_named_work_full_name_year_queries[:2],
+                    *chamber_solo_opus_queries[:2],
+                    *chamber_latin_anchor_queries[:7],
                     *cjk_context_rescue_queries[:1],
                     *bundle_context_queries[:1],
                     *decade_rescue_queries[:2],
@@ -1666,6 +1783,11 @@ class HttpSourceProvider:
             )
             final_queries = ensure_catalogue_hints([
                 *profile.zh_queries[:2],
+                *chamber_cjk_anchor_queries[:2],
+                *chamber_named_work_surname_queries[:2],
+                *chamber_named_work_full_name_year_queries[:2],
+                *chamber_solo_opus_queries[:2],
+                *chamber_latin_anchor_queries[:7],
                 *cjk_context_rescue_queries[:1],
                 *decade_rescue_queries[:2],
                 *generic_bundle_rescue_queries[:1],
@@ -1679,6 +1801,108 @@ class HttpSourceProvider:
                 *profile.latin_queries[:1],
                 *generated_queries,
             ], draft=draft)
+            named_duo_anchor_query = next(
+                (
+                    query
+                    for query in chamber_cjk_anchor_queries
+                    if is_chamber_named_work_duo_anchor_query(query, draft)
+                ),
+                "",
+            )
+            if named_duo_anchor_query and named_duo_anchor_query not in final_queries[:2]:
+                final_queries = [query for query in final_queries if query != named_duo_anchor_query]
+                final_queries = [named_duo_anchor_query, *final_queries]
+            mixed_compact_duo_query = next(
+                (
+                    query
+                    for query in chamber_cjk_anchor_queries
+                    if is_chamber_named_work_compact_duo_query(query, draft)
+                ),
+                "",
+            )
+            if mixed_compact_duo_query and mixed_compact_duo_query not in final_queries[:8]:
+                final_queries = [query for query in final_queries if query != mixed_compact_duo_query]
+                final_queries = [*final_queries[:1], mixed_compact_duo_query, *final_queries[1:]]
+            latin_compact_duo_query = next(
+                (
+                    query
+                    for query in chamber_latin_anchor_queries
+                    if is_chamber_latin_compact_duo_anchor_query(query, draft)
+                ),
+                "",
+            )
+            if latin_compact_duo_query and latin_compact_duo_query not in final_queries[:6]:
+                final_queries = [query for query in final_queries if query != latin_compact_duo_query]
+                insert_index = min(3, len(final_queries))
+                final_queries = [*final_queries[:insert_index], latin_compact_duo_query, *final_queries[insert_index:]]
+            solo_opus_anchor_query = next(
+                (
+                    query
+                    for query in chamber_solo_opus_queries
+                    if is_chamber_latin_solo_opus_anchor_query(query, draft)
+                ),
+                "",
+            )
+            if solo_opus_anchor_query and solo_opus_anchor_query not in final_queries[:6]:
+                final_queries = [query for query in final_queries if query != solo_opus_anchor_query]
+                insert_index = min(1, len(final_queries))
+                final_queries = [*final_queries[:insert_index], solo_opus_anchor_query, *final_queries[insert_index:]]
+            chamber_bundle_trailer_query = next(
+                (
+                    query
+                    for query in chamber_latin_anchor_queries
+                    if "trailer" in query.lower() and bilibili_query_is_chamber_duo_bundle_anchor(query)
+                ),
+                "",
+            )
+            trailer_is_schneiderhan_probe = (
+                "schneiderhan" in chamber_bundle_trailer_query.lower()
+                and "seemann" in chamber_bundle_trailer_query.lower()
+            )
+            if (
+                chamber_bundle_trailer_query
+                and trailer_is_schneiderhan_probe
+                and chamber_bundle_trailer_query not in final_queries[:10]
+            ):
+                final_queries = [query for query in final_queries if query != chamber_bundle_trailer_query]
+                insert_index = min(5, len(final_queries))
+                final_queries = [*final_queries[:insert_index], chamber_bundle_trailer_query, *final_queries[insert_index:]]
+            chamber_bundle_year_query = next(
+                (
+                    query
+                    for query in chamber_latin_anchor_queries
+                    if bilibili_query_is_chamber_duo_bundle_anchor(query)
+                    and re.search(r"\b(?:18|19|20)\d{2}\b", query.lower())
+                ),
+                "",
+            )
+            year_is_schneiderhan_probe = (
+                "schneiderhan" in chamber_bundle_year_query.lower()
+                and "seemann" in chamber_bundle_year_query.lower()
+            )
+            if (
+                chamber_bundle_year_query
+                and year_is_schneiderhan_probe
+                and chamber_bundle_year_query not in final_queries[:10]
+            ):
+                final_queries = [query for query in final_queries if query != chamber_bundle_year_query]
+                insert_index = min(6, len(final_queries))
+                final_queries = [*final_queries[:insert_index], chamber_bundle_year_query, *final_queries[insert_index:]]
+            solo_named_work_cjk_query = next(
+                (
+                    query
+                    for query in sorted(
+                        chamber_cjk_anchor_queries,
+                        key=chamber_named_work_solo_cjk_rescue_rank,
+                    )
+                    if is_chamber_named_work_solo_cjk_rescue_query(query, draft)
+                ),
+                "",
+            )
+            if solo_named_work_cjk_query and solo_named_work_cjk_query not in final_queries[:6]:
+                final_queries = [query for query in final_queries if query != solo_named_work_cjk_query]
+                insert_index = min(2, len(final_queries))
+                final_queries = [*final_queries[:insert_index], solo_named_work_cjk_query, *final_queries[insert_index:]]
             anchor_pool = dedupe_text([
                 *profile.zh_queries[:2],
                 *profile.queries[:3],
@@ -1692,6 +1916,7 @@ class HttpSourceProvider:
                 *alias_queries[:2],
                 *decade_rescue_queries[:2],
                 *primary_work_rescue_queries[:2],
+                *chamber_solo_opus_queries[:2],
                 *generated_queries,
             ])
             anchor_candidates = [
@@ -1713,6 +1938,7 @@ class HttpSourceProvider:
                                 for index in range(replace_window - 1, -1, -1)
                                 if not bilibili_query_is_primary_work_rescue(final_queries[index])
                                 and not bilibili_query_has_collaboration_signal(final_queries[index])
+                                and not is_chamber_named_work_duo_anchor_query(final_queries[index], draft)
                             ),
                             replace_window - 1,
                         )
@@ -1746,6 +1972,7 @@ class HttpSourceProvider:
                                 and not bilibili_query_is_primary_year_anchor(final_queries[index])
                                 and not bilibili_query_is_exact_collaboration_anchor(final_queries[index])
                                 and not bilibili_query_has_collaboration_signal(final_queries[index])
+                                and not is_chamber_named_work_duo_anchor_query(final_queries[index], draft)
                             ),
                             replace_window - 1,
                         )
@@ -1760,6 +1987,7 @@ class HttpSourceProvider:
             host,
             composer_query=compact(draft.composer_name_latin),
         )
+        chamber_named_work_surname_queries = build_chamber_named_work_surname_rescue_queries(draft)
         collaboration_rescue_queries = build_collaboration_surname_rescue_queries(draft)
         alias_queries = self._alias_queries_for_host(
             draft,
@@ -1769,6 +1997,9 @@ class HttpSourceProvider:
         )
         generated_queries = prioritize_platform_queries(
             [
+                *chamber_latin_anchor_queries[:7],
+                *chamber_named_work_surname_queries[:3],
+                *chamber_latin_anchor_queries[6:8],
                 *collaboration_rescue_queries[:3],
                 *primary_only_queries[:4],
                 *alias_queries[:4],
@@ -1778,6 +2009,9 @@ class HttpSourceProvider:
             prefer_cjk=False,
         )
         return ensure_catalogue_hints([
+            *chamber_latin_anchor_queries[:7],
+            *chamber_named_work_surname_queries[:3],
+            *chamber_latin_anchor_queries[6:8],
             *collaboration_rescue_queries[:3],
             *primary_only_queries[:4],
             *alias_queries[:1],
@@ -1961,6 +2195,7 @@ class HttpSourceProvider:
             platform = detect_platform(url)
             html_text = ""
             bilibili_metadata: dict[str, Any] = {}
+            youtube_metadata: dict[str, Any] = {}
             seed = seed_data or {}
             seed_title = strip_html(compact(seed.get("title")))
             seed_description = strip_html(compact(seed.get("description")))
@@ -2044,15 +2279,21 @@ class HttpSourceProvider:
                     for key, value in html_bilibili_metadata.items():
                         if not compact(bilibili_metadata.get(key)):
                             bilibili_metadata[key] = value
+                if platform == "youtube" and html_text:
+                    youtube_metadata = extract_youtube_structured_metadata(html_text)
             title = strip_html(
                 extract_meta_content(html_text, "og:title")
+                or compact(youtube_metadata.get("title"))
                 or compact(bilibili_metadata.get("title"))
                 or title
                 or extract_title(html_text)
             )
+            if platform == "youtube":
+                title = strip_generic_youtube_watch_suffix(title)
             description = strip_html(
                 extract_meta_content(html_text, "og:description")
                 or extract_meta_content(html_text, "description", attr="name")
+                or compact(youtube_metadata.get("description"))
                 or compact(bilibili_metadata.get("description"))
                 or description
             )
@@ -2060,7 +2301,21 @@ class HttpSourceProvider:
                 title = seed_title or title
             if platform == "apple_music" and is_generic_apple_player_text(description):
                 description = seed_description or description
-            body_text = compact(bilibili_metadata.get("body_text")) or body_text or (strip_html(html_text)[:4000] if html_text else "")
+            body_text = (
+                compact(youtube_metadata.get("body_text"))
+                or compact(bilibili_metadata.get("body_text"))
+                or body_text
+                or (strip_html(html_text)[:4000] if html_text else "")
+            )
+            youtube_generic_shell = False
+            if platform == "youtube":
+                youtube_generic_shell = is_generic_youtube_watch_text(title) or (
+                    is_generic_youtube_watch_text(description) and is_generic_youtube_watch_text(body_text)
+                )
+                if is_generic_youtube_watch_text(title):
+                    title = seed_title or ""
+                if is_generic_youtube_watch_text(description):
+                    description = seed_description or ""
             if platform == "bilibili":
                 description = sanitize_bilibili_metadata_text(description)
                 body_text = sanitize_bilibili_metadata_text(body_text)
@@ -2073,18 +2328,37 @@ class HttpSourceProvider:
                 or extract_first_image_src(html_text, url),
             )
             canonical_url = canonicalize_bilibili_video_url(canonical_url, compact(bilibili_metadata.get("bvid")) or seed_bvid)
-            duration_seconds = extract_duration_seconds(html_text) or int(bilibili_metadata.get("duration_seconds", 0) or 0)
+            duration_seconds = (
+                extract_duration_seconds(html_text)
+                or int(youtube_metadata.get("duration_seconds", 0) or 0)
+                or int(bilibili_metadata.get("duration_seconds", 0) or 0)
+            )
             if duration_seconds <= 0:
                 duration_seconds = int(seed.get("duration_seconds") or 0)
-            uploader = extract_uploader_name(html_text) or compact(bilibili_metadata.get("uploader"))
+            uploader = (
+                extract_uploader_name(html_text)
+                or compact(youtube_metadata.get("uploader"))
+                or compact(bilibili_metadata.get("uploader"))
+            )
             if not compact(uploader):
                 uploader = seed_uploader
-            view_count = extract_view_count(html_text) or int(bilibili_metadata.get("view_count", 0) or 0)
+            view_count = (
+                extract_view_count(html_text)
+                or int(youtube_metadata.get("view_count", 0) or 0)
+                or int(bilibili_metadata.get("view_count", 0) or 0)
+            )
             if view_count <= 0:
                 view_count = int(seed.get("view_count") or 0)
 
-            browser_metadata_needed = metadata_is_insufficient(title, description, body_text) or (
-                platform == "bilibili" and (duration_seconds <= 0 or view_count <= 0 or not compact(uploader))
+            bilibili_suspicious_metadata = platform == "bilibili" and bilibili_metadata_needs_browser_fallback(
+                title=title,
+                description=description,
+                body_text=body_text,
+                duration_seconds=duration_seconds,
+                draft=draft,
+            )
+            browser_metadata_needed = metadata_is_insufficient(title, description, body_text) or youtube_generic_shell or (
+                platform == "bilibili" and (duration_seconds <= 0 or view_count <= 0 or not compact(uploader) or bilibili_suspicious_metadata)
             )
             if browser_metadata_needed:
                 browser_started = time.perf_counter()
@@ -2106,6 +2380,12 @@ class HttpSourceProvider:
                         browser_title = ""
                     if platform == "apple_music" and is_generic_apple_player_text(browser_description):
                         browser_description = ""
+                    if platform == "youtube" and is_generic_youtube_watch_text(browser_title):
+                        browser_title = ""
+                    if platform == "youtube" and is_generic_youtube_watch_text(browser_description):
+                        browser_description = ""
+                    if platform == "youtube":
+                        browser_title = strip_generic_youtube_watch_suffix(browser_title)
                     title = browser_title or title
                     description = browser_description or description
                     body_text = compact(browser_payload.get("bodyText")) or body_text
@@ -2118,14 +2398,18 @@ class HttpSourceProvider:
                         canonical_url,
                         compact(browser_payload.get("bvid")),
                     )
-                    duration_seconds = max(
-                        duration_seconds,
-                        int(browser_payload.get("durationSeconds", browser_payload.get("duration_seconds", 0)) or 0),
+                    browser_duration_seconds = int(
+                        browser_payload.get("durationSeconds", browser_payload.get("duration_seconds", 0)) or 0
                     )
-                    view_count = max(
-                        view_count,
-                        int(browser_payload.get("viewCount", browser_payload.get("view_count", 0)) or 0),
+                    browser_view_count = int(
+                        browser_payload.get("viewCount", browser_payload.get("view_count", 0)) or 0
                     )
+                    if platform == "bilibili" and bilibili_suspicious_metadata:
+                        duration_seconds = browser_duration_seconds or duration_seconds
+                        view_count = browser_view_count or view_count
+                    else:
+                        duration_seconds = max(duration_seconds, browser_duration_seconds)
+                        view_count = max(view_count, browser_view_count)
                 except (BrowserFetchUnavailable, RuntimeError, TimeoutError) as error:
                     self._warn(f"{normalize_host(url)} 浏览器回退失败：{error}")
                     self._record_access_event(
@@ -2140,6 +2424,13 @@ class HttpSourceProvider:
 
         summary_text = " ".join(part for part in [title, description] if part)
         combined = " ".join(part for part in [summary_text, body_text] if part)
+        bilibili_field_year_guard = platform == "bilibili" and bilibili_metadata_needs_browser_fallback(
+            title=title,
+            description=description,
+            body_text=body_text,
+            duration_seconds=duration_seconds,
+            draft=draft,
+        )
         score_inputs = dedupe_text([summary_text, combined])
         match_score = max(
             (
@@ -2179,7 +2470,15 @@ class HttpSourceProvider:
             "uploader": uploader,
             "view_count": view_count,
             "fields": {
-                "performanceDateText": extract_year(summary_text) or extract_year(combined) or draft.performance_date_text,
+                "performanceDateText": (
+                    compact(draft.performance_date_text)
+                    if bilibili_field_year_guard
+                    else (
+                        extract_performance_date_text(summary_text)
+                        or extract_performance_date_text(combined)
+                        or draft.performance_date_text
+                    )
+                ),
                 "venueText": extract_venue(combined),
                 "albumTitle": title if title and not title.startswith("http") else "",
                 "label": extract_label(summary_text or combined),
@@ -2239,6 +2538,32 @@ class HttpSourceProvider:
 
 def metadata_is_insufficient(title: str, description: str, body_text: str) -> bool:
     return not compact(title) and not compact(description) and len(compact(body_text)) < 80
+
+
+def bilibili_metadata_needs_browser_fallback(
+    *,
+    title: str,
+    description: str,
+    body_text: str,
+    duration_seconds: int,
+    draft: DraftRecordingEntry,
+) -> bool:
+    if duration_seconds < 21600:
+        return False
+    normalized_context = normalize_text(" ".join(part for part in [title, description, body_text] if compact(part)))
+    work_aliases = {
+        normalize_text(value)
+        for value in [
+            draft.work_title,
+            draft.work_title_latin,
+            draft.catalogue,
+            *build_work_aliases(draft),
+        ]
+        if compact(value)
+    }
+    if any(alias and alias in normalized_context for alias in work_aliases):
+        return False
+    return len(normalize_text(description)) <= 20
 
 
 def should_disable_platform_api(error: Exception) -> bool:
@@ -2400,6 +2725,7 @@ def merge_bilibili_browser_query_rows(
     result_depth: int,
 ) -> list[dict[str, str]]:
     if queries and len(queries) == len(query_rows_list):
+        bundle_priority_rows: list[dict[str, str]] = []
         prioritized_rows: list[dict[str, str]] = []
         rescue_rows: list[dict[str, str]] = []
         coverage_rows: list[dict[str, str]] = []
@@ -2441,6 +2767,11 @@ def merge_bilibili_browser_query_rows(
                     seen_urls.add(url)
                 break
         prioritized_groups: list[list[dict[str, str]]] = []
+        bundle_indices = [
+            index for index, query in enumerate(queries) if bilibili_query_is_chamber_duo_bundle_anchor(query)
+        ]
+        for index in bundle_indices[:1]:
+            bundle_priority_rows.extend(query_rows_list[index][:5])
         for rank, index in enumerate(deep_indices):
             prioritized_groups.append(query_rows_list[index][1 : max(2, result_depth - (3 * (rank + 1)) + 1)])
         for index in medium_indices:
@@ -2453,7 +2784,7 @@ def merge_bilibili_browser_query_rows(
                         prioritized_rows.append(group[offset])
         for index, rows in enumerate(query_rows_list):
             all_rows.extend(rows)
-        return dedupe_rows([*consensus_rows, *coverage_rows, *rescue_rows, *prioritized_rows, *all_rows])[:result_depth]
+        return dedupe_rows([*consensus_rows, *bundle_priority_rows, *coverage_rows, *rescue_rows, *prioritized_rows, *all_rows])[:result_depth]
 
     prioritized_rows: list[dict[str, str]] = []
     coverage_rows: list[dict[str, str]] = []
@@ -2495,6 +2826,368 @@ def bilibili_query_specificity(query: str) -> tuple[int, int, int]:
         len(normalized.split()),
         len(normalized),
     )
+
+
+def bilibili_queries_have_chamber_duo_signal(queries: list[str]) -> bool:
+    chamber_markers = (
+        "spring",
+        "appassionata",
+        "sonata",
+        "violin sonata",
+        "piano sonata",
+        "sonatas",
+        "\u6625\u5929",
+        "\u70ed\u60c5",
+        "\u594f\u9e23\u66f2",
+        "\u5c0f\u63d0\u7434\u594f\u9e23\u66f2",
+        "\u94a2\u7434\u594f\u9e23\u66f2",
+    )
+    normalized_queries = [compact(query) for query in queries if compact(query)]
+    if not normalized_queries:
+        return False
+    has_chamber_marker = any(
+        any(marker in query.lower() or marker in query for marker in chamber_markers)
+        for query in normalized_queries
+    )
+    if not has_chamber_marker:
+        return False
+    return any(bilibili_query_has_collaboration_signal(query) for query in normalized_queries)
+
+
+def build_bilibili_chamber_duo_trailer_probe_queries(queries: list[str]) -> list[str]:
+    probe_queries: list[str] = []
+    bundle_markers = (
+        "sonatas",
+        "quartets",
+        "trios",
+        "sonata collection",
+        "quartet collection",
+        "trio collection",
+    )
+    for query in dedupe_text(queries):
+        normalized = compact(query)
+        if not normalized or contains_cjk(normalized) or "/" in normalized:
+            continue
+        lowered = normalized.lower()
+        if "trailer" in lowered:
+            continue
+        if "complete" not in lowered or not any(marker in lowered for marker in bundle_markers):
+            continue
+        if not bilibili_query_has_collaboration_signal(normalized):
+            continue
+        year_stripped = compact(re.sub(r"\b(?:18|19|20)\d{2}\b", "", normalized))
+        complete_offset = year_stripped.lower().find("complete ")
+        focused_query = year_stripped[complete_offset:] if complete_offset >= 0 else year_stripped
+        focused_query = compact(re.sub(r"\s+", " ", focused_query))
+        if not focused_query:
+            continue
+        probe_queries.append(f"{focused_query} trailer")
+    return dedupe_text(probe_queries)
+
+
+def bilibili_query_is_chamber_solo_opus_probe(query: str) -> bool:
+    normalized = compact(query)
+    if not normalized or "/" in normalized:
+        return False
+    lowered = normalized.lower()
+    has_named_marker = any(marker in lowered or marker in normalized for marker in ("appassionata", "spring", "热情", "春天"))
+    has_opus_marker = bool(re.search(r"\bop\.?\s*(?:24|57)\b", lowered, re.I)) or "op24" in lowered or "op57" in lowered
+    return has_named_marker or has_opus_marker
+
+
+def build_bilibili_chamber_solo_opus_probe_queries(queries: list[str]) -> list[str]:
+    probe_queries = [
+        query
+        for query in dedupe_text(queries)
+        if bilibili_query_is_chamber_solo_opus_probe(query)
+    ]
+    ordered = sorted(
+        probe_queries,
+        key=lambda query: (
+            0 if not re.search(r"[\u4e00-\u9fff]", query) else 1,
+            0 if re.search(r"\bop\.?\s*(?:24|57)\b", compact(query), re.I) else 1,
+            bilibili_query_focus_rank(query),
+            len(compact(query)),
+        ),
+    )
+    return dedupe_text(ordered)[:2]
+
+
+def bilibili_chamber_duo_person_tokens(queries: list[str]) -> list[str]:
+    normalized_queries = [compact(query) for query in queries if compact(query)]
+    if not normalized_queries:
+        return []
+    stop_tokens = {
+        "beethoven",
+        "spring",
+        "appassionata",
+        "sonata",
+        "sonatas",
+        "violin",
+        "piano",
+        "ludwig",
+        "van",
+        "no",
+        "op",
+        "major",
+        "minor",
+        "complete",
+        "collection",
+    }
+    counts: dict[str, int] = {}
+    for query in normalized_queries:
+        for token in re.findall(r"[A-Za-z]{3,}", query.lower()):
+            if token in stop_tokens:
+                continue
+            counts[token] = counts.get(token, 0) + 1
+    ranked_tokens = sorted(counts.items(), key=lambda item: (-item[1], -len(item[0]), item[0]))
+    selected = [token for token, count in ranked_tokens if count >= 2][:4]
+    return selected
+
+
+def bilibili_rows_have_chamber_duo_person_match(
+    rows: list[dict[str, Any]],
+    *,
+    person_tokens: list[str],
+) -> bool:
+    if len(person_tokens) < 2:
+        return False
+    for row in rows:
+        fields = row.get("fields") or {}
+        haystack = normalize_text(
+            " ".join(
+                [
+                    compact(row.get("title")),
+                    compact(row.get("description")),
+                    compact(fields.get("albumTitle")),
+                    compact(fields.get("notes")),
+                ]
+            )
+        )
+        if not haystack:
+            continue
+        if sum(1 for token in person_tokens if token in haystack) >= 2:
+            return True
+    return False
+
+
+def should_force_chamber_duo_second_pass_for_bilibili(
+    *,
+    queries: list[str],
+    api_rows: list[dict[str, Any]],
+    browser_rows: list[dict[str, Any]],
+) -> bool:
+    if not bilibili_queries_have_chamber_duo_signal(queries):
+        return False
+    person_tokens = bilibili_chamber_duo_person_tokens(queries)
+    if len(person_tokens) < 2:
+        return False
+    return not bilibili_rows_have_chamber_duo_person_match(
+        [*api_rows, *browser_rows],
+        person_tokens=person_tokens,
+    )
+
+
+def bilibili_chamber_solo_person_tokens(queries: list[str]) -> list[str]:
+    normalized_queries = [compact(query) for query in queries if compact(query)]
+    if not normalized_queries:
+        return []
+    stop_tokens = {
+        "beethoven",
+        "spring",
+        "appassionata",
+        "sonata",
+        "sonatas",
+        "violin",
+        "piano",
+        "ludwig",
+        "van",
+        "no",
+        "op",
+        "major",
+        "minor",
+        "complete",
+        "collection",
+    }
+    counts: dict[str, int] = {}
+    cjk_stop_markers = (
+        "热情",
+        "春天",
+        "奏鸣曲",
+        "钢琴",
+        "小提琴",
+        "贝多芬",
+        "路德维希",
+        "第二十三",
+        "第五",
+        "op",
+    )
+    cjk_stop_full_tokens = {
+        "贝多芬",
+        "路德维希",
+        "凡贝多芬",
+    }
+    for query in normalized_queries:
+        for token in re.findall(r"[A-Za-z]{3,}", query.lower()):
+            if token in stop_tokens:
+                continue
+            counts[token] = counts.get(token, 0) + 1
+        for chunk in re.findall(r"[\u4e00-\u9fff·]{2,}", query):
+            normalized_chunk = compact(chunk.replace("·", ""))
+            if (
+                not normalized_chunk
+                or len(normalized_chunk) < 3
+                or normalized_chunk in cjk_stop_full_tokens
+                or any(marker in normalized_chunk for marker in cjk_stop_markers)
+            ):
+                continue
+            counts[normalized_chunk] = counts.get(normalized_chunk, 0) + 1
+        cjk_keyword = compact(extract_cjk_person_query_keyword(query))
+        if (
+            cjk_keyword
+            and len(cjk_keyword) >= 3
+            and cjk_keyword not in cjk_stop_full_tokens
+            and not any(marker in cjk_keyword for marker in cjk_stop_markers)
+        ):
+            counts[cjk_keyword] = counts.get(cjk_keyword, 0) + 1
+    ranked_tokens = sorted(counts.items(), key=lambda item: (-item[1], -len(item[0]), item[0]))
+    selected = [
+        token
+        for token, count in ranked_tokens
+        if count >= 2 or (contains_cjk(token) and count >= 1)
+    ][:3]
+    return selected
+
+
+def bilibili_rows_have_chamber_solo_named_work_match(
+    rows: list[dict[str, Any]],
+    *,
+    person_tokens: list[str],
+) -> bool:
+    if not person_tokens:
+        return False
+    work_markers = (
+        "appassionata",
+        "spring",
+        "op57",
+        "op.57",
+        "op 57",
+        "op24",
+        "op.24",
+        "op 24",
+        "热情",
+        "春天",
+    )
+    for row in rows:
+        fields = row.get("fields") or {}
+        haystack = normalize_text(
+            " ".join(
+                [
+                    compact(row.get("title")),
+                    compact(row.get("description")),
+                    compact(fields.get("albumTitle")),
+                    compact(fields.get("notes")),
+                ]
+            )
+        )
+        if not haystack:
+            continue
+        has_person = any(token in haystack for token in person_tokens)
+        has_work = any(marker in haystack for marker in work_markers)
+        if has_person and has_work:
+            return True
+    return False
+
+
+def should_force_chamber_solo_second_pass_for_bilibili(
+    *,
+    queries: list[str],
+    api_rows: list[dict[str, Any]],
+    browser_rows: list[dict[str, Any]],
+) -> bool:
+    if not any(bilibili_query_is_chamber_solo_opus_probe(query) for query in queries):
+        return False
+    person_tokens = bilibili_chamber_solo_person_tokens(queries)
+    if not person_tokens:
+        return False
+    return not bilibili_rows_have_chamber_solo_named_work_match(
+        [*api_rows, *browser_rows],
+        person_tokens=person_tokens,
+    )
+
+
+def bilibili_row_has_chamber_duo_bundle_signal(
+    row: dict[str, Any],
+    *,
+    person_tokens: list[str],
+) -> bool:
+    if len(person_tokens) < 2:
+        return False
+    fields = row.get("fields") or {}
+    haystack = normalize_text(
+        " ".join(
+            [
+                compact(row.get("title")),
+                compact(row.get("description")),
+                compact(fields.get("albumTitle")),
+                compact(fields.get("notes")),
+            ]
+        )
+    )
+    if not haystack:
+        return False
+    has_complete_marker = "complete" in haystack or "全集" in haystack
+    has_bundle_marker = any(
+        marker in haystack
+        for marker in (
+            "sonata",
+            "sonatas",
+            "奏鸣曲",
+            "quartet",
+            "quartets",
+            "四重奏",
+            "trio",
+            "trios",
+            "三重奏",
+        )
+    )
+    if not has_complete_marker or not has_bundle_marker:
+        return False
+    return sum(1 for token in person_tokens if token in haystack) >= 2
+
+
+def select_bilibili_chamber_duo_bundle_probe_rows(
+    rows: list[dict[str, Any]],
+    *,
+    queries: list[str],
+    limit: int = 1,
+) -> list[dict[str, Any]]:
+    if limit <= 0 or not rows:
+        return []
+    if not bilibili_queries_have_chamber_duo_signal(queries):
+        return []
+    person_tokens = bilibili_chamber_duo_person_tokens(queries)
+    if len(person_tokens) < 2:
+        return []
+    matches = [
+        row
+        for row in rows
+        if bilibili_row_has_chamber_duo_bundle_signal(
+            row,
+            person_tokens=person_tokens,
+        )
+    ]
+    if not matches:
+        return []
+    ordered = sorted(
+        matches,
+        key=lambda row: (
+            0 if "bilibili.com/video/BV" in compact(row.get("url")) else 1,
+            0 if "complete" in normalize_text(compact(row.get("title"))) else 1,
+            len(compact(row.get("title"))),
+        ),
+    )
+    return dedupe_rows(ordered)[:limit]
 
 
 def select_bilibili_browser_queries(queries: list[str], *, max_queries: int = 6) -> list[str]:
@@ -2583,6 +3276,36 @@ def prepare_bilibili_browser_queries(queries: list[str], *, max_queries: int = 3
                         selected.append(query)
                         if len(selected) >= max_queries:
                             break
+    primary_year_anchor_pool = [query for query in pool if bilibili_query_is_primary_year_anchor(query)]
+    if primary_year_anchor_pool:
+        best_primary_year_anchor = min(
+            dedupe_text(primary_year_anchor_pool),
+            key=lambda query: (0 if contains_cjk(query) else 1, len(compact(query).split()), len(compact(query)), query),
+        )
+        if best_primary_year_anchor not in selected:
+            protected_collaboration_query = ""
+            collaboration_selected = [query for query in selected if bilibili_query_has_collaboration_signal(query)]
+            if collaboration_selected:
+                protected_collaboration_query = min(collaboration_selected, key=bilibili_query_collaboration_rank)
+            replace_index = next(
+                (
+                    index
+                    for index in range(len(selected) - 1, -1, -1)
+                    if not bilibili_query_is_primary_work_rescue(selected[index])
+                    and not bilibili_query_is_generic_plural_bundle_rescue(selected[index])
+                    and selected[index] != protected_collaboration_query
+                ),
+                len(selected) - 1,
+            )
+            selected[replace_index] = best_primary_year_anchor
+            selected = dedupe_text(selected)
+            if len(selected) < max_queries:
+                for query in ranked:
+                    if query in selected:
+                        continue
+                    selected.append(query)
+                    if len(selected) >= max_queries:
+                        break
     if max_queries >= 4 and not any(bilibili_query_is_generic_plural_bundle_rescue(query) for query in selected):
         bundle_pool = [query for query in pool if bilibili_query_is_generic_plural_bundle_rescue(query)]
         if bundle_pool:
@@ -2631,6 +3354,33 @@ def prepare_bilibili_browser_queries(queries: list[str], *, max_queries: int = 3
                         selected.append(query)
                         if len(selected) >= max_queries:
                             break
+    if max_queries >= 4:
+        year_collaboration_pool = [query for query in pool if bilibili_query_is_year_collaboration_rescue(query)]
+        if year_collaboration_pool:
+            year_collaboration_query = min(
+                dedupe_text(year_collaboration_pool),
+                key=bilibili_year_collaboration_rescue_rank,
+            )
+            if year_collaboration_query not in selected:
+                replace_index = next(
+                    (
+                        index
+                        for index in range(len(selected) - 1, -1, -1)
+                        if not bilibili_query_is_primary_work_rescue(selected[index])
+                        and not bilibili_query_is_primary_year_anchor(selected[index])
+                        and not bilibili_query_is_generic_plural_bundle_rescue(selected[index])
+                    ),
+                    len(selected) - 1,
+                )
+                selected[replace_index] = year_collaboration_query
+                selected = dedupe_text(selected)
+                if len(selected) < max_queries:
+                    for query in ranked:
+                        if query in selected:
+                            continue
+                        selected.append(query)
+                        if len(selected) >= max_queries:
+                            break
     if max_queries >= 4 and not any(bilibili_query_is_exact_collaboration_anchor(query) for query in selected):
         collaboration_pool = [query for query in pool if bilibili_query_is_exact_collaboration_anchor(query)]
         if collaboration_pool:
@@ -2660,6 +3410,189 @@ def prepare_bilibili_browser_queries(queries: list[str], *, max_queries: int = 3
                     ),
                 )
                 selected[replace_index] = collaboration_query
+                selected = dedupe_text(selected)
+                if len(selected) < max_queries:
+                    for query in ranked:
+                        if query in selected:
+                            continue
+                        selected.append(query)
+                        if len(selected) >= max_queries:
+                            break
+    if max_queries >= 4 and not any(bilibili_query_is_mixed_compact_duo_anchor(query) for query in selected):
+        mixed_compact_pool = [query for query in pool if bilibili_query_is_mixed_compact_duo_anchor(query)]
+        if mixed_compact_pool:
+            mixed_compact_query = min(
+                dedupe_text(mixed_compact_pool),
+                key=lambda query: (bilibili_query_focus_rank(query), len(compact(query)), query),
+            )
+            if mixed_compact_query not in selected:
+                replace_index = next(
+                    (
+                        index
+                        for index in range(len(selected) - 1, -1, -1)
+                        if not bilibili_query_is_primary_work_rescue(selected[index])
+                        and not bilibili_query_is_generic_plural_bundle_rescue(selected[index])
+                        and not bilibili_query_is_exact_collaboration_anchor(selected[index])
+                    ),
+                    len(selected) - 1,
+                )
+                selected[replace_index] = mixed_compact_query
+                selected = dedupe_text(selected)
+                if len(selected) < max_queries:
+                    for query in ranked:
+                        if query in selected:
+                            continue
+                        selected.append(query)
+                        if len(selected) >= max_queries:
+                            break
+    if max_queries >= 4 and not any(bilibili_query_is_chamber_duo_bundle_anchor(query) for query in selected):
+        chamber_bundle_pool = [query for query in pool if bilibili_query_is_chamber_duo_bundle_anchor(query)]
+        if chamber_bundle_pool:
+            chamber_bundle_query = min(
+                dedupe_text(chamber_bundle_pool),
+                key=lambda query: (
+                    chamber_duo_bundle_query_rank(query),
+                    bilibili_query_focus_rank(query),
+                    len(compact(query)),
+                    query,
+                ),
+            )
+            if chamber_bundle_query not in selected:
+                replace_index = next(
+                    (
+                        index
+                        for index in range(len(selected) - 1, -1, -1)
+                        if not bilibili_query_is_primary_work_rescue(selected[index])
+                        and not bilibili_query_is_generic_plural_bundle_rescue(selected[index])
+                        and not bilibili_query_is_exact_collaboration_anchor(selected[index])
+                        and not bilibili_query_is_mixed_compact_duo_anchor(selected[index])
+                    ),
+                    len(selected) - 1,
+                )
+                selected[replace_index] = chamber_bundle_query
+                selected = dedupe_text(selected)
+                if len(selected) < max_queries:
+                    for query in ranked:
+                        if query in selected:
+                            continue
+                        selected.append(query)
+                        if len(selected) >= max_queries:
+                            break
+    if max_queries >= 4 and not any(bilibili_query_is_chamber_named_work_surname_rescue(query) for query in selected):
+        chamber_named_work_pool = [query for query in pool if bilibili_query_is_chamber_named_work_surname_rescue(query)]
+        if chamber_named_work_pool:
+            chamber_named_work_query = min(
+                dedupe_text(chamber_named_work_pool),
+                key=lambda query: (bilibili_query_focus_rank(query), len(compact(query)), query),
+            )
+            if chamber_named_work_query not in selected:
+                replace_index = next(
+                    (
+                        index
+                        for index in range(len(selected) - 1, -1, -1)
+                        if not bilibili_query_is_primary_work_rescue(selected[index])
+                        and not bilibili_query_is_primary_year_anchor(selected[index])
+                        and not bilibili_query_is_generic_plural_bundle_rescue(selected[index])
+                        and not bilibili_query_is_exact_collaboration_anchor(selected[index])
+                        and not bilibili_query_is_mixed_compact_duo_anchor(selected[index])
+                        and not bilibili_query_is_chamber_duo_bundle_anchor(selected[index])
+                    ),
+                    len(selected) - 1,
+                )
+                selected[replace_index] = chamber_named_work_query
+                selected = dedupe_text(selected)
+                if len(selected) < max_queries:
+                    for query in ranked:
+                        if query in selected:
+                            continue
+                        selected.append(query)
+                        if len(selected) >= max_queries:
+                            break
+    if max_queries >= 4 and not any(bilibili_query_is_chamber_named_work_full_name_year_rescue(query) for query in selected):
+        chamber_full_name_year_pool = [
+            query for query in pool if bilibili_query_is_chamber_named_work_full_name_year_rescue(query)
+        ]
+        if chamber_full_name_year_pool:
+            chamber_full_name_year_query = min(
+                dedupe_text(chamber_full_name_year_pool),
+                key=lambda query: (bilibili_query_focus_rank(query), len(compact(query)), query),
+            )
+            if chamber_full_name_year_query not in selected:
+                replace_index = next(
+                    (
+                        index
+                        for index in range(len(selected) - 1, -1, -1)
+                        if not bilibili_query_is_primary_work_rescue(selected[index])
+                        and not bilibili_query_is_primary_year_anchor(selected[index])
+                        and not bilibili_query_is_generic_plural_bundle_rescue(selected[index])
+                        and not bilibili_query_is_exact_collaboration_anchor(selected[index])
+                        and not bilibili_query_is_mixed_compact_duo_anchor(selected[index])
+                        and not bilibili_query_is_chamber_duo_bundle_anchor(selected[index])
+                    ),
+                    len(selected) - 1,
+                )
+                selected[replace_index] = chamber_full_name_year_query
+                selected = dedupe_text(selected)
+                if len(selected) < max_queries:
+                    for query in ranked:
+                        if query in selected:
+                            continue
+                        selected.append(query)
+                        if len(selected) >= max_queries:
+                            break
+    if max_queries >= 4 and not any(bilibili_query_is_chamber_named_work_solo_cjk_rescue(query) for query in selected):
+        chamber_solo_cjk_pool = [query for query in pool if bilibili_query_is_chamber_named_work_solo_cjk_rescue(query)]
+        if chamber_solo_cjk_pool:
+            chamber_solo_cjk_query = min(
+                dedupe_text(chamber_solo_cjk_pool),
+                key=chamber_named_work_solo_cjk_rescue_rank,
+            )
+            if chamber_solo_cjk_query not in selected:
+                replace_index = next(
+                    (
+                        index
+                        for index in range(len(selected) - 1, -1, -1)
+                        if not bilibili_query_is_primary_work_rescue(selected[index])
+                        and not bilibili_query_is_primary_year_anchor(selected[index])
+                        and not bilibili_query_is_generic_plural_bundle_rescue(selected[index])
+                        and not bilibili_query_is_exact_collaboration_anchor(selected[index])
+                        and not bilibili_query_is_mixed_compact_duo_anchor(selected[index])
+                        and not bilibili_query_is_chamber_duo_bundle_anchor(selected[index])
+                        and not bilibili_query_is_chamber_named_work_surname_rescue(selected[index])
+                    ),
+                    len(selected) - 1,
+                )
+                selected[replace_index] = chamber_solo_cjk_query
+                selected = dedupe_text(selected)
+                if len(selected) < max_queries:
+                    for query in ranked:
+                        if query in selected:
+                            continue
+                        selected.append(query)
+                        if len(selected) >= max_queries:
+                            break
+    if max_queries >= 4 and not any(bilibili_query_is_cjk_orchestral_context_anchor(query) for query in selected):
+        orchestral_context_pool = [query for query in pool if bilibili_query_is_cjk_orchestral_context_anchor(query)]
+        if orchestral_context_pool:
+            orchestral_context_query = min(
+                dedupe_text(orchestral_context_pool),
+                key=bilibili_cjk_orchestral_context_rank,
+            )
+            if orchestral_context_query not in selected:
+                replace_index = next(
+                    (
+                        index
+                        for index in range(len(selected) - 1, -1, -1)
+                        if not bilibili_query_is_primary_work_rescue(selected[index])
+                        and not bilibili_query_is_primary_year_anchor(selected[index])
+                        and not bilibili_query_is_generic_plural_bundle_rescue(selected[index])
+                        and not bilibili_query_is_exact_collaboration_anchor(selected[index])
+                        and not bilibili_query_is_mixed_compact_duo_anchor(selected[index])
+                        and not bilibili_query_is_chamber_duo_bundle_anchor(selected[index])
+                    ),
+                    len(selected) - 1,
+                )
+                selected[replace_index] = orchestral_context_query
                 selected = dedupe_text(selected)
                 if len(selected) < max_queries:
                     for query in ranked:
@@ -2954,6 +3887,226 @@ def bilibili_query_has_collaboration_signal(query: str) -> bool:
     return len(latin_tokens) >= 3
 
 
+def bilibili_query_is_mixed_compact_duo_anchor(query: str) -> bool:
+    normalized = compact(query)
+    if not normalized or not contains_cjk(normalized) or "/" in normalized:
+        return False
+    if any(character.isdigit() for character in normalized):
+        return False
+    latin_tokens = [token for token in re.findall(r"[A-Za-z][A-Za-z'.-]*", normalized) if len(token) > 1]
+    if not 2 <= len(latin_tokens) <= 3:
+        return False
+    lowered = normalized.lower()
+    ensemble_markers = (
+        "orchestra",
+        "philharmonic",
+        "symphony",
+        "ensemble",
+        "涔愬洟",
+        "鐖变箰",
+        "浜ゅ搷",
+    )
+    chamber_markers = (
+        "\u594f\u9e23\u66f2",
+        "\u4e09\u91cd\u594f",
+        "\u56db\u91cd\u594f",
+        "\u6625\u5929",
+        "\u70ed\u60c5",
+        "sonata",
+        "trio",
+        "quartet",
+        "spring",
+        "appassionata",
+    )
+    return not any(marker in lowered for marker in ensemble_markers) and any(
+        marker in lowered for marker in chamber_markers
+    )
+
+
+def bilibili_query_is_chamber_duo_bundle_anchor(query: str) -> bool:
+    normalized = compact(query)
+    if not normalized or contains_cjk(normalized) or "/" in normalized:
+        return False
+    lowered = normalized.lower()
+    bundle_markers = (
+        "violin sonatas",
+        "piano sonatas",
+        "sonatas",
+        "violin sonata collection",
+        "piano sonata collection",
+        "sonata collection",
+        "quartets",
+        "quartet collection",
+        "trios",
+        "trio collection",
+    )
+    if not any(marker in lowered for marker in bundle_markers):
+        return False
+    # Keep chamber bundle anchors with an explicit release year (e.g. 1959),
+    # while rejecting other numeric fragments (e.g. movement/opus numbers).
+    without_years = re.sub(r"\b(?:18|19|20)\d{2}\b", "", lowered)
+    if any(character.isdigit() for character in without_years):
+        return False
+    latin_tokens = [token for token in re.findall(r"[A-Za-z][A-Za-z'.-]*", normalized) if len(token) > 1]
+    return len(latin_tokens) >= 4
+
+
+def bilibili_query_is_chamber_named_work_surname_rescue(query: str) -> bool:
+    normalized = compact(query)
+    if not normalized or contains_cjk(normalized) or "/" in normalized:
+        return False
+    lowered = normalized.lower()
+    if not any(alias in lowered for alias in ("appassionata", "spring")):
+        return False
+    if not any(composer in lowered for composer in ("beethoven",)):
+        return False
+    if any(marker in lowered for marker in ("concerto", "symphony", "quartet", "trio")):
+        return False
+    latin_tokens = [token for token in re.findall(r"[A-Za-z][A-Za-z'.-]*", normalized) if len(token) > 1]
+    return 3 <= len(latin_tokens) <= 4
+
+
+def bilibili_query_is_chamber_named_work_full_name_year_rescue(query: str) -> bool:
+    normalized = compact(query)
+    if not normalized or contains_cjk(normalized) or "/" in normalized:
+        return False
+    lowered = normalized.lower()
+    if not any(alias in lowered for alias in ("appassionata", "spring")):
+        return False
+    if not re.search(r"\b(?:18|19|20)\d{2}\b", lowered):
+        return False
+    if any(marker in lowered for marker in ("concerto", "symphony", "quartet", "trio", "collection", "complete")):
+        return False
+    latin_tokens = [token for token in re.findall(r"[A-Za-z][A-Za-z'.-]*", normalized) if len(token) > 1]
+    return 3 <= len(latin_tokens) <= 5
+
+
+def bilibili_query_is_chamber_named_work_solo_cjk_rescue(query: str) -> bool:
+    normalized = compact(query)
+    if not normalized or not contains_cjk(normalized):
+        return False
+    if "/" in normalized:
+        return False
+    lowered = normalized.lower()
+    if not any(marker in normalized for marker in ("钢琴奏鸣曲", "小提琴奏鸣曲", "op57", "op.57", "op24", "op.24")):
+        return False
+    if any(marker in lowered for marker in ("concerto", "symphony", "quartet", "trio")):
+        return False
+    return len(re.findall(r"[A-Za-z0-9]+|[\u4e00-\u9fff]+", normalized)) >= 2
+
+
+def bilibili_query_is_year_collaboration_rescue(query: str) -> bool:
+    normalized = compact(query)
+    if not normalized or not bilibili_query_has_collaboration_signal(normalized):
+        return False
+    lowered = normalized.lower()
+    if not re.search(r"\b(?:18|19|20)\d{2}\b", lowered):
+        return False
+    if any(
+        month in lowered
+        for month in (
+            "january",
+            "february",
+            "march",
+            "april",
+            "may",
+            "june",
+            "july",
+            "august",
+            "september",
+            "october",
+            "november",
+            "december",
+        )
+    ):
+        return False
+    return any(
+        marker in lowered or marker in normalized
+        for marker in ("concerto", "concertos", "klavierkonzert", "钢协", "协奏曲")
+    )
+
+
+def bilibili_year_collaboration_rescue_rank(query: str) -> tuple[int, int, int, int]:
+    normalized = compact(query)
+    latin_tokens = [token for token in re.findall(r"[A-Za-z][A-Za-z'.-]*", normalized) if len(token) > 1]
+    long_latin_tokens = [token for token in latin_tokens if len(token) > 2 and not token.isupper()]
+    acronym_tokens = [token for token in latin_tokens if token.isupper() and len(token) <= 3]
+    return (
+        0 if "/" not in normalized else 1,
+        0 if not acronym_tokens else 1,
+        0 if len(long_latin_tokens) >= 3 else 1,
+        len(normalized),
+    )
+
+
+def bilibili_query_is_cjk_orchestral_context_anchor(query: str) -> bool:
+    normalized = compact(query)
+    if not normalized or "/" in normalized:
+        return False
+    lowered = normalized.lower()
+    if not re.search(r"\b(?:18|19|20)\d{2}\b", lowered):
+        return False
+    if any(
+        marker in lowered or marker in normalized
+        for marker in (
+            "concerto",
+            "concertos",
+            "klavierkonzert",
+            "sonata",
+            "quartet",
+            "trio",
+            "钢协",
+            "协奏曲",
+            "奏鸣曲",
+            "四重奏",
+            "三重奏",
+            "海顿",
+            "布鲁克纳",
+            "贝多芬",
+            "舒伯特",
+            "舒曼",
+        )
+    ):
+        return False
+    if any(
+        month in lowered
+        for month in (
+            "january",
+            "february",
+            "march",
+            "april",
+            "may",
+            "june",
+            "july",
+            "august",
+            "september",
+            "october",
+            "november",
+            "december",
+        )
+    ):
+        return False
+    token_count = len(re.findall(r"[A-Za-z0-9]+|[\u4e00-\u9fff]+", normalized))
+    cjk_chunks = re.findall(r"[\u4e00-\u9fff]+", normalized)
+    if token_count < 4 or token_count > 10:
+        return False
+    if len(cjk_chunks) < 2:
+        return False
+    return True
+
+
+def bilibili_cjk_orchestral_context_rank(query: str) -> tuple[int, int, int, int]:
+    normalized = compact(query)
+    token_count = len(re.findall(r"[A-Za-z0-9]+|[\u4e00-\u9fff]+", normalized))
+    cjk_chunk_count = len(re.findall(r"[\u4e00-\u9fff]+", normalized))
+    return (
+        0 if not re.search(r"[A-Za-z]", normalized) else 1,
+        token_count,
+        -cjk_chunk_count,
+        len(normalized),
+    )
+
+
 def bilibili_query_collaboration_rank(query: str) -> tuple[int, int, int, int, int]:
     normalized = compact(query)
     lowered = normalized.lower()
@@ -3222,6 +4375,26 @@ def prioritize_person_query_terms(values: list[str]) -> list[str]:
     ]
 
 
+def prioritize_chamber_collaboration_query_terms(
+    draft: DraftRecordingEntry,
+    values: list[str],
+) -> list[str]:
+    if compact(getattr(draft, "work_type_hint", "")).lower() not in {"chamber_solo", "chamber_duo"}:
+        return dedupe_text(values)
+    lead_slots = build_lead_slots(draft)
+    if len(lead_slots) < 2:
+        return dedupe_text(values)
+
+    collaboration_terms: list[str] = []
+    for value in dedupe_text(values):
+        haystack = normalize_text(value)
+        if not looks_latin(value):
+            continue
+        if all(any(name_matches(haystack, candidate) for candidate in slot if compact(candidate)) for slot in lead_slots[:2]):
+            collaboration_terms.append(value)
+    return dedupe_text([*collaboration_terms, *values])
+
+
 def is_probable_abbreviation(value: str) -> bool:
     normalized = compact(value)
     return bool(normalized) and normalized.upper() == normalized and len(normalized) <= 6 and " " not in normalized
@@ -3345,6 +4518,112 @@ def extract_bilibili_structured_metadata(html_text: str) -> dict[str, Any]:
         "duration_seconds": int(video_data.get("duration") or 0),
         "view_count": int(stats.get("view") or 0),
     }
+
+
+def extract_youtube_structured_metadata(html_text: str) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    for marker in (
+        "var ytInitialPlayerResponse = ",
+        "var ytInitialPlayerResponse=",
+        "ytInitialPlayerResponse = ",
+        "ytInitialPlayerResponse=",
+    ):
+        payload = extract_json_object_after_marker(html_text, marker)
+        if payload:
+            break
+    if not payload:
+        return {}
+
+    video_details = payload.get("videoDetails") if isinstance(payload.get("videoDetails"), dict) else {}
+    microformat = payload.get("microformat") if isinstance(payload.get("microformat"), dict) else {}
+    player_microformat = (
+        microformat.get("playerMicroformatRenderer") if isinstance(microformat.get("playerMicroformatRenderer"), dict) else {}
+    )
+    description_runs = player_microformat.get("description") if isinstance(player_microformat.get("description"), dict) else {}
+    description = compact(video_details.get("shortDescription"))
+    if not description:
+        description = compact(description_runs.get("simpleText"))
+    title = compact(video_details.get("title")) or compact(player_microformat.get("title"))
+    uploader = compact(video_details.get("author")) or compact(player_microformat.get("ownerChannelName"))
+    duration_seconds = int(video_details.get("lengthSeconds") or player_microformat.get("lengthSeconds") or 0)
+    view_count = int(video_details.get("viewCount") or player_microformat.get("viewCount") or 0)
+
+    overlay_payload = extract_json_object_after_marker(html_text, '"videoDetails":')
+    overlay_renderer = (
+        overlay_payload.get("playerOverlayVideoDetailsRenderer")
+        if isinstance(overlay_payload.get("playerOverlayVideoDetailsRenderer"), dict)
+        else {}
+    )
+    overlay_title = extract_renderer_text(overlay_renderer.get("title"))
+    overlay_subtitle = overlay_renderer.get("subtitle") if isinstance(overlay_renderer.get("subtitle"), dict) else {}
+    overlay_runs = overlay_subtitle.get("runs") if isinstance(overlay_subtitle.get("runs"), list) else []
+    overlay_texts = [compact(item.get("text")) for item in overlay_runs if isinstance(item, dict) and compact(item.get("text"))]
+    overlay_uploader = overlay_texts[0] if overlay_texts else ""
+    overlay_view_count = 0
+    for value in overlay_texts[1:]:
+        numeric_value = extract_first_number(value)
+        if numeric_value > 0:
+            overlay_view_count = numeric_value
+            break
+    overlay_duration_seconds = extract_duration_seconds_from_accessibility_label(
+        extract_meta_content(html_text, "lengthText", attr="name")
+    ) or extract_duration_seconds_from_accessibility_label(extract_youtube_length_label(html_text))
+
+    title = title or overlay_title
+    uploader = uploader or overlay_uploader
+    duration_seconds = duration_seconds or overlay_duration_seconds
+    view_count = view_count or overlay_view_count
+    return {
+        "title": title,
+        "description": description,
+        "body_text": compact(" ".join(part for part in [title, description, uploader] if part)),
+        "uploader": uploader,
+        "duration_seconds": duration_seconds,
+        "view_count": view_count,
+    }
+
+
+def extract_renderer_text(value: Any) -> str:
+    if isinstance(value, dict):
+        simple_text = compact(value.get("simpleText"))
+        if simple_text:
+            return simple_text
+        runs = value.get("runs")
+        if isinstance(runs, list):
+            return compact("".join(compact(item.get("text")) for item in runs if isinstance(item, dict)))
+        return ""
+    return compact(value)
+
+
+def extract_first_number(value: str) -> int:
+    match = re.search(r"(\d[\d,\.]*)", compact(value))
+    if not match:
+        return 0
+    digits = re.sub(r"[^\d]", "", match.group(1))
+    return int(digits) if digits else 0
+
+
+def extract_duration_seconds_from_accessibility_label(value: str) -> int:
+    numbers = [int(token) for token in re.findall(r"\d+", compact(value))]
+    if len(numbers) >= 3:
+        return numbers[-3] * 3600 + numbers[-2] * 60 + numbers[-1]
+    if len(numbers) == 2:
+        return numbers[0] * 60 + numbers[1]
+    if len(numbers) == 1:
+        return numbers[0]
+    return 0
+
+
+def extract_youtube_length_label(html_text: str) -> str:
+    patterns = (
+        r'"lengthText":\{"accessibility":\{"accessibilityData":\{"label":"([^"]+)"',
+        r'"lengthText":\{"simpleText":"([^"]+)"',
+    )
+    for pattern in patterns:
+        match = re.search(pattern, html_text or "", re.I)
+        if match:
+            return html.unescape(match.group(1))
+    return ""
 
 
 def extract_uploader_name(html_text: str) -> str:
@@ -3477,6 +4756,30 @@ def is_generic_apple_player_text(value: str) -> bool:
     return any(marker in lowered for marker in generic_markers)
 
 
+def is_generic_youtube_watch_text(value: str) -> bool:
+    lowered = compact(value).lower().replace("\xa0", " ")
+    if not lowered:
+        return False
+    if lowered in {"- youtube", "youtube"}:
+        return True
+    generic_markers = (
+        "youtube でお気に入りの動画や音楽を楽しみ",
+        "在 youtube 上畅享你喜爱的视频和音乐",
+        "enjoy the videos and music you love",
+        "upload original content",
+        "share it all with friends, family, and the world",
+        "share your videos with friends, family, and the world",
+    )
+    return any(marker in lowered for marker in generic_markers)
+
+
+def strip_generic_youtube_watch_suffix(value: str) -> str:
+    normalized = compact(value)
+    if not normalized:
+        return ""
+    return re.sub(r"\s*-\s*YouTube\s*$", "", normalized, flags=re.I).strip()
+
+
 def score_recording_match(
     text: str,
     url: str,
@@ -3578,21 +4881,23 @@ def score_recording_match(
     if work_matched and group_hits and (not lead_slots or lead_hits >= len(lead_slots)):
         score += 0.06
 
-    year = infer_reference_year(draft)
-    if year and year in haystack:
+    reference_years = infer_reference_years(draft)
+    reference_year_set = set(reference_years)
+    has_reference_year_hit = bool(reference_year_set.intersection(years_in_text))
+    if has_reference_year_hit:
         score += 0.08
-    if year and years_in_text and year not in years_in_text:
+    if reference_year_set and years_in_text and reference_year_set.isdisjoint(years_in_text):
         score -= 0.32
     performance_context_tokens = extract_performance_context_tokens(draft.performance_date_text)
     if performance_context_tokens and contains_tokens(haystack, performance_context_tokens):
         score += 0.1
-        if has_specific_date_context_tokens(performance_context_tokens) and lead_hits >= 1 and year and year in haystack:
+        if has_specific_date_context_tokens(performance_context_tokens) and lead_hits >= 1 and has_reference_year_hit:
             score += 0.08
             if work_matched:
                 score += 0.08
     if sparse_collaboration_hint and work_matched and lead_hits >= 1 and has_complete_work_tracklist(haystack):
         score += 0.08
-        if year and year in haystack:
+        if has_reference_year_hit:
             score += 0.04
     score += score_catalogue_fit(draft, haystack)
 
@@ -3704,11 +5009,15 @@ def has_complete_work_tracklist(haystack: str) -> bool:
 
 
 def infer_reference_year(draft: DraftRecordingEntry) -> str:
-    return (
-        extract_year(draft.performance_date_text)
-        or extract_year(draft.title)
-        or extract_year(draft.raw_text)
-    )
+    years = infer_reference_years(draft)
+    return years[0] if years else ""
+
+
+def infer_reference_years(draft: DraftRecordingEntry) -> list[str]:
+    years: list[str] = []
+    for value in (draft.performance_date_text, draft.title, draft.raw_text):
+        years.extend(re.findall(r"((?:17|18|19|20)\d{2})", compact(value)))
+    return dedupe_text(years)
 
 
 def extract_decade_bucket(value: str) -> str:
@@ -3888,6 +5197,428 @@ def build_chinese_host_primary_year_anchor_queries(draft: DraftRecordingEntry) -
             continue
         queries.append(f"{query_term} {reference_year}")
     return dedupe_text(queries)
+
+
+def chamber_work_alias_rank(alias: str) -> tuple[int, int, int]:
+    normalized = normalize_text(alias)
+    named_aliases = {"appassionata", "spring"}
+    return (
+        0 if normalized in named_aliases else 1,
+        0 if "no." not in normalized and "no " not in normalized else 1,
+        len(normalized),
+    )
+
+
+def build_chamber_compound_work_candidates(values: list[str]) -> list[str]:
+    normalized_values = dedupe_text([compact(value) for value in values if compact(value)])
+    named_values = [value for value in normalized_values if normalize_text(value) in {"appassionata", "spring"}]
+    numbered_values = [
+        value
+        for value in normalized_values
+        if re.search(r"\bsonata\b", normalize_text(value)) and re.search(r"\bno\.?\s*\d+\b", normalize_text(value))
+    ]
+    queries: list[str] = []
+    for named_value in named_values[:2]:
+        for numbered_value in numbered_values[:2]:
+            if normalize_text(named_value) in normalize_text(numbered_value):
+                continue
+            queries.append(f"{named_value} {numbered_value}")
+    return dedupe_text(queries)
+
+
+def build_chamber_duo_compact_lead_terms(draft: DraftRecordingEntry) -> list[str]:
+    primary_values = dedupe_text(getattr(draft, "primary_names_latin", [])[:2])
+    secondary_values = dedupe_text(getattr(draft, "secondary_names_latin", [])[:2])
+    if not primary_values or not secondary_values:
+        return []
+
+    queries: list[str] = []
+    for primary_value in primary_values:
+        for secondary_value in secondary_values:
+            primary_keyword = compact(extract_person_query_keyword(primary_value))
+            secondary_keyword = compact(extract_person_query_keyword(secondary_value))
+            if not primary_keyword or not secondary_keyword or primary_keyword.casefold() == secondary_keyword.casefold():
+                continue
+            queries.extend(
+                [
+                    f"{primary_keyword} {secondary_keyword}",
+                    f"{primary_keyword}-{secondary_keyword}",
+                    f"{primary_keyword} / {secondary_keyword}",
+                ]
+            )
+    return dedupe_text(queries)
+
+
+def build_chamber_year_anchor_queries(
+    draft: DraftRecordingEntry,
+    *,
+    composer_query: str,
+    work_candidates: list[str],
+    lead_terms: list[str],
+) -> list[str]:
+    year_candidates = extract_year_candidates(
+        " ".join(
+            [
+                compact(draft.performance_date_text),
+                compact(draft.title),
+                compact(draft.raw_text),
+                compact(draft.source_line),
+            ]
+        )
+    )
+    if not year_candidates or not work_candidates or not lead_terms:
+        return []
+
+    queries: list[str] = []
+    composer_queries: list[str] = []
+    for work_candidate in work_candidates[:1]:
+        for lead_term in lead_terms[:1]:
+            for year_candidate in year_candidates[:2]:
+                queries.append(f"{work_candidate} {lead_term} {year_candidate}")
+                if composer_query:
+                    composer_queries.append(f"{composer_query} {work_candidate} {lead_term} {year_candidate}")
+    return dedupe_text([*queries, *composer_queries])
+
+
+def build_chamber_solo_opus_queries(
+    draft: DraftRecordingEntry,
+    *,
+    composer_query: str,
+    lead_terms: list[str],
+) -> list[str]:
+    if getattr(draft, "secondary_names", []) or getattr(draft, "secondary_names_latin", []):
+        return []
+    context = normalize_text(
+        " ".join(
+            [
+                compact(draft.work_title_latin),
+                compact(draft.work_title),
+                compact(draft.title),
+                compact(draft.raw_text),
+                compact(draft.source_line),
+            ]
+        )
+    )
+    opus_values = dedupe_text(re.findall(r"\bop\.?\s*(\d+)\b", context))
+    if not opus_values:
+        return []
+
+    queries: list[str] = []
+    for lead_term in dedupe_text(lead_terms)[:3]:
+        normalized_lead = compact(lead_term)
+        if not normalized_lead or not looks_latin(normalized_lead) or "/" in normalized_lead:
+            continue
+        for opus in opus_values[:1]:
+            queries.append(f"{normalized_lead} op {opus}")
+            if composer_query:
+                queries.append(f"{composer_query} {normalized_lead} op {opus}")
+    return dedupe_text(queries)
+
+
+def build_chamber_duo_bundle_queries(
+    draft: DraftRecordingEntry,
+    *,
+    composer_query: str,
+    compact_duo_lead_terms: list[str],
+) -> list[str]:
+    if not (getattr(draft, "secondary_names", []) or getattr(draft, "secondary_names_latin", [])):
+        return []
+
+    work_text = normalize_text(draft.work_title_latin or draft.work_title)
+    bundle_terms: list[str] = []
+    if "violin sonata" in work_text:
+        bundle_terms = ["complete violin sonatas", "violin sonatas", "violin sonata collection"]
+    elif "piano sonata" in work_text:
+        bundle_terms = ["complete piano sonatas", "piano sonatas", "piano sonata collection"]
+    elif "sonata" in work_text:
+        bundle_terms = ["complete sonatas", "sonatas", "sonata collection"]
+    elif "quartet" in work_text:
+        bundle_terms = ["complete quartets", "quartets", "quartet collection"]
+    elif "trio" in work_text:
+        bundle_terms = ["complete trios", "trios", "trio collection"]
+    if not bundle_terms:
+        return []
+
+    year_candidates = extract_year_candidates(
+        " ".join(
+            [
+                compact(draft.performance_date_text),
+                compact(draft.title),
+                compact(draft.raw_text),
+                compact(draft.source_line),
+            ]
+        )
+    )
+
+    queries: list[str] = []
+    for lead_term in compact_duo_lead_terms[:2]:
+        if "/" in lead_term:
+            continue
+        for bundle_term in bundle_terms[:3]:
+            is_complete_bundle = bundle_term.startswith("complete ")
+            if composer_query:
+                if year_candidates:
+                    queries.append(f"{composer_query} {bundle_term} {lead_term} {year_candidates[0]}")
+                queries.append(f"{composer_query} {lead_term} {bundle_term}")
+            queries.append(f"{lead_term} {bundle_term}")
+            if is_complete_bundle:
+                queries.append(f"{lead_term} {bundle_term} trailer")
+    ranked_queries = sorted(
+        dedupe_text(queries),
+        key=chamber_duo_bundle_query_rank,
+    )
+    return ranked_queries
+
+
+def chamber_duo_bundle_query_rank(query: str) -> tuple[int, int, int, int]:
+    normalized = compact(query)
+    lowered = normalized.lower()
+    has_complete = "complete" in lowered
+    has_year = bool(re.search(r"\b(?:18|19|20)\d{2}\b", lowered))
+    has_trailer = "trailer" in lowered
+    has_hyphenated_duo = bool(re.search(r"\b[A-Za-z]+-[A-Za-z]+\b", normalized))
+    return (
+        0
+        if has_complete and has_year and not has_hyphenated_duo
+        else 1
+        if has_complete and has_trailer
+        else 2
+        if has_complete and has_year
+        else 3
+        if has_complete
+        else 4
+        if has_year
+        else 5,
+        1 if has_hyphenated_duo else 0,
+        len(lowered.split()),
+        len(lowered),
+    )
+
+
+def build_chamber_work_anchor_queries(
+    draft: DraftRecordingEntry,
+    *,
+    prefer_latin: bool,
+    composer_query: str,
+    lead_terms: list[str],
+) -> list[str]:
+    work_text = normalize_text(draft.work_title_latin or draft.work_title)
+    if not any(token in work_text for token in ("sonata", "quartet", "trio", "奏鸣曲", "四重奏", "三重奏")):
+        return []
+
+    work_candidates: list[str] = []
+    work_candidates.extend(build_work_aliases(draft.work_title_latin or draft.work_title))
+    work_candidates.append(build_work_query(draft, prefer_latin=prefer_latin))
+    if prefer_latin:
+        filtered_work_candidates = [value for value in work_candidates if looks_latin(value)]
+        filtered_leads = [value for value in dedupe_text(lead_terms) if looks_latin(value) or "/" in value]
+        filtered_leads = prioritize_chamber_anchor_lead_terms(draft, filtered_leads)
+    else:
+        filtered_work_candidates = [value for value in work_candidates if contains_cjk(value)]
+        filtered_leads = dedupe_text(lead_terms)
+    ranked_work_candidates = dedupe_text(
+        sorted(
+            [compact(value) for value in filtered_work_candidates if compact(value)],
+            key=chamber_work_alias_rank,
+        )
+    )
+    compound_work_candidates: list[str] = []
+    if prefer_latin:
+        leading_candidates = ranked_work_candidates[:1]
+        trailing_candidates = ranked_work_candidates[1:]
+        compound_work_candidates = build_chamber_compound_work_candidates(ranked_work_candidates)
+        ranked_work_candidates = dedupe_text([
+            *leading_candidates,
+            *compound_work_candidates,
+            *trailing_candidates,
+        ])
+    if not ranked_work_candidates or not filtered_leads:
+        return []
+
+    queries: list[str] = []
+    for work_candidate in ranked_work_candidates[:3]:
+        for lead_term in filtered_leads[:4]:
+            queries.append(f"{work_candidate} {lead_term}")
+            if composer_query:
+                queries.append(f"{composer_query} {work_candidate} {lead_term}")
+    compact_duo_lead_terms = build_chamber_duo_compact_lead_terms(draft)
+    if prefer_latin:
+        compact_duo_queries: list[str] = []
+        for work_candidate in ranked_work_candidates[:2]:
+            for lead_term in compact_duo_lead_terms[:2]:
+                compact_duo_queries.append(f"{work_candidate} {lead_term}")
+                if composer_query:
+                    compact_duo_queries.append(f"{composer_query} {work_candidate} {lead_term}")
+        bundle_queries = build_chamber_duo_bundle_queries(
+            draft,
+            composer_query=composer_query,
+            compact_duo_lead_terms=compact_duo_lead_terms,
+        )
+        year_anchor_queries = build_chamber_year_anchor_queries(
+            draft,
+            composer_query=composer_query,
+            work_candidates=dedupe_text([*compound_work_candidates, *ranked_work_candidates]),
+            lead_terms=dedupe_text([*compact_duo_lead_terms, *filtered_leads]),
+        )
+        queries = [
+            *queries[:2],
+            *compact_duo_queries[:1],
+            *year_anchor_queries[:2],
+            *bundle_queries[:2],
+            *compact_duo_queries[1:2],
+            *queries[2:],
+        ]
+    elif compact_duo_lead_terms:
+        mixed_compact_duo_queries: list[str] = []
+        for work_candidate in ranked_work_candidates[:2]:
+            for lead_term in compact_duo_lead_terms[:2]:
+                mixed_compact_duo_queries.extend(
+                    [
+                        f"{work_candidate} {lead_term}",
+                        f"{lead_term} {work_candidate}",
+                    ]
+                )
+                if composer_query:
+                    mixed_compact_duo_queries.append(f"{composer_query} {work_candidate} {lead_term}")
+        queries = [*queries[:1], *mixed_compact_duo_queries[:1], *queries[1:]]
+    return dedupe_text(queries)
+
+
+def prioritize_chamber_anchor_lead_terms(
+    draft: DraftRecordingEntry,
+    values: list[str],
+) -> list[str]:
+    deduped = dedupe_text(values)
+    if compact(getattr(draft, "work_type_hint", "")).lower() not in {"chamber_solo", "chamber_duo"}:
+        return deduped
+
+    collaboration_terms = sorted(
+        [
+            value
+            for value in deduped
+            if looks_latin(value) and query_mentions_primary_and_secondary_names(value, draft)
+        ],
+        key=lambda value: ("/" in value, len([token for token in value.split() if token]), len(compact(value))),
+    )
+    return dedupe_text([*collaboration_terms, *deduped])
+
+
+def query_mentions_primary_and_secondary_names(query: str, draft: DraftRecordingEntry) -> bool:
+    haystack = normalize_text(query)
+    primary_values = dedupe_text([*getattr(draft, "primary_names_latin", [])[:3], *getattr(draft, "primary_names", [])[:2]])
+    secondary_values = dedupe_text([*getattr(draft, "secondary_names_latin", [])[:3], *getattr(draft, "secondary_names", [])[:2]])
+    return bool(primary_values) and bool(secondary_values) and any(
+        name_matches(haystack, value) for value in primary_values if compact(value)
+    ) and any(name_matches(haystack, value) for value in secondary_values if compact(value))
+
+
+def is_chamber_named_work_compact_duo_query(query: str, draft: DraftRecordingEntry) -> bool:
+    normalized_query = compact(query)
+    if not normalized_query:
+        return False
+    compact_duo_terms = build_chamber_duo_compact_lead_terms(draft)
+    if not any(term in normalized_query for term in compact_duo_terms[:2]):
+        return False
+    cjk_named_aliases = [
+        alias
+        for alias in build_named_work_aliases(draft.work_title_latin or draft.work_title)
+        if contains_cjk(alias)
+    ]
+    return any(alias in normalized_query for alias in cjk_named_aliases)
+
+
+def is_chamber_named_work_duo_anchor_query(query: str, draft: DraftRecordingEntry) -> bool:
+    normalized_query = compact(query)
+    if not normalized_query:
+        return False
+    cjk_named_aliases = [
+        alias
+        for alias in build_named_work_aliases(draft.work_title_latin or draft.work_title)
+        if contains_cjk(alias)
+    ]
+    if not any(alias in normalized_query for alias in cjk_named_aliases):
+        return False
+    if is_chamber_named_work_compact_duo_query(normalized_query, draft):
+        return True
+    haystack = normalize_text(normalized_query)
+    primary_values = dedupe_text([*getattr(draft, "primary_names_latin", [])[:2], *getattr(draft, "primary_names", [])[:2]])
+    secondary_values = dedupe_text([*getattr(draft, "secondary_names_latin", [])[:2], *getattr(draft, "secondary_names", [])[:2]])
+    return bool(primary_values) and bool(secondary_values) and any(
+        name_matches(haystack, value) for value in primary_values if compact(value)
+    ) and any(name_matches(haystack, value) for value in secondary_values if compact(value))
+
+
+def is_chamber_latin_compact_duo_anchor_query(query: str, draft: DraftRecordingEntry) -> bool:
+    normalized_query = compact(query)
+    if not normalized_query or contains_cjk(normalized_query):
+        return False
+    compact_duo_terms = build_chamber_duo_compact_lead_terms(draft)
+    if not any(term in normalized_query for term in compact_duo_terms[:2]):
+        return False
+    return query_mentions_requested_work(normalized_query, draft=draft)
+
+
+def is_chamber_latin_solo_opus_anchor_query(query: str, draft: DraftRecordingEntry) -> bool:
+    if compact(getattr(draft, "work_type_hint", "")).lower() != "chamber_solo":
+        return False
+    if getattr(draft, "secondary_names", []) or getattr(draft, "secondary_names_latin", []):
+        return False
+    normalized_query = compact(query)
+    if not normalized_query or contains_cjk(normalized_query):
+        return False
+    query_opus_values = set(re.findall(r"\bop\.?\s*(\d+)\b", normalized_query, re.I))
+    if not query_opus_values:
+        return False
+    draft_context = normalize_text(
+        " ".join(
+            [
+                compact(draft.work_title_latin),
+                compact(draft.work_title),
+                compact(draft.title),
+                compact(draft.raw_text),
+                compact(draft.source_line),
+            ]
+        )
+    )
+    draft_opus_values = set(re.findall(r"\bop\.?\s*(\d+)\b", draft_context, re.I))
+    if draft_opus_values and not (query_opus_values & draft_opus_values):
+        return False
+    haystack = normalize_text(normalized_query)
+    primary_values = dedupe_text([*getattr(draft, "primary_names_latin", [])[:2], *getattr(draft, "primary_names", [])[:1]])
+    if primary_values and not any(name_matches(haystack, value) for value in primary_values if compact(value)):
+        return False
+    return True
+
+
+def is_chamber_named_work_solo_cjk_rescue_query(query: str, draft: DraftRecordingEntry) -> bool:
+    if compact(getattr(draft, "work_type_hint", "")).lower() != "chamber_solo":
+        return False
+    if getattr(draft, "secondary_names", []) or getattr(draft, "secondary_names_latin", []):
+        return False
+    normalized_query = compact(query)
+    if not normalized_query or not contains_cjk(normalized_query):
+        return False
+    if not query_mentions_requested_work(normalized_query, draft=draft):
+        return False
+    haystack = normalize_text(normalized_query)
+    primary_values = dedupe_text([*getattr(draft, "primary_names", [])[:2], *getattr(draft, "primary_names_latin", [])[:1]])
+    if primary_values and not any(name_matches(haystack, value) for value in primary_values if compact(value)):
+        return False
+    cjk_specific_aliases = [
+        alias
+        for alias in build_named_work_aliases(draft.work_title_latin or draft.work_title)
+        if contains_cjk(alias) and any(marker in alias for marker in ("钢琴奏鸣曲", "小提琴奏鸣曲", "op57", "op.57", "op24", "op.24"))
+    ]
+    return any(alias in normalized_query for alias in cjk_specific_aliases)
+
+
+def chamber_named_work_solo_cjk_rescue_rank(query: str) -> tuple[int, int, int]:
+    normalized = compact(query)
+    return (
+        0 if any(marker in normalized for marker in ("钢琴奏鸣曲", "小提琴奏鸣曲")) else 1,
+        0 if re.search(r"op\.?\s*(?:24|57)", normalized, re.I) else 1,
+        len(normalized),
+    )
 
 
 def build_ensemble_bundle_query_keywords(values: list[str]) -> list[str]:
@@ -4109,6 +5840,77 @@ def build_collaboration_surname_rescue_queries(draft: DraftRecordingEntry) -> li
                 queries.append(f"{primary_keyword} {secondary_keyword} concerto {reference_year}")
                 for work_keyword in work_keywords[:1]:
                     queries.append(f"{primary_keyword} {secondary_keyword} {work_keyword} {reference_year}")
+    return dedupe_text(queries)
+
+
+def build_chamber_named_work_surname_rescue_queries(draft: DraftRecordingEntry) -> list[str]:
+    if compact(getattr(draft, "work_type_hint", "")).lower() != "chamber_solo":
+        return []
+    if getattr(draft, "secondary_names", []) or getattr(draft, "secondary_names_latin", []):
+        return []
+
+    named_aliases = dedupe_text(
+        alias
+        for alias in build_named_work_aliases(draft.work_title_latin or draft.work_title)
+        if looks_latin(alias) and normalize_text(alias) in {"appassionata", "spring"}
+    )
+    if not named_aliases:
+        return []
+
+    primary_keywords = dedupe_text(
+        extract_person_query_keyword(value)
+        for value in prioritize_person_query_terms(getattr(draft, "primary_names_latin", []))
+    )
+    if not primary_keywords:
+        return []
+
+    composer_keyword = extract_person_query_keyword(draft.composer_name_latin or draft.composer_name)
+    composer_surname = compact(composer_keyword).split()[-1] if compact(composer_keyword) else ""
+    reference_year = extract_year(draft.performance_date_text or draft.title or draft.raw_text or draft.source_line)
+
+    queries: list[str] = []
+    for primary_keyword in primary_keywords[:2]:
+        for named_alias in named_aliases[:1]:
+            if composer_surname:
+                queries.append(f"{primary_keyword} {named_alias} {composer_surname}")
+            if reference_year:
+                queries.append(f"{named_alias} {primary_keyword} {reference_year}")
+                if composer_surname:
+                    queries.append(f"{named_alias} {primary_keyword} {composer_surname} {reference_year}")
+    return dedupe_text(queries)
+
+
+def build_chamber_named_work_full_name_year_rescue_queries(draft: DraftRecordingEntry) -> list[str]:
+    if compact(getattr(draft, "work_type_hint", "")).lower() != "chamber_solo":
+        return []
+    if getattr(draft, "secondary_names", []) or getattr(draft, "secondary_names_latin", []):
+        return []
+
+    named_aliases = dedupe_text(
+        alias
+        for alias in build_named_work_aliases(draft.work_title_latin or draft.work_title)
+        if looks_latin(alias) and normalize_text(alias) in {"appassionata", "spring"}
+    )
+    if not named_aliases:
+        return []
+
+    reference_year = extract_year(draft.performance_date_text or draft.title or draft.raw_text or draft.source_line)
+    if not reference_year:
+        return []
+
+    primary_names = dedupe_text(
+        compact(value)
+        for value in prioritize_person_query_terms(getattr(draft, "primary_names_latin", []))
+        if looks_latin(value)
+    )
+    if not primary_names:
+        return []
+
+    queries: list[str] = []
+    for primary_name in primary_names[:2]:
+        for named_alias in named_aliases[:1]:
+            queries.append(f"{named_alias} {primary_name}")
+            queries.append(f"{named_alias} {primary_name} {reference_year}")
     return dedupe_text(queries)
 
 
@@ -4390,10 +6192,20 @@ def build_named_work_aliases(value: str) -> set[str]:
     for alias, markers in nickname_map.items():
         if any(marker in normalized or marker in text for marker in markers):
             aliases.add(alias)
+            if alias == "appassionata":
+                aliases.add("热情奏鸣曲")
+            if alias == "spring":
+                aliases.add("春天奏鸣曲")
     if "piano sonata no 23" in normalized or "op.57" in normalized or "op57" in normalized:
         aliases.add("appassionata")
+        aliases.add("热情奏鸣曲")
+        aliases.add("第二十三钢琴奏鸣曲")
+        aliases.add("第二十三号钢琴奏鸣曲")
+        aliases.add("热情op57")
+        aliases.add("热情op.57")
     if "violin sonata no 5" in normalized or "op.24" in normalized or "op24" in normalized:
         aliases.add("spring")
+        aliases.add("春天奏鸣曲")
     return aliases
 
 
@@ -4486,6 +6298,94 @@ def contains_tokens(haystack: str, tokens: list[str]) -> bool:
 def extract_year(value: str) -> str:
     match = re.search(r"(19\d{2}|20\d{2})", value or "")
     return match.group(1) if match else ""
+
+
+def extract_performance_date_text(value: str) -> str:
+    normalized = compact(value)
+    if not normalized:
+        return ""
+
+    month_names = {
+        1: "January",
+        2: "February",
+        3: "March",
+        4: "April",
+        5: "May",
+        6: "June",
+        7: "July",
+        8: "August",
+        9: "September",
+        10: "October",
+        11: "November",
+        12: "December",
+    }
+    english_month_aliases = {
+        "jan": "January",
+        "january": "January",
+        "feb": "February",
+        "february": "February",
+        "mar": "March",
+        "march": "March",
+        "apr": "April",
+        "april": "April",
+        "may": "May",
+        "jun": "June",
+        "june": "June",
+        "jul": "July",
+        "july": "July",
+        "aug": "August",
+        "august": "August",
+        "sep": "September",
+        "sept": "September",
+        "september": "September",
+        "oct": "October",
+        "october": "October",
+        "nov": "November",
+        "november": "November",
+        "dec": "December",
+        "december": "December",
+    }
+    english_month_pattern = (
+        r"(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
+        r"jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)"
+    )
+
+    cjk_match = re.search(r"((?:19|20)\d{2})\s*年\s*(1[0-2]|0?[1-9])\s*月(?:\s*(3[01]|[12]?\d)\s*日)?", normalized)
+    if cjk_match:
+        year, month_text, day_text = cjk_match.groups()
+        month_name = month_names.get(int(month_text))
+        if month_name:
+            if day_text:
+                return f"{month_name} {int(day_text)}, {year}"
+            return f"{month_name}, {year}"
+
+    full_english_match = re.search(
+        rf"\b{english_month_pattern}\.?\s+(\d{{1,2}})(?:st|nd|rd|th)?(?:,)?\s+((?:19|20)\d{{2}})\b",
+        normalized,
+        re.I,
+    )
+    if full_english_match:
+        month_text, day_text, year = full_english_match.groups()
+        month_name = english_month_aliases.get(month_text.rstrip(".").lower())
+        if month_name:
+            return f"{month_name} {int(day_text)}, {year}"
+
+    english_month_year_match = re.search(
+        rf"\b{english_month_pattern}\.?\s*,?\s+((?:19|20)\d{{2}})\b",
+        normalized,
+        re.I,
+    )
+    if english_month_year_match:
+        month_text, year = english_month_year_match.groups()
+        month_name = english_month_aliases.get(month_text.rstrip(".").lower())
+        if month_name:
+            return f"{month_name}, {year}"
+
+    return extract_year(normalized)
+
+
+def extract_year_candidates(value: str) -> list[str]:
+    return dedupe_text([match.group(1) for match in re.finditer(r"(19\d{2}|20\d{2})", value or "")])
 
 
 def extract_year_mentions(value: str) -> set[str]:

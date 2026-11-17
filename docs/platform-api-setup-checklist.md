@@ -2,15 +2,13 @@
 
 本文用于配置 `YouTube`、`Apple Music`、`Bilibili` 的 `API-first`（API 优先）搜索通道。运行时配置文件路径为：
 
-- [platform-search.example.json](E:\Workspace\codex\Introduction to Classical Music\tools\recording-retrieval-service\app\config\platform-search.example.json)
-- `E:\Workspace\codex\Introduction to Classical Music\tools\recording-retrieval-service\app\config\platform-search.local.json`
+- `config/platform-search.example.json`
+- `config/platform-search.local.json`
 
 建议先复制示例文件：
 
 ```powershell
-Copy-Item `
-  'E:\Workspace\codex\Introduction to Classical Music\tools\recording-retrieval-service\app\config\platform-search.example.json' `
-  'E:\Workspace\codex\Introduction to Classical Music\tools\recording-retrieval-service\app\config\platform-search.local.json'
+Copy-Item '.\config\platform-search.example.json' '.\config\platform-search.local.json'
 ```
 
 ## 1. YouTube Data API

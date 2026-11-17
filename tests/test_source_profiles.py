@@ -121,6 +121,26 @@ def test_person_alias_loader_expands_both_directions_and_persists_memory(tmp_pat
     assert reloaded.expand("安妮·费舍尔", role="soloist") == ["安妮·费舍尔", "Annie Fischer"]
 
 
+def test_person_alias_loader_treats_hash_space_lines_as_comments_not_sections(tmp_path: Path) -> None:
+    path = tmp_path / "person-name-aliases.txt"
+    path.write_text(
+        "\n".join(
+            [
+                "#soloist",
+                "山根弥生子 = 山根美代子 = Miyoko Yamane",
+                "# Example comment should stay inside the same section",
+                "安妮·费舍尔 = Annie Fischer",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    loader = PersonAliasLoader(path)
+
+    assert loader.expand("山根弥生子", role="soloist") == ["山根弥生子", "山根美代子", "Miyoko Yamane"]
+    assert loader.expand("安妮·费舍尔", role="soloist") == ["安妮·费舍尔", "Annie Fischer"]
+
+
 def test_profile_resolver_adds_live_and_piano_tags() -> None:
     payload = sample_request()
     payload["items"][0]["workTypeHint"] = "chamber_solo"

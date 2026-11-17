@@ -6,7 +6,14 @@ from pathlib import Path
 
 import httpx
 
-from app.services.llm_client import DualModelLlmClient, ModelConfig, OpenAiCompatibleLlmClient, load_llm_config, migrate_legacy_llm_config
+from app.services.llm_client import (
+    DualModelLlmClient,
+    ModelConfig,
+    OpenAiCompatibleLlmClient,
+    ensure_runtime_llm_config,
+    load_llm_config,
+    migrate_legacy_llm_config,
+)
 
 
 def test_load_llm_config_reads_dual_model_shape(tmp_path: Path) -> None:
@@ -69,6 +76,34 @@ def test_migrate_legacy_llm_config_reads_two_entries_and_persists_dual_models(tm
     assert config.reasoning.api_key == "sk-reason"
     assert config.fast.model == "deepseek-chat"
     assert config.fast.api_key == "sk-fast"
+
+
+def test_ensure_runtime_llm_config_bootstraps_from_example_file(tmp_path: Path) -> None:
+    example_path = tmp_path / "llm.example.json"
+    runtime_path = tmp_path / "llm.local.json"
+    example_payload = {
+        "enabled": False,
+        "fastModel": {
+            "enabled": False,
+            "baseUrl": "",
+            "apiKey": "",
+            "model": "",
+            "timeoutMs": 12000,
+        },
+        "reasoningModel": {
+            "enabled": False,
+            "baseUrl": "",
+            "apiKey": "",
+            "model": "",
+            "timeoutMs": 30000,
+        },
+    }
+    example_path.write_text(json.dumps(example_payload), encoding="utf-8")
+
+    result_path = ensure_runtime_llm_config(runtime_path=runtime_path, example_path=example_path)
+
+    assert result_path == runtime_path
+    assert json.loads(runtime_path.read_text(encoding="utf-8")) == example_payload
 
 def test_dual_model_client_flags_realtime_capabilities_based_on_fast_model(tmp_path: Path) -> None:
     payload = {

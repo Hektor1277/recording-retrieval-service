@@ -22,6 +22,10 @@ Kletzki = Paul Kletzki
 安妮·费舍尔 = Annie Fischer
 # 例：安妮·费舍尔 = Annie Fischer
 
+山根弥生子 = 山根美代子 = Miyoko Yamane
+亚历山大·莫吉列夫斯基 = Alexandre Moguilewsky = Alexander Mogilevsky = Alexander Yakovlevich Mogilevsky
+列奥尼德·克鲁策 = Leonid Kreutzer
+
 #composer
 舒曼 = Robert Schumann
 # 例：舒曼 = Robert Schumann

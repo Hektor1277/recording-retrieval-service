@@ -17,7 +17,7 @@ def test_profile_targets_endpoint_returns_editable_source_files() -> None:
     payload = response.json()
     assert Path(payload["highQuality"]["path"]).name == "high-quality.txt"
     assert Path(payload["streaming"]["path"]).name == "streaming.txt"
-    assert Path(payload["llmConfig"]["path"]).name == "LLM config.txt"
+    assert Path(payload["llmConfig"]["path"]).name == "llm.local.json"
     assert Path(payload["orchestraAliases"]["path"]).name == "orchestra-abbreviations.txt"
     assert Path(payload["personAliases"]["path"]).name == "person-name-aliases.txt"
 
@@ -38,7 +38,7 @@ def test_open_profile_endpoint_supports_all_profile_groups(monkeypatch) -> None:
     assert [path.name for path in opened] == [
         "high-quality.txt",
         "streaming.txt",
-        "LLM config.txt",
+        "llm.local.json",
         "orchestra-abbreviations.txt",
         "person-name-aliases.txt",
     ]

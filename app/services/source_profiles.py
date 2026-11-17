@@ -218,7 +218,7 @@ class PersonAliasLoader:
             line = raw_line.strip()
             if not line:
                 continue
-            if line.startswith("#") and not line.startswith("##"):
+            if is_section_header_line(line):
                 section_name = line[1:].strip().lower()
                 if section_name:
                     current_section = section_name
@@ -243,7 +243,7 @@ class PersonAliasLoader:
             line = raw_line.strip()
             if not line:
                 continue
-            if line.startswith("#") and not line.startswith("##"):
+            if is_section_header_line(line):
                 current_section = line[1:].strip().lower() or current_section
                 continue
             if current_section != role_name or line.startswith("#"):
@@ -258,7 +258,7 @@ class PersonAliasLoader:
         section_start = len(lines)
         for index, raw_line in enumerate(lines):
             line = raw_line.strip()
-            if line.startswith("#") and not line.startswith("##"):
+            if is_section_header_line(line):
                 current_section = line[1:].strip().lower() or current_section
                 if current_section == role_name:
                     section_start = index + 1
@@ -266,7 +266,7 @@ class PersonAliasLoader:
         insert_at = len(lines)
         for index in range(section_start, len(lines)):
             line = lines[index].strip()
-            if line.startswith("#") and not line.startswith("##"):
+            if is_section_header_line(line):
                 insert_at = index
                 break
         return insert_at
@@ -281,7 +281,7 @@ class PersonAliasLoader:
         current_section = "global"
         for index, raw_line in enumerate(lines):
             line = raw_line.strip()
-            if line.startswith("#") and not line.startswith("##"):
+            if is_section_header_line(line):
                 current_section = line[1:].strip().lower() or current_section
                 continue
             if current_section != role_name or line.startswith("#"):
@@ -342,7 +342,7 @@ class SourceProfileLoader:
             line = raw_line.strip()
             if not line:
                 continue
-            if line.startswith("#") and not line.startswith("##"):
+            if is_section_header_line(line):
                 section_name = line[1:].strip().lower()
                 if section_name:
                     current_section = section_name
@@ -388,6 +388,10 @@ def parse_source_profile_entry(line: str) -> SourceProfileEntry | None:
 
 def compact(value: str | None) -> str:
     return str(value or "").strip()
+
+
+def is_section_header_line(value: str) -> bool:
+    return value.startswith("#") and not value.startswith("##") and not value.startswith("# ")
 
 
 def dedupe_alias_values(values: list[str]) -> list[str]:

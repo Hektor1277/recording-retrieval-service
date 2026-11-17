@@ -91,6 +91,7 @@ class DraftRecordingEntry:
     lead_names_latin: list[str] = field(default_factory=list)
     ensemble_names: list[str] = field(default_factory=list)
     ensemble_names_latin: list[str] = field(default_factory=list)
+    work_type_hint: str = "unknown"
 
 
 @dataclass(slots=True)
@@ -204,11 +205,13 @@ def build_query_lead_terms(
     secondary_values: list[str],
     *,
     prefer_collaboration: bool = False,
+    max_primary_values: int = 2,
+    max_secondary_values: int = 2,
 ) -> list[str]:
     if primary_values and secondary_values:
         combined: list[str] = []
-        for primary_value in primary_values[:2]:
-            for secondary_value in secondary_values[:2]:
+        for primary_value in primary_values[:max_primary_values]:
+            for secondary_value in secondary_values[:max_secondary_values]:
                 combined.extend(
                     [
                         " ".join([primary_value, secondary_value]).strip(),
@@ -323,7 +326,10 @@ class InputNormalizer:
                 latin_value = primary_label
             elif looks_latin(resolved_name_latin):
                 latin_value = resolved_name_latin
-            latin_variants = build_latin_credit_variants(latin_value, resolved_aliases)
+            alias_expansions = self._person_alias_loader.expand(primary_label, role=role)
+            if resolved_name:
+                alias_expansions.extend(self._person_alias_loader.expand(resolved_name, role=role))
+            latin_variants = build_latin_credit_variants(latin_value, [*resolved_aliases, *alias_expansions])
 
             bucket = resolve_credit_bucket(work_type=work_type, role=role)
             if work_type == "chamber_solo" and role in {"soloist", "instrumentalist", "person"} and primary_names:
@@ -405,15 +411,18 @@ class InputNormalizer:
             ],
         )
         prefer_collaboration = work_type in {"concerto", "chamber_solo", "opera_vocal"}
+        query_variant_limit = 3 if work_type == "chamber_solo" else 2
         query_lead_names = build_query_lead_terms(
             primary_names,
             secondary_names,
             prefer_collaboration=prefer_collaboration,
+            max_primary_values=query_variant_limit,
         )
         query_lead_names_latin = build_query_lead_terms(
             primary_names_latin,
             secondary_names_latin,
             prefer_collaboration=prefer_collaboration,
+            max_primary_values=query_variant_limit,
         )
         if not query_lead_names:
             query_lead_names = leads
@@ -447,6 +456,7 @@ class InputNormalizer:
             lead_names_latin=dedupe_preserve_order(leads_latin),
             ensemble_names=dedupe_preserve_order(ensembles),
             ensemble_names_latin=dedupe_preserve_order(ensembles_latin),
+            work_type_hint=work_type,
         )
 
     def _build_title_inferred_latin_variants(self, inferred_name: str, *, work_type: str) -> list[str]:
@@ -461,7 +471,12 @@ class InputNormalizer:
                         [compact(value) for value in (resolved_person or {}).get("aliases") or [] if compact(value)],
                     )
                 )
-        inferred_role = "conductor" if compact(work_type).lower() == "concerto" else None
+        normalized_work_type = compact(work_type).lower()
+        inferred_role = None
+        if normalized_work_type == "concerto":
+            inferred_role = "conductor"
+        elif normalized_work_type in {"chamber_solo", "opera_vocal"}:
+            inferred_role = "soloist"
         variants.extend(build_latin_credit_variants("", self._person_alias_loader.expand(inferred_name, role=inferred_role)))
         return dedupe_preserve_order(variants)
 
@@ -692,6 +707,23 @@ def build_generic_work_aliases(value: str) -> set[str]:
         aliases.add(stripped)
     if "piano concerto" in stripped:
         aliases.add("piano concerto")
+    return aliases
+
+
+def build_named_work_aliases(value: str) -> set[str]:
+    text = compact(value)
+    lowered = text.lower()
+    if not text:
+        return set()
+    aliases: set[str] = set()
+    if any(marker in lowered or marker in text for marker in ("appassionata", "热情")):
+        aliases.update({"appassionata", "热情", "热情奏鸣曲"})
+    if any(marker in lowered or marker in text for marker in ("spring", "春天")):
+        aliases.update({"spring", "春天", "春天奏鸣曲"})
+    if "piano sonata no.23" in lowered or "piano sonata no 23" in lowered or "op.57" in lowered or "op57" in lowered:
+        aliases.update({"appassionata", "热情", "热情奏鸣曲"})
+    if "violin sonata no.5" in lowered or "violin sonata no 5" in lowered or "op.24" in lowered or "op24" in lowered:
+        aliases.update({"spring", "春天", "春天奏鸣曲"})
     return aliases
 
 
@@ -1116,19 +1148,19 @@ class RetrievalPipeline:
                         record_map,
                         prefer_exactness=ambiguous_upload_cluster,
                     )
-            reference_year = extract_reference_year(draft)
-            if reference_year:
+            reference_years = extract_reference_years(draft)
+            if reference_years:
                 year_matched_links = [
                     candidate
                     for candidate in filtered_links
-                    if not extract_conflicting_year(compact(candidate.title).lower(), reference_year)
+                    if not extract_conflicting_years(compact(candidate.title).lower(), reference_years)
                     or compact(candidate.url) in accepted_url_set
                 ]
                 year_confirmed_links = [
                     candidate
                     for candidate in year_matched_links
                     if compact(candidate.url) in accepted_url_set
-                    or reference_year in compact(candidate.title).lower()
+                    or any(year in compact(candidate.title).lower() for year in reference_years)
                 ]
                 if year_confirmed_links:
                     filtered_links = year_matched_links
@@ -1209,6 +1241,13 @@ class RetrievalPipeline:
                 record_map,
                 prefer_exactness=ambiguous_upload_cluster,
             )
+            filtered_links, added_close_same_platform_complete_alternate = supplement_close_same_platform_complete_alternate_links(
+                draft,
+                filtered_links,
+                raw_link_candidates,
+                record_map,
+                prefer_exactness=ambiguous_upload_cluster,
+            )
             filtered_links = supplement_independent_primary_platform_links(
                 draft,
                 filtered_links,
@@ -1222,6 +1261,23 @@ class RetrievalPipeline:
                 raw_link_candidates,
                 record_map,
                 prefer_exactness=ambiguous_upload_cluster,
+            )
+            filtered_links, added_longform_accepted_platform_alternate = supplement_accepted_platform_longform_alternate_links(
+                draft,
+                filtered_links,
+                raw_link_candidates,
+                accepted_links,
+                record_map,
+                prefer_exactness=ambiguous_upload_cluster,
+            )
+            filtered_links, added_chamber_cross_platform_low_confidence_rescue = (
+                supplement_chamber_cross_platform_low_confidence_rescue_links(
+                    draft,
+                    filtered_links,
+                    raw_link_candidates,
+                    record_map,
+                    prefer_exactness=ambiguous_upload_cluster,
+                )
             )
             if filtered_links and max((candidate.confidence or 0.0) for candidate in filtered_links) < FINAL_LINK_CONFIDENCE_THRESHOLD:
                 rescue_pool = [
@@ -1245,6 +1301,12 @@ class RetrievalPipeline:
             )
             if close_same_platform_alternate:
                 final_link_limit = max(final_link_limit, 3)
+            if added_close_same_platform_complete_alternate:
+                final_link_limit = max(final_link_limit, 3)
+            if added_longform_accepted_platform_alternate:
+                final_link_limit = max(final_link_limit, 3)
+            if added_chamber_cross_platform_low_confidence_rescue:
+                final_link_limit = max(final_link_limit, 3)
             filtered_links, champion_count = prioritize_primary_platform_champions(
                 draft,
                 filtered_links,
@@ -1252,7 +1314,19 @@ class RetrievalPipeline:
             )
             if champion_count:
                 final_link_limit = max(final_link_limit, champion_count)
+            filtered_links = prioritize_accepted_links(
+                filtered_links,
+                accepted_url_set,
+                final_link_limit=final_link_limit,
+            )
             result.links = filtered_links[:final_link_limit]
+            result.links = supplement_chamber_post_final_same_platform_title_rescues(
+                draft,
+                result.links,
+                raw_link_candidates,
+                record_map,
+                max_links=4,
+            )
         if not result.links and accepted_url_set:
             result.links = sort_link_candidates(
                 draft,
@@ -1655,10 +1729,10 @@ def looks_like_year_or_work(value: str) -> bool:
         "歌剧",
         "现场",
         "音乐节",
-        "浜ゅ搷鏇?",
-        "鍗忓鏇?",
-        "濂忛福鏇?",
-        "姝屽墽",
+        "海顿",
+        "布鲁克纳",
+        "贝多芬",
+        "马勒",
     )
     return bool(re.search(r"(19\d{2}|20\d{2})", lowered) or any(token in lowered for token in work_markers))
 
@@ -1668,13 +1742,14 @@ def candidate_title_quality_score(draft: DraftRecordingEntry, title: str) -> flo
     if not lowered:
         return -0.05
     score = 0.0
-    year = extract_reference_year(draft)
-    if year and year in lowered:
+    reference_years = extract_reference_years(draft)
+    if any(year in lowered for year in reference_years):
         score += 0.05
-    elif year and extract_conflicting_year(lowered, year):
+    elif reference_years and extract_conflicting_years(lowered, reference_years):
         score -= 0.05
     work_aliases = build_candidate_work_anchor_terms(draft)
-    if any(alias in lowered for alias in work_aliases):
+    work_alias_hit = any(alias in lowered for alias in work_aliases)
+    if work_alias_hit:
         score += 0.03
     if candidate_mentions_expected_composer(draft, lowered):
         score += 0.05
@@ -1684,8 +1759,18 @@ def candidate_title_quality_score(draft: DraftRecordingEntry, title: str) -> flo
         score -= 0.02
     if candidate_mentions_primary_and_secondary(draft, lowered):
         score += 0.04
-    elif candidate_mentions_any_lead(draft, lowered):
-        score += 0.01
+    else:
+        lead_hit = candidate_mentions_any_lead(draft, lowered)
+        if lead_hit:
+            score += 0.01
+            solo_style_draft = not (
+                draft.secondary_names
+                or draft.secondary_names_latin
+                or draft.ensemble_names
+                or draft.ensemble_names_latin
+            )
+            if solo_style_draft and work_alias_hit:
+                score += 0.03
     if any(marker in lowered for marker in ("new edition", "restored", "remaster", "reissue", "alt take")):
         score -= 0.08
     if any(marker in lowered for marker in ("blu-ray", "bluray", "bd版", "蓝光", "「bd」", "[bd]", "(bd)")):
@@ -1701,10 +1786,10 @@ def candidate_description_support_score(draft: DraftRecordingEntry, description:
     work_aliases = build_candidate_work_anchor_terms(draft)
     has_work_anchor = any(alias in lowered for alias in work_aliases)
     has_expected_composer = candidate_mentions_expected_composer(draft, lowered)
-    year = extract_reference_year(draft)
-    if year and year in lowered:
+    reference_years = extract_reference_years(draft)
+    if any(year in lowered for year in reference_years):
         score += 0.03
-    elif year and extract_conflicting_year(lowered, year):
+    elif reference_years and extract_conflicting_years(lowered, reference_years):
         score -= 0.04
     if has_work_anchor:
         score += 0.02
@@ -1761,6 +1846,10 @@ def candidate_mentions_expected_composer(draft: DraftRecordingEntry, lowered_tit
     composer_cjk = compact(draft.composer_name)
     if composer_cjk and composer_cjk in compact(lowered_title):
         return True
+    if composer_cjk:
+        composer_tokens = tokenize_person_name(composer_cjk)
+        if any(len(token) >= 2 and token in compact(lowered_title) for token in composer_tokens):
+            return True
     return False
 
 
@@ -1772,6 +1861,7 @@ def build_candidate_work_anchor_terms(draft: DraftRecordingEntry) -> set[str]:
         lowered = value.lower()
         values.add(lowered)
         values.update(build_generic_work_aliases(value))
+        values.update(build_named_work_aliases(value))
         latin_alias = build_latin_work_alias(value)
         if latin_alias:
             values.add(latin_alias.lower())
@@ -1784,7 +1874,11 @@ def build_candidate_work_anchor_terms(draft: DraftRecordingEntry) -> set[str]:
         if "协奏曲" in value and "钢琴" in value:
             values.add("钢琴协奏曲")
             values.add("钢协")
-    return {value for value in values if len(value) >= 4}
+    return {
+        value
+        for value in values
+        if len(value) >= 4 or (contains_cjk(value) and len(value) >= 2)
+    }
 
 
 def candidate_mentions_primary_and_secondary(draft: DraftRecordingEntry, lowered_title: str) -> bool:
@@ -1824,16 +1918,81 @@ def candidate_mentions_names(lowered_title: str, values: list[str]) -> bool:
 
 
 def extract_reference_year(draft: DraftRecordingEntry) -> str:
+    years = extract_reference_years(draft)
+    return years[0] if years else ""
+
+
+def extract_reference_years(draft: DraftRecordingEntry) -> list[str]:
+    years: list[str] = []
     for value in (draft.performance_date_text, draft.title, draft.raw_text):
-        match = re.search(r"(17|18|19|20)\d{2}", compact(value))
-        if match:
-            return match.group(0)
-    return ""
+        years.extend(re.findall(r"((?:17|18|19|20)\d{2})", compact(value)))
+    return dedupe_preserve_order(years)
 
 
 def extract_conflicting_year(lowered_title: str, reference_year: str) -> bool:
     years = set(re.findall(r"(?:17|18|19|20)\d{2}", lowered_title))
     return bool(years and reference_year not in years)
+
+
+def extract_conflicting_years(lowered_title: str, reference_years: list[str]) -> bool:
+    years = set(re.findall(r"(?:17|18|19|20)\d{2}", lowered_title))
+    return bool(years and reference_years and years.isdisjoint(set(reference_years)))
+
+
+def extract_month_day_markers(value: str) -> set[str]:
+    normalized = compact(value)
+    if not normalized:
+        return set()
+    markers: set[str] = set()
+    patterns = (
+        r"(?:(?:17|18|19|20)\d{2})\s*[./-]\s*(\d{1,2})\s*[./-]\s*(\d{1,2})",
+        r"(?:(?:17|18|19|20)\d{2})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日?",
+    )
+    for pattern in patterns:
+        for month, day in re.findall(pattern, normalized):
+            markers.add(f"{int(month):02d}-{int(day):02d}")
+    return markers
+
+
+def is_tolerable_chamber_year_typo_candidate(
+    draft: DraftRecordingEntry,
+    candidate: LinkCandidate,
+    record: SourceRecord | None,
+) -> bool:
+    if compact(getattr(draft, "work_type_hint", "")) != "chamber_solo":
+        return False
+    if draft.secondary_names or draft.secondary_names_latin or draft.ensemble_names or draft.ensemble_names_latin:
+        return False
+    reference_markers = extract_month_day_markers(draft.performance_date_text)
+    if not reference_markers:
+        return False
+    support_text = " ".join(
+        part
+        for part in [
+            compact(candidate.title),
+            compact(record.description) if record is not None else "",
+            compact(record.uploader) if record is not None else "",
+        ]
+        if part
+    ).lower()
+    if not support_text:
+        return False
+    if not candidate_mentions_any_lead(draft, support_text):
+        return False
+    if candidate_conflicting_credit_tokens(draft, support_text):
+        return False
+    normalized_support_text = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", support_text)
+    work_supported = any(
+        compact(alias).lower() in support_text
+        or re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", compact(alias).lower()) in normalized_support_text
+        for alias in build_candidate_work_anchor_terms(draft)
+        if compact(alias)
+    )
+    if not work_supported:
+        return False
+    if not (reference_markers & extract_month_day_markers(support_text)):
+        return False
+    return candidate_match_quality_score(draft, candidate, record) >= 0.12
 
 
 def has_ambiguous_upload_cluster(draft: DraftRecordingEntry, candidates: list[LinkCandidate]) -> bool:
@@ -1941,11 +2100,14 @@ def candidate_inferred_people(draft: DraftRecordingEntry, title: str) -> list[st
 
 
 def candidate_conflicting_credit_tokens(draft: DraftRecordingEntry, title: str) -> set[str]:
-    inferred_people = candidate_inferred_people(draft, title)
+    inferred_people = [
+        strip_title_credit_role_prefix(person)
+        for person in candidate_inferred_people(draft, title)
+    ]
     inferred_people = [
         person
         for person in inferred_people
-        if not looks_like_year_or_work(person) and not looks_like_ensemble_name(person)
+        if compact(person) and not looks_like_year_or_work(person) and not looks_like_ensemble_name(person)
     ]
     if not inferred_people:
         return set()
@@ -1966,9 +2128,52 @@ def candidate_conflicting_credit_tokens(draft: DraftRecordingEntry, title: str) 
         return {token.lower() for person in unmatched_people for token in tokenize_person_name(person)}
     if not matched_people and len(unmatched_people) == 1 and work_anchor:
         person = unmatched_people[0]
-        if len(tokenize_person_name(person)) >= 2:
+        person_tokens = [token.lower() for token in tokenize_person_name(person)]
+        composer_tokens = {
+            token.lower()
+            for value in [compact(draft.composer_name), compact(draft.composer_name_latin)]
+            for token in tokenize_person_name(value)
+            if compact(token)
+        }
+        work_like_tokens = {
+            "piano",
+            "violin",
+            "cello",
+            "concerto",
+            "concertos",
+            "sonata",
+            "sonatas",
+            "symphony",
+            "symphonies",
+            "op",
+        }
+        person_token_set = set(person_tokens)
+        safe_token_set = composer_tokens | work_like_tokens
+        is_composer_work_prefix = bool(person_token_set) and person_token_set.issubset(safe_token_set)
+        # Avoid false red-zone conflicts for titles such as
+        # "Beethoven: Piano Sonata No. 23 ...", where inferred prefix tokens are
+        # fully explained by composer/work labels rather than a conflicting performer.
+        if len(person_tokens) >= 2 and not is_composer_work_prefix:
             return {token.lower() for token in tokenize_person_name(person)}
     return set()
+
+
+def strip_title_credit_role_prefix(value: str) -> str:
+    normalized = compact(value)
+    if not normalized:
+        return ""
+    return re.sub(
+        (
+            r"^(?:"
+            r"演奏者|演奏|表演者|指挥|钢琴|钢琴家|小提琴|小提琴家|中提琴|大提琴|乐团|"
+            r"performer|performed by|player|played by|conductor|piano|pianist|violin|violinist|"
+            r"viola|violist|cello|cellist"
+            r")\s*[:：-]\s*"
+        ),
+        "",
+        normalized,
+        flags=re.I,
+    ).strip()
 
 
 def looks_like_year_or_work(value: str) -> bool:
@@ -1988,10 +2193,10 @@ def looks_like_year_or_work(value: str) -> bool:
         "歌剧",
         "现场",
         "音乐节",
-        "浜ゅ搷鏇?",
-        "鍗忓鏇?",
-        "濂忛福鏇?",
-        "姝屽墽",
+        "海顿",
+        "布鲁克纳",
+        "贝多芬",
+        "马勒",
     )
     return bool(re.search(r"(19\d{2}|20\d{2})", lowered) or any(token in lowered for token in work_markers))
 
@@ -2049,9 +2254,9 @@ def is_independently_finalizable_primary_candidate(
         return False
     if candidate_conflicting_credit_tokens(draft, support_text):
         return False
-    reference_year = extract_reference_year(draft)
+    reference_years = extract_reference_years(draft)
     year_haystack = compact(candidate.title).lower() if is_apple_track_url(candidate.url) else support_text
-    if reference_year and extract_conflicting_year(year_haystack, reference_year):
+    if reference_years and extract_conflicting_years(year_haystack, reference_years):
         return False
     if (
         candidate_description_support_score(draft, compact(record.description)) <= 0
@@ -2096,13 +2301,17 @@ def candidate_year_conflicts_reference(
     candidate: LinkCandidate,
     record: SourceRecord | None,
 ) -> bool:
-    reference_year = extract_reference_year(draft)
-    if not reference_year:
+    reference_years = extract_reference_years(draft)
+    if not reference_years:
         return False
     haystack = compact(candidate.title).lower()
     if record is not None and not is_apple_track_url(candidate.url):
         haystack = " ".join(part for part in [haystack, compact(record.description).lower()] if part)
-    return extract_conflicting_year(haystack, reference_year)
+    if not extract_conflicting_years(haystack, reference_years):
+        return False
+    if is_tolerable_chamber_year_typo_candidate(draft, candidate, record):
+        return False
+    return True
 
 
 def annotate_link_candidates(
@@ -2157,7 +2366,7 @@ def supplement_primary_platform_links(
         PRIMARY_PLATFORM_COMPLETION_CONFIDENCE_THRESHOLD,
         best_anchor_confidence - PRIMARY_PLATFORM_COMPLETION_CONFIDENCE_GAP,
     )
-    reference_year = extract_reference_year(draft)
+    reference_years = extract_reference_years(draft)
     existing_urls = {compact(candidate.url) for candidate in filtered_links}
     additions: list[LinkCandidate] = []
 
@@ -2171,8 +2380,8 @@ def supplement_primary_platform_links(
             and candidate_title_quality_score(draft, compact(candidate.title)) >= exactness_floor - 1e-6
             and candidate_context_match_count(draft, compact(candidate.title)) > best_anchor_context
             and (
-                not reference_year
-                or not extract_conflicting_year(compact(candidate.title).lower(), reference_year)
+                not reference_years
+                or not extract_conflicting_years(compact(candidate.title).lower(), reference_years)
             )
         ]
         if not platform_candidates:
@@ -2211,7 +2420,6 @@ def supplement_independent_primary_platform_links(
         if compact(candidate.platform) in PRIMARY_COMPLETION_PLATFORMS
     }
     additions: list[LinkCandidate] = []
-    reference_year = extract_reference_year(draft)
 
     for platform in PRIMARY_COMPLETION_PLATFORMS - represented_platforms:
         platform_candidates = [
@@ -2311,6 +2519,330 @@ def supplement_complete_upload_rescue_links(
     )
 
 
+def supplement_close_same_platform_complete_alternate_links(
+    draft: DraftRecordingEntry,
+    filtered_links: list[LinkCandidate],
+    link_candidates: list[LinkCandidate],
+    record_map: dict[str, SourceRecord],
+    *,
+    prefer_exactness: bool = False,
+) -> tuple[list[LinkCandidate], bool]:
+    if len(filtered_links) < 2:
+        return filtered_links, False
+    chamber_work_text = " ".join(
+        value.casefold()
+        for value in [compact(draft.work_title_latin), compact(draft.work_title)]
+        if compact(value)
+    )
+    if not any(token in chamber_work_text for token in ("sonata", "quartet", "trio", "奏鸣曲", "四重奏", "三重奏")):
+        return filtered_links, False
+
+    represented_platforms = {
+        compact(candidate.platform)
+        for candidate in filtered_links
+        if compact(candidate.platform) in PRIMARY_COMPLETION_PLATFORMS
+    }
+    if len(represented_platforms) != 1:
+        return filtered_links, False
+
+    target_platform = next(iter(represented_platforms))
+    anchor_links = [
+        candidate
+        for candidate in filtered_links
+        if compact(candidate.platform) == target_platform
+        and not looks_like_title_single_movement(compact(candidate.title))
+        and candidate_packaging_priority_score(candidate, record_map.get(compact(candidate.url))) >= 0.0
+    ]
+    if len(anchor_links) < 2:
+        return filtered_links, False
+
+    anchor_exactness_scores = sorted(
+        (
+            candidate_match_quality_score(draft, candidate, record_map.get(compact(candidate.url)))
+            for candidate in anchor_links
+        ),
+        reverse=True,
+    )
+    reference_anchor_exactness = anchor_exactness_scores[min(1, len(anchor_exactness_scores) - 1)]
+    anchor_durations = [
+        record_map.get(compact(candidate.url)).duration_seconds
+        for candidate in anchor_links
+        if record_map.get(compact(candidate.url)) is not None
+        and record_map.get(compact(candidate.url)).duration_seconds > 0
+    ]
+    duration_floor = max(600, int(max(anchor_durations) * 0.75)) if anchor_durations else 0
+    rescue_floor = max(0.08, reference_anchor_exactness - 0.06)
+    existing_urls = {compact(candidate.url) for candidate in filtered_links}
+    rescue_candidates = [
+        candidate
+        for candidate in link_candidates
+        if compact(candidate.url) not in existing_urls
+        and compact(candidate.platform) == target_platform
+        and (candidate.confidence or 0.0) >= LOW_CONFIDENCE_THRESHOLD
+        and not candidate_year_conflicts_reference(
+            draft,
+            candidate,
+            record_map.get(compact(candidate.url)),
+        )
+        and classify_link_candidate_zone(draft, candidate)[0] != "red"
+        and not looks_like_title_single_movement(compact(candidate.title))
+        and candidate_packaging_priority_score(candidate, record_map.get(compact(candidate.url))) >= 0.0
+        and (
+            duration_floor <= 0
+            or record_map.get(compact(candidate.url)) is None
+            or record_map.get(compact(candidate.url)).duration_seconds <= 0
+            or record_map.get(compact(candidate.url)).duration_seconds >= duration_floor
+        )
+        and candidate_match_quality_score(draft, candidate, record_map.get(compact(candidate.url)))
+        >= rescue_floor - 1e-6
+    ]
+    if not rescue_candidates:
+        return filtered_links, False
+
+    best_candidate = sort_link_candidates(
+        draft,
+        rescue_candidates,
+        record_map,
+        prefer_exactness=True,
+    )[0]
+    return (
+        sort_link_candidates(
+            draft,
+            dedupe_link_candidates([*filtered_links, best_candidate]),
+            record_map,
+            prefer_exactness=prefer_exactness,
+        ),
+        True,
+    )
+
+
+def supplement_accepted_platform_longform_alternate_links(
+    draft: DraftRecordingEntry,
+    filtered_links: list[LinkCandidate],
+    link_candidates: list[LinkCandidate],
+    accepted_links: list[LinkCandidate],
+    record_map: dict[str, SourceRecord],
+    *,
+    prefer_exactness: bool = False,
+) -> tuple[list[LinkCandidate], bool]:
+    if not filtered_links or not accepted_links:
+        return filtered_links, False
+
+    existing_urls = {compact(candidate.url) for candidate in filtered_links}
+    additions: list[LinkCandidate] = []
+    accepted_by_platform: dict[str, list[LinkCandidate]] = defaultdict(list)
+    for candidate in accepted_links:
+        platform = compact(candidate.platform)
+        if platform in PRIMARY_COMPLETION_PLATFORMS:
+            accepted_by_platform[platform].append(candidate)
+
+    for platform, platform_accepted in accepted_by_platform.items():
+        accepted_durations = [
+            record_map.get(compact(candidate.url)).duration_seconds
+            for candidate in platform_accepted
+            if record_map.get(compact(candidate.url)) is not None
+            and record_map.get(compact(candidate.url)).duration_seconds > 0
+        ]
+        if not accepted_durations:
+            continue
+        best_accepted_confidence = max((candidate.confidence or 0.0) for candidate in platform_accepted)
+        best_accepted_exactness = max(
+            candidate_match_quality_score(draft, candidate, record_map.get(compact(candidate.url)))
+            for candidate in platform_accepted
+        )
+        longest_accepted_duration = max(accepted_durations)
+        rescue_candidates = [
+            candidate
+            for candidate in link_candidates
+            if compact(candidate.url) not in existing_urls
+            and compact(candidate.platform) == platform
+            and (candidate.confidence or 0.0) >= max(LOW_CONFIDENCE_THRESHOLD, best_accepted_confidence - 0.05)
+            and not candidate_year_conflicts_reference(
+                draft,
+                candidate,
+                record_map.get(compact(candidate.url)),
+            )
+            and classify_link_candidate_zone(draft, candidate)[0] != "red"
+            and not looks_like_title_single_movement(compact(candidate.title))
+            and (
+                record_map.get(compact(candidate.url)) is not None
+                and record_map.get(compact(candidate.url)).duration_seconds >= int(longest_accepted_duration * 1.35)
+            )
+            and candidate_match_quality_score(draft, candidate, record_map.get(compact(candidate.url)))
+            >= max(0.0, best_accepted_exactness - 0.05 - 1e-6)
+        ]
+        if not rescue_candidates:
+            continue
+        best_candidate = max(
+            rescue_candidates,
+            key=lambda candidate: (
+                record_map.get(compact(candidate.url)).duration_seconds if record_map.get(compact(candidate.url)) else 0,
+                candidate_match_quality_score(draft, candidate, record_map.get(compact(candidate.url))),
+                candidate.confidence or 0.0,
+            ),
+        )
+        additions.append(best_candidate)
+        existing_urls.add(compact(best_candidate.url))
+
+    if not additions:
+        return filtered_links, False
+    return (
+        sort_link_candidates(
+            draft,
+            dedupe_link_candidates([*filtered_links, *additions]),
+            record_map,
+            prefer_exactness=prefer_exactness,
+        ),
+        True,
+    )
+
+
+def supplement_chamber_cross_platform_low_confidence_rescue_links(
+    draft: DraftRecordingEntry,
+    filtered_links: list[LinkCandidate],
+    link_candidates: list[LinkCandidate],
+    record_map: dict[str, SourceRecord],
+    *,
+    prefer_exactness: bool = False,
+) -> tuple[list[LinkCandidate], bool]:
+    if compact(getattr(draft, "work_type_hint", "")).lower() != "chamber_solo":
+        return filtered_links, False
+    if not filtered_links or len(filtered_links) >= 3:
+        return filtered_links, False
+
+    represented_platforms = {
+        compact(candidate.platform)
+        for candidate in filtered_links
+        if compact(candidate.platform) in {"youtube", "bilibili"}
+    }
+    if len(represented_platforms) != 1:
+        return filtered_links, False
+
+    anchor = filtered_links[0]
+    anchor_platform = compact(anchor.platform)
+    if anchor_platform not in {"youtube", "bilibili"}:
+        return filtered_links, False
+    anchor_record = record_map.get(compact(anchor.url))
+    anchor_title_exactness = candidate_title_quality_score(draft, compact(anchor.title))
+    confidence_floor = max(0.58, (anchor.confidence or 0.0) - 0.16)
+    title_exactness_floor = max(0.02, anchor_title_exactness - 0.08)
+
+    existing_urls = {compact(candidate.url) for candidate in filtered_links}
+    rescue_pool = [
+        candidate
+        for candidate in link_candidates
+        if compact(candidate.url) not in existing_urls
+        and compact(candidate.platform) in {"youtube", "bilibili"}
+        and compact(candidate.platform) != anchor_platform
+        and (candidate.confidence or 0.0) >= confidence_floor
+        and not candidate_year_conflicts_reference(
+            draft,
+            candidate,
+            record_map.get(compact(candidate.url)),
+        )
+        and classify_link_candidate_zone(draft, candidate)[0] != "red"
+        and candidate_title_quality_score(draft, compact(candidate.title)) >= title_exactness_floor - 1e-6
+    ]
+    if len(rescue_pool) < 2:
+        return filtered_links, False
+
+    grouped: dict[str, list[LinkCandidate]] = defaultdict(list)
+    for candidate in rescue_pool:
+        grouped[compact(candidate.platform)].append(candidate)
+    if not grouped:
+        return filtered_links, False
+
+    target_platform = max(
+        grouped.keys(),
+        key=lambda platform: (
+            len(grouped[platform]),
+            max((candidate.confidence or 0.0) for candidate in grouped[platform]),
+        ),
+    )
+    selected_rescues = sort_link_candidates(
+        draft,
+        grouped[target_platform],
+        record_map,
+        prefer_exactness=True,
+    )[:2]
+    if len(selected_rescues) < 2:
+        return filtered_links, False
+
+    return (
+        sort_link_candidates(
+            draft,
+            dedupe_link_candidates([*filtered_links, *selected_rescues]),
+            record_map,
+            prefer_exactness=prefer_exactness,
+        ),
+        True,
+    )
+
+
+def supplement_chamber_post_final_same_platform_title_rescues(
+    draft: DraftRecordingEntry,
+    final_links: list[LinkCandidate],
+    link_candidates: list[LinkCandidate],
+    record_map: dict[str, SourceRecord],
+    *,
+    max_links: int = 4,
+) -> list[LinkCandidate]:
+    if compact(getattr(draft, "work_type_hint", "")).lower() != "chamber_solo":
+        return final_links
+    if len(final_links) >= max_links:
+        return final_links
+
+    primary_video_links = [
+        candidate
+        for candidate in final_links
+        if compact(candidate.platform) in {"youtube", "bilibili"}
+    ]
+    if not primary_video_links:
+        return final_links
+
+    platform_counts = Counter(compact(candidate.platform) for candidate in primary_video_links)
+    anchor_platform = max(
+        platform_counts.keys(),
+        key=lambda platform: (
+            platform_counts[platform],
+            max(
+                (
+                    candidate.confidence or 0.0
+                    for candidate in primary_video_links
+                    if compact(candidate.platform) == platform
+                ),
+                default=0.0,
+            ),
+        ),
+    )
+    anchor_title_exactness = max(
+        candidate_title_quality_score(draft, compact(candidate.title))
+        for candidate in primary_video_links
+        if compact(candidate.platform) == anchor_platform
+    )
+    title_floor = max(0.08, anchor_title_exactness - 0.02)
+    existing_urls = {compact(candidate.url) for candidate in final_links}
+    rescue_candidates = [
+        candidate
+        for candidate in link_candidates
+        if compact(candidate.url) not in existing_urls
+        and compact(candidate.platform) == anchor_platform
+        and LOW_CONFIDENCE_THRESHOLD <= (candidate.confidence or 0.0) < FINAL_LINK_CONFIDENCE_THRESHOLD
+        and candidate_title_quality_score(draft, compact(candidate.title)) >= title_floor - 1e-6
+        and classify_link_candidate_zone(draft, candidate)[0] != "red"
+    ]
+    if not rescue_candidates:
+        return final_links
+
+    selected_rescue = sort_link_candidates(
+        draft,
+        rescue_candidates,
+        record_map,
+        prefer_exactness=True,
+    )[0]
+    return dedupe_link_candidates([*final_links, selected_rescue])[:max_links]
+
+
 def supplement_apple_track_version_rescues(
     draft: DraftRecordingEntry,
     filtered_links: list[LinkCandidate],
@@ -2379,6 +2911,27 @@ def prioritize_primary_platform_champions(
     prioritized = [candidate for candidate in candidates if compact(candidate.url) in champion_set]
     prioritized.extend(candidate for candidate in candidates if compact(candidate.url) not in champion_set)
     return prioritized, len(champion_urls)
+
+
+def prioritize_accepted_links(
+    candidates: list[LinkCandidate],
+    accepted_url_set: set[str],
+    *,
+    final_link_limit: int,
+) -> list[LinkCandidate]:
+    if not accepted_url_set:
+        return candidates
+    accepted_candidates = [
+        candidate for candidate in candidates if compact(candidate.url) in accepted_url_set
+    ]
+    if not accepted_candidates or len(accepted_candidates) < max(1, final_link_limit):
+        return candidates
+    accepted_candidate_urls = {compact(candidate.url) for candidate in accepted_candidates}
+    prioritized = list(accepted_candidates)
+    prioritized.extend(
+        candidate for candidate in candidates if compact(candidate.url) not in accepted_candidate_urls
+    )
+    return prioritized
 
 
 def pick_version_rescue_links(
@@ -2774,9 +3327,9 @@ def looks_like_year_or_work(value: str) -> bool:
         "歌剧",
         "现场",
         "音乐节",
-        "浜ゅ搷鏇?",
-        "鍗忓鏇?",
-        "濂忛福鏇?",
-        "姝屽墽",
+        "海顿",
+        "布鲁克纳",
+        "贝多芬",
+        "马勒",
     )
     return bool(re.search(r"(19\d{2}|20\d{2})", lowered) or any(token in lowered for token in work_markers))

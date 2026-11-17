@@ -11,12 +11,12 @@
 
 - 存放工具自己的源码、依赖、缓存、日志、下载产物和打包脚本。
 - 不直接读写主项目的 `apps/`、`packages/`、`data/` 或 `apps/site/public/`。
-- 与父项目的唯一正式集成面仍是 [`PROTOCOL.md`](/E:/Workspace/codex/Introduction%20to%20Classical%20Music/tools/recording-retrieval-service/PROTOCOL.md) 定义的本地 HTTP 协议。
+- 与父项目的唯一正式集成面仍是 [`PROTOCOL.md`](../PROTOCOL.md) 定义的本地 HTTP 协议。
 
 ## 阅读顺序
 
-1. [`PROJECT_CONTEXT.md`](/E:/Workspace/codex/Introduction%20to%20Classical%20Music/tools/recording-retrieval-service/PROJECT_CONTEXT.md)
-2. [`PROTOCOL.md`](/E:/Workspace/codex/Introduction%20to%20Classical%20Music/tools/recording-retrieval-service/PROTOCOL.md)
+1. [`PROJECT_CONTEXT.md`](../PROJECT_CONTEXT.md)
+2. [`PROTOCOL.md`](../PROTOCOL.md)
 3. 本文件
 
 ## 当前实现
@@ -100,10 +100,20 @@ tools/recording-retrieval-service/
 便携包脚本位于 `packaging/build-portable.ps1`，当前策略是：
 
 - 使用 `PyInstaller onedir`（单目录可执行包）生成 `recording-retrieval-service.exe`
+- 数据文件只打包 `packaging/materials-whitelist.json` 白名单内的非敏感材料（来源规则/别名文件）；**不打包**整个 `materials/`，用户本地配置、密钥、缓存与下载目录一律不进包
 - 附带 `start-service.cmd` 与 `start-ui.cmd`
 - 每次输出新的发布目录到 `dist/releases/`
 - 同时刷新 `dist/portable/`，它始终指向当前最新的一份便携目录
 - 同时生成一个可直接交付的 `dist/recording-retrieval-service-portable-<timestamp>.zip`
+- 构建后在包内写入 `build-info.json`（应用版本、git commit/worktree 状态、Python/PyInstaller 版本、materials 白名单与 `requirements.lock` 哈希、包目录摘要），并在 zip 旁生成 `<zip>.build-info.json`（附 zip SHA256）
+
+## 版本、依赖与构建追溯
+
+- 版本单一来源：`app/version.py` 的 `APP_VERSION`；`pyproject.toml` 通过 `dynamic = ["version"]` 读取，`/health` 与 `PROTOCOL.md` 示例一致（由 `tests/test_build_info.py` 断言）。
+- 依赖：`requirements.in` 记录直接依赖范围；`requirements.lock` 为 **BLOCKED 的精确 pin 草案**（本机无网络/未安装依赖时无法生成真实 lock，未伪造可复现结果）。生成真实 lock 的方法写在文件头注释中。
+- 内嵌仓库为可追溯的干净提交：父仓库 `tools/recording-retrieval-service/app/**` 快照与内嵌仓库 HEAD 对齐（见父仓库 `docs/` 与 remediation 证据）。
+- 离线回归：`.github/workflows/ci.yml` 在安装 `[dev]` 依赖后运行 `python -m compileall -q app` 与 `python -m pytest -m "not network" -q`；真实平台测试应标记 `@pytest.mark.network`（标记已在 `pyproject.toml` 声明）。
+- 本地凭据：`config/*.local.json`、旧路径 `materials/source-profiles/LLM config.txt` 已在 `.gitignore` 排除，禁止提交。
 
 启动建议：
 

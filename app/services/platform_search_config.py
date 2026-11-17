@@ -7,6 +7,13 @@ from pathlib import Path
 from typing import Any
 
 
+def runtime_config_root() -> Path:
+    app_data_dir = str(os.getenv("ICM_APP_DATA_DIR", "")).strip()
+    if app_data_dir:
+        return Path(app_data_dir).resolve() / "retrieval-service" / "config"
+    return Path(__file__).resolve().parents[2] / "config"
+
+
 @dataclass(slots=True)
 class YouTubeSearchConfig:
     enabled: bool = True
@@ -41,7 +48,7 @@ class PlatformSearchConfig:
 
 
 def default_platform_search_config_path() -> Path:
-    return Path(__file__).resolve().parents[2] / "config" / "platform-search.local.json"
+    return runtime_config_root() / "platform-search.local.json"
 
 
 def load_platform_search_config(path: Path | None = None) -> PlatformSearchConfig:
@@ -53,6 +60,11 @@ def load_platform_search_config(path: Path | None = None) -> PlatformSearchConfi
     youtube_payload = dict(payload.get("youtube") or {})
     apple_payload = dict(payload.get("appleMusic") or payload.get("apple_music") or {})
     bilibili_payload = dict(payload.get("bilibili") or {})
+
+    storage_state_path = _string_value(
+        os.getenv("RECORDING_RETRIEVAL_BILIBILI_STORAGE_STATE_PATH", ""),
+        bilibili_payload.get("storageStatePath"),
+    )
 
     return PlatformSearchConfig(
         enabled=_bool_value(payload.get("enabled"), True),
@@ -86,10 +98,7 @@ def load_platform_search_config(path: Path | None = None) -> PlatformSearchConfi
                 bilibili_payload.get("referer"),
                 "https://www.bilibili.com",
             ),
-            storage_state_path=_string_value(
-                os.getenv("RECORDING_RETRIEVAL_BILIBILI_STORAGE_STATE_PATH", ""),
-                bilibili_payload.get("storageStatePath"),
-            ),
+            storage_state_path=storage_state_path,
         ),
     )
 

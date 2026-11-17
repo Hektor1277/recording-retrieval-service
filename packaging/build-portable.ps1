@@ -35,10 +35,59 @@ Copy-Item -Force (Join-Path $root "packaging\portable-start-service.cmd") (Join-
 Copy-Item -Force (Join-Path $root "packaging\portable-start-ui.cmd") (Join-Path $bundle "start-ui.cmd")
 Copy-Item -Force (Join-Path $root "packaging\portable-start-service.cmd") (Join-Path $latestBundle "start-service.cmd")
 Copy-Item -Force (Join-Path $root "packaging\portable-start-ui.cmd") (Join-Path $latestBundle "start-ui.cmd")
+
+$sensitiveLegacyLlmPaths = @(
+  (Join-Path $bundle "_internal\materials\source-profiles\LLM config.txt"),
+  (Join-Path $latestBundle "_internal\materials\source-profiles\LLM config.txt")
+)
+foreach ($legacyLlmPath in $sensitiveLegacyLlmPaths) {
+  if (Test-Path $legacyLlmPath) {
+    Remove-Item -Force $legacyLlmPath
+  }
+}
+
+# Defense in depth (W1b): the PyInstaller spec only packs the explicit
+# `packaging/materials-whitelist.json` allow-list, so the checks below must pass
+# without relying on the compatibility deletion above. A regression in the spec
+# fails the build instead of silently shipping user-local config or secrets.
+$verifyScript = Join-Path $PSScriptRoot "assert-portable-bundle.ps1"
+if (-not (Test-Path -LiteralPath $verifyScript)) {
+  throw "Missing portable bundle verification script: $verifyScript"
+}
+foreach ($bundleRoot in @($bundle, $latestBundle)) {
+  & $verifyScript -BundleRoot $bundleRoot -WhitelistPath (Join-Path $PSScriptRoot "materials-whitelist.json")
+  if ($LASTEXITCODE -ne 0) {
+    throw "Portable bundle verification failed: $bundleRoot"
+  }
+}
+
+# Build provenance (W7b): record app/git/python/PyInstaller versions, material
+# allow-list and requirements-lock hashes, and a digest of the emitted bundle.
+$pyinstallerVersion = ""
+try {
+  $pyinstallerVersion = (& $python -m PyInstaller --version 2>$null | Select-Object -First 1)
+} catch {
+  $pyinstallerVersion = "unknown"
+}
+$buildInfoPath = Join-Path $bundle "build-info.json"
+& $python (Join-Path $root "app\build_info.py") --app-root $root --bundle-dir $bundle --output $buildInfoPath --pyinstaller-version "$pyinstallerVersion"
+if ($LASTEXITCODE -ne 0) {
+  throw "build-info.json generation failed"
+}
+Copy-Item -Force $buildInfoPath (Join-Path $latestBundle "build-info.json")
+
 if (Test-Path $zipPath) {
   Remove-Item -Force $zipPath
 }
 Compress-Archive -Path (Join-Path $bundle '*') -DestinationPath $zipPath
+$zipSha256 = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+$zipBuildInfoPath = "$zipPath.build-info.json"
+& $python (Join-Path $root "app\build_info.py") --app-root $root --bundle-dir $bundle --output $zipBuildInfoPath --pyinstaller-version "$pyinstallerVersion" --portable-zip-sha256 $zipSha256
+if ($LASTEXITCODE -ne 0) {
+  throw "portable zip build-info.json generation failed"
+}
+Write-Host "Build info: $buildInfoPath"
+Write-Host "Zip build info: $zipBuildInfoPath"
 Write-Host "Portable directory: $bundle"
 Write-Host "Latest portable directory: $latestBundle"
 Write-Host "Portable zip: $zipPath"

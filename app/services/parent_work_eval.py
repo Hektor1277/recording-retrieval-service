@@ -26,6 +26,7 @@ GROUND_TRUTH_PLATFORM_ALIASES = {
     "apple-music": "apple_music",
     "apple_music": "apple_music",
 }
+EVAL_TARGET_OVERRIDE_FILE = "eval-target-overrides.json"
 
 
 @dataclass(slots=True)
@@ -49,6 +50,27 @@ def compact(value: object) -> str:
     return str(value or "").strip()
 
 
+def load_selector_values(*, inline_values: str = "", values_file: str = "") -> list[str]:
+    ordered_values: list[str] = []
+    seen: set[str] = set()
+
+    def add_value(raw_value: object) -> None:
+        value = compact(raw_value)
+        if not value or value in seen:
+            return
+        seen.add(value)
+        ordered_values.append(value)
+
+    for chunk in str(inline_values or "").replace("\n", ",").split(","):
+        add_value(chunk)
+
+    if values_file:
+        for line in Path(values_file).read_text(encoding="utf-8").splitlines():
+            add_value(line)
+
+    return ordered_values
+
+
 def workspace_root() -> Path:
     current = Path(__file__).resolve()
     for parent in current.parents:
@@ -62,9 +84,65 @@ def load_library_json(name: str, base_path: Path | None = None) -> list[dict]:
     return json.loads((root / name).read_text(encoding="utf-8"))
 
 
+def _resolve_eval_target_override_path() -> Path | None:
+    current = Path(__file__).resolve()
+    for parent in current.parents:
+        candidate = parent / "materials" / EVAL_TARGET_OVERRIDE_FILE
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def load_eval_target_overrides() -> dict[str, dict[str, list[str]]]:
+    path = _resolve_eval_target_override_path()
+    if path is None:
+        return {}
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        return {}
+
+    normalized: dict[str, dict[str, list[str]]] = {}
+    for raw_recording_id, raw_variants in payload.items():
+        recording_id = compact(raw_recording_id)
+        if not recording_id or not isinstance(raw_variants, dict):
+            continue
+        variant_map: dict[str, list[str]] = {}
+        for raw_variant, raw_urls in raw_variants.items():
+            variant = compact(raw_variant)
+            if not variant or not isinstance(raw_urls, list):
+                continue
+            urls = [compact(url) for url in raw_urls if compact(url)]
+            if urls:
+                variant_map[variant] = urls
+        if variant_map:
+            normalized[recording_id] = variant_map
+    return normalized
+
+
+def apply_eval_target_overrides(recordings: dict[str, dict]) -> dict[str, dict]:
+    overrides = load_eval_target_overrides()
+    if not overrides:
+        return recordings
+
+    patched = dict(recordings)
+    for recording_id, variant_overrides in overrides.items():
+        recording = patched.get(recording_id)
+        if not isinstance(recording, dict):
+            continue
+        merged = dict(recording)
+        existing = merged.get("evalTargetUrlsByVariant")
+        existing_map = dict(existing) if isinstance(existing, dict) else {}
+        existing_map.update(variant_overrides)
+        merged["evalTargetUrlsByVariant"] = existing_map
+        patched[recording_id] = merged
+    return patched
+
+
 def load_library_indices(base_path: Path | None = None) -> tuple[dict[str, dict], dict[str, dict], dict[str, dict]]:
     root = base_path or workspace_root() / "data" / "library"
     recordings = {item["id"]: item for item in load_library_json("recordings.json", root)}
+    recordings = apply_eval_target_overrides(recordings)
     works = {item["id"]: item for item in load_library_json("works.json", root)}
     composers = {item["id"]: item for item in load_library_json("composers.json", root)}
     return recordings, works, composers
@@ -220,6 +298,31 @@ def supported_target_urls(recording: dict, allowed_canonicals: set[str] | None =
     return targets
 
 
+def supported_target_urls_for_variant(
+    recording: dict,
+    *,
+    variant: str,
+    allowed_canonicals: set[str] | None = None,
+) -> list[str]:
+    overrides = recording.get("evalTargetUrlsByVariant")
+    if isinstance(overrides, dict):
+        variant_urls = overrides.get(variant)
+        if isinstance(variant_urls, list):
+            targets: list[str] = []
+            seen: set[str] = set()
+            for raw_url in variant_urls:
+                canonical = canonicalize_url(str(raw_url or "").strip())
+                if not canonical or canonical in seen:
+                    continue
+                if allowed_canonicals is not None and canonical not in allowed_canonicals:
+                    continue
+                seen.add(canonical)
+                targets.append(canonical)
+            if targets:
+                return targets
+    return supported_target_urls(recording, allowed_canonicals=allowed_canonicals)
+
+
 def build_allowed_targets_by_recording(
     rows: list[dict],
     *,
@@ -262,6 +365,19 @@ def build_source_line(
     return " | ".join(part for part in parts if part)
 
 
+def strip_performance_date_from_title(title: str, performance_date_text: str) -> str:
+    normalized_title = compact(title)
+    normalized_date = compact(performance_date_text)
+    if not normalized_title or not normalized_date or normalized_date not in normalized_title:
+        return normalized_title
+    pieces = [
+        piece.strip(" \t-–—_/|,;:()[]{}")
+        for piece in normalized_title.split(normalized_date)
+    ]
+    cleaned = " ".join(piece for piece in pieces if piece).strip()
+    return cleaned or normalized_title
+
+
 def build_retrieval_item(
     *,
     recording: dict,
@@ -271,6 +387,7 @@ def build_retrieval_item(
     work_type_hint: str,
     roles: list[RoleInput],
     performance_date_text: str,
+    seed_title: str = "",
 ) -> RetrievalItem:
     source_line = build_source_line(
         composer=composer,
@@ -286,7 +403,7 @@ def build_retrieval_item(
         workTypeHint=work_type_hint,
         sourceLine=source_line,
         seed=Seed(
-            title=str(recording.get("title") or source_line),
+            title=compact(seed_title) or str(recording.get("title") or source_line),
             composerName=str(composer.get("name") or ""),
             composerNameLatin=str(composer.get("nameLatin") or ""),
             workTitle=str(work.get("title") or ""),
@@ -325,7 +442,7 @@ def build_recording_scenarios(
     full_roles = [role for role in [primary, secondary, group] if role is not None]
     partial_roles = [role for role in [primary] if role is not None]
     performance_date_text = str(recording.get("performanceDateText") or "").strip()
-    targets = supported_target_urls(recording, allowed_canonicals=allowed_targets)
+    recording_title = str(recording.get("title") or "").strip()
 
     scenarios = [
         GeneratedScenario(
@@ -339,9 +456,20 @@ def build_recording_scenarios(
                 work_type_hint=work_type_hint,
                 roles=full_roles,
                 performance_date_text=performance_date_text,
+                seed_title=recording_title,
             ),
-            target_urls=targets,
-            evaluable=bool(targets),
+            target_urls=supported_target_urls_for_variant(
+                recording,
+                variant="full",
+                allowed_canonicals=allowed_targets,
+            ),
+            evaluable=bool(
+                supported_target_urls_for_variant(
+                    recording,
+                    variant="full",
+                    allowed_canonicals=allowed_targets,
+                )
+            ),
         ),
         GeneratedScenario(
             variant="partial",
@@ -354,9 +482,24 @@ def build_recording_scenarios(
                 work_type_hint=work_type_hint,
                 roles=partial_roles,
                 performance_date_text="",
+                seed_title=(
+                    strip_performance_date_from_title(recording_title, performance_date_text)
+                    if work_type_hint.startswith("chamber")
+                    else recording_title
+                ),
             ),
-            target_urls=targets,
-            evaluable=bool(targets),
+            target_urls=supported_target_urls_for_variant(
+                recording,
+                variant="partial",
+                allowed_canonicals=allowed_targets,
+            ),
+            evaluable=bool(
+                supported_target_urls_for_variant(
+                    recording,
+                    variant="partial",
+                    allowed_canonicals=allowed_targets,
+                )
+            ),
         ),
     ]
     return scenarios

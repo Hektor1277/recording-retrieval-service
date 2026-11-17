@@ -8,11 +8,15 @@ from app.services.http_sources import HttpSourceProvider
 from app.services.pipeline import (
     build_candidate_work_anchor_terms,
     candidate_conflicting_credit_tokens,
+    candidate_mentions_expected_composer,
     candidate_mentions_names,
+    candidate_year_conflicts_reference,
     candidate_title_quality_score,
+    classify_link_candidate_zone,
     DraftRecordingEntry,
     InputNormalizer,
     LinkCandidate,
+    pick_dominant_link_candidate,
     person_variant_matches,
     ProfileResolver,
     RetrievalPipeline,
@@ -357,6 +361,22 @@ def test_input_normalizer_extracts_embedded_english_aliases_from_credit_display_
     assert all("EN:" not in value for value in draft.ensemble_names)
 
 
+def test_input_normalizer_expands_transliterated_credit_aliases_from_person_alias_table() -> None:
+    payload = sample_request()
+    payload["items"][0]["workTypeHint"] = "chamber_solo"
+    payload["items"][0]["seed"]["credits"] = [
+        {"role": "soloist", "displayName": "亚历山大·莫吉列夫斯基", "label": "亚历山大·莫吉列夫斯基"},
+        {"role": "soloist", "displayName": "列奥尼德·克鲁策", "label": "列奥尼德·克鲁策"},
+    ]
+    request = CreateJobRequest.model_validate(payload)
+
+    draft = InputNormalizer().normalize(request.items[0])
+
+    assert "Alexander Mogilevsky" in draft.primary_names_latin
+    assert "Alexander Yakovlevich Mogilevsky" in draft.primary_names_latin
+    assert "Alexandre Moguilewsky" in draft.primary_names_latin
+
+
 def test_input_normalizer_infers_missing_chamber_collaborator_from_title() -> None:
     payload = sample_request()
     payload["items"][0]["workTypeHint"] = "chamber_solo"
@@ -376,6 +396,29 @@ def test_input_normalizer_infers_missing_chamber_collaborator_from_title() -> No
 
     assert "Ginette Doyen" in draft.secondary_names_latin
     assert "Jean Fournier Ginette Doyen" in draft.query_lead_names_latin
+
+
+def test_input_normalizer_uses_soloist_aliases_for_title_inferred_chamber_collaborator() -> None:
+    payload = sample_request()
+    payload["items"][0]["workTypeHint"] = "chamber_solo"
+    payload["items"][0]["sourceLine"] = "Ludwig van Beethoven | Violin Sonata No.5, Op.24 | 亚历山大·莫吉列夫斯基 | -"
+    payload["items"][0]["seed"]["title"] = "亚历山大·莫吉列夫斯基 - 列奥尼德·克鲁策"
+    payload["items"][0]["seed"]["composerName"] = "贝多芬"
+    payload["items"][0]["seed"]["composerNameLatin"] = "Ludwig van Beethoven"
+    payload["items"][0]["seed"]["workTitle"] = "第5号小提琴奏鸣曲, “春天”"
+    payload["items"][0]["seed"]["workTitleLatin"] = "Violin Sonata No.5, Op.24"
+    payload["items"][0]["seed"]["catalogue"] = ""
+    payload["items"][0]["seed"]["performanceDateText"] = ""
+    payload["items"][0]["seed"]["credits"] = [
+        {"role": "soloist", "displayName": "亚历山大·莫吉列夫斯基", "label": "亚历山大·莫吉列夫斯基"},
+    ]
+    request = CreateJobRequest.model_validate(payload)
+
+    draft = InputNormalizer().normalize(request.items[0])
+
+    assert "Alexandre Moguilewsky" in draft.primary_names_latin
+    assert "Leonid Kreutzer" in draft.secondary_names_latin
+    assert "Alexandre Moguilewsky Leonid Kreutzer" in draft.query_lead_names_latin
 
 
 def test_input_normalizer_uses_person_id_lookup_for_missing_latin_credit_names() -> None:
@@ -483,6 +526,34 @@ def test_input_normalizer_enriches_title_inferred_secondary_latin_aliases_from_p
     assert any("Walter Gieseking Wilhelm Furtwangler" in query for query in draft.query_lead_names_latin)
 
 
+def test_input_normalizer_enriches_credit_person_latin_aliases_from_person_alias_loader() -> None:
+    class FakePersonAliasLoader:
+        def expand(self, value: str, *, role: str | None = None):
+            mapping = {
+                ("soloist", "山根弥生子"): ["山根弥生子", "山根美代子", "Miyoko Yamane"],
+            }
+            return mapping.get((role, value), [value])
+
+    payload = sample_request()
+    payload["items"][0]["workTypeHint"] = "chamber_solo"
+    payload["items"][0]["seed"]["title"] = "席蒙·戈尔德贝格 - 山根美代子 - June, 1961"
+    payload["items"][0]["seed"]["composerName"] = "路德维希·凡·贝多芬"
+    payload["items"][0]["seed"]["composerNameLatin"] = "Ludwig van Beethoven"
+    payload["items"][0]["seed"]["workTitle"] = "第5号小提琴奏鸣曲, “春天”"
+    payload["items"][0]["seed"]["workTitleLatin"] = "Violin Sonata No.5, Op.24"
+    payload["items"][0]["seed"]["catalogue"] = ""
+    payload["items"][0]["seed"]["credits"] = [
+        {"role": "soloist", "displayName": "席蒙·戈尔德贝格", "label": "小提琴"},
+        {"role": "soloist", "displayName": "山根弥生子", "label": "钢琴"},
+    ]
+    request = CreateJobRequest.model_validate(payload)
+
+    draft = InputNormalizer(person_alias_loader=FakePersonAliasLoader()).normalize(request.items[0])
+
+    assert "Miyoko Yamane" in draft.secondary_names_latin
+    assert any("Miyoko Yamane" in query for query in draft.query_lead_names_latin)
+
+
 def test_input_normalizer_extracts_english_alias_from_person_lookup_name_latin_payload() -> None:
     class FakePersonNameLookup:
         def resolve(self, person_id: str):
@@ -556,6 +627,92 @@ def test_candidate_conflicting_credit_tokens_ignores_shorter_same_person_variant
     title = "【玛丽亚·格林伯格 | 舒曼钢协】Maria Grinberg plays Schumann Piano Concerto Op. 54"
 
     assert candidate_conflicting_credit_tokens(draft, title) == set()
+
+
+def test_candidate_conflicting_credit_tokens_ignores_matching_performer_role_prefix_for_duo_title() -> None:
+    draft = DraftRecordingEntry(
+        item_id="recording-goldberg-yamane-full",
+        title="席蒙·戈尔德贝格 - 山根美代子 - June, 1991",
+        composer_name="贝多芬",
+        composer_name_latin="Ludwig van Beethoven",
+        work_title="第5号小提琴奏鸣曲“春天”",
+        work_title_latin="Violin Sonata No.5, Op.24",
+        catalogue="Op.24",
+        performance_date_text="June, 1991",
+        venue_text="",
+        album_title="",
+        label="",
+        release_date="",
+        notes="",
+        source_line="Ludwig van Beethoven | Violin Sonata No.5, Op.24 | Szymon Goldberg | Miyoko Yamane | June, 1991",
+        raw_text="Ludwig van Beethoven | Violin Sonata No.5, Op.24 | Szymon Goldberg | Miyoko Yamane | June, 1991",
+        existing_links=[],
+        primary_names=["席蒙·戈尔德贝格"],
+        primary_names_latin=["Szymon Goldberg"],
+        secondary_names=["山根美代子"],
+        secondary_names_latin=["Miyoko Yamane"],
+        query_lead_names=["席蒙·戈尔德贝格", "山根美代子"],
+        query_lead_names_latin=["Szymon Goldberg Miyoko Yamane", "Szymon Goldberg / Miyoko Yamane"],
+        lead_names=["席蒙·戈尔德贝格", "山根美代子"],
+        lead_names_latin=["Szymon Goldberg", "Miyoko Yamane"],
+        ensemble_names=[],
+        ensemble_names_latin=[],
+        work_type_hint="chamber_solo",
+    )
+    title = "贝多芬：第五号小提琴奏鸣曲“春天”/ 演奏者：戈尔德贝格 & 山根美代子（Szymon Goldberg, Miyoko Yamane）"
+    candidate = LinkCandidate(
+        platform="bilibili",
+        url="https://www.bilibili.com/video/BV1tS411P7xf/",
+        title=title,
+        sourceLabel="Bilibili Search Browser Search",
+        confidence=0.97,
+    )
+
+    assert candidate_conflicting_credit_tokens(draft, title) == set()
+    assert classify_link_candidate_zone(draft, candidate)[0] == "green"
+
+
+def test_candidate_conflicting_credit_tokens_ignores_composer_work_prefix_for_chamber_solo_track_title() -> None:
+    draft = DraftRecordingEntry(
+        item_id="recording-egon-petri-conflict-guard",
+        title="Egon Petri 1956",
+        composer_name="Ludwig van Beethoven",
+        composer_name_latin="Ludwig van Beethoven",
+        work_title="Piano Sonata No.23, Op.57 Appassionata",
+        work_title_latin="Piano Sonata No.23, Op.57 Appassionata",
+        catalogue="Op.57",
+        performance_date_text="1956",
+        venue_text="",
+        album_title="",
+        label="",
+        release_date="",
+        notes="",
+        source_line="Ludwig van Beethoven | Piano Sonata No.23, Op.57 | Egon Petri | 1956",
+        raw_text="Ludwig van Beethoven | Piano Sonata No.23, Op.57 | Egon Petri | 1956",
+        existing_links=[],
+        primary_names=["Egon Petri"],
+        primary_names_latin=["Egon Petri"],
+        secondary_names=[],
+        secondary_names_latin=[],
+        query_lead_names=["Egon Petri"],
+        query_lead_names_latin=["Egon Petri"],
+        lead_names=["Egon Petri"],
+        lead_names_latin=["Egon Petri"],
+        ensemble_names=[],
+        ensemble_names_latin=[],
+        work_type_hint="chamber_solo",
+    )
+    title = 'Beethoven: Piano Sonata No. 23 in F Minor, Op. 57 "Appassionata": I. Allegro assai'
+    candidate = LinkCandidate(
+        platform="youtube",
+        url="https://www.youtube.com/watch?v=3oo93lgs15Y",
+        title=title,
+        sourceLabel="YouTube Search",
+        confidence=0.61,
+    )
+
+    assert candidate_conflicting_credit_tokens(draft, title) == set()
+    assert classify_link_candidate_zone(draft, candidate)[0] != "red"
 
 
 def test_build_latin_credit_variants_prefers_condensed_alias_for_long_person_name() -> None:
@@ -1711,6 +1868,367 @@ def test_candidate_title_quality_score_rewards_expected_composer_for_sparse_virs
 
     assert candidate_title_quality_score(draft, correct_title) >= 0.08
     assert candidate_title_quality_score(draft, correct_title) > candidate_title_quality_score(draft, wrong_title)
+
+
+def test_candidate_mentions_expected_composer_accepts_cjk_surname_fragment() -> None:
+    draft = DraftRecordingEntry(
+        item_id="recording-sonoda-composer-fragment",
+        title="園田高弘 - 2023.10.31",
+        composer_name="路德维希·凡·贝多芬",
+        composer_name_latin="Ludwig van Beethoven",
+        work_title="第二十三号奏鸣曲，热情",
+        work_title_latin="Piano Sonata No.23, Op.57",
+        catalogue="",
+        performance_date_text="2023.10.31",
+        venue_text="",
+        album_title="",
+        label="",
+        release_date="",
+        notes="",
+        source_line="路德维希·凡·贝多芬 | 第二十三号奏鸣曲，热情 | 園田高弘 | 2023.10.31",
+        raw_text="路德维希·凡·贝多芬 | 第二十三号奏鸣曲，热情 | 園田高弘 | 2023.10.31",
+        existing_links=[],
+        primary_names=["園田高弘"],
+        primary_names_latin=["Takahiro Sonoda"],
+        secondary_names=[],
+        secondary_names_latin=[],
+        lead_names=["園田高弘"],
+        lead_names_latin=["Takahiro Sonoda"],
+        ensemble_names=[],
+        ensemble_names_latin=[],
+    )
+
+    assert candidate_mentions_expected_composer(
+        draft,
+        "贝多芬-第二十三钢琴奏鸣曲-热情op.57（園田高弘）".lower(),
+    )
+
+
+def test_candidate_title_quality_score_rewards_actual_appassionata_cjk_title() -> None:
+    draft = DraftRecordingEntry(
+        item_id="recording-sonoda-title-quality",
+        title="園田高弘 - 2023.10.31",
+        composer_name="路德维希·凡·贝多芬",
+        composer_name_latin="Ludwig van Beethoven",
+        work_title="第二十三号奏鸣曲，热情",
+        work_title_latin="Piano Sonata No.23, Op.57",
+        catalogue="",
+        performance_date_text="2023.10.31",
+        venue_text="",
+        album_title="",
+        label="",
+        release_date="",
+        notes="",
+        source_line="路德维希·凡·贝多芬 | 第二十三号奏鸣曲，热情 | 園田高弘 | 2023.10.31",
+        raw_text="路德维希·凡·贝多芬 | 第二十三号奏鸣曲，热情 | 園田高弘 | 2023.10.31",
+        existing_links=[],
+        primary_names=["園田高弘"],
+        primary_names_latin=["Takahiro Sonoda"],
+        secondary_names=[],
+        secondary_names_latin=[],
+        lead_names=["園田高弘"],
+        lead_names_latin=["Takahiro Sonoda"],
+        ensemble_names=[],
+        ensemble_names_latin=[],
+    )
+
+    actual_title = "贝多芬-第二十三钢琴奏鸣曲-热情op.57（園田高弘）"
+    wrong_title = '贝多芬热情奏鸣曲 Performed by Emil Gilels'
+
+    assert candidate_title_quality_score(draft, actual_title) >= 0.08
+    assert candidate_title_quality_score(draft, actual_title) > candidate_title_quality_score(draft, wrong_title)
+
+
+def test_pick_dominant_link_candidate_prefers_actual_appassionata_cjk_candidate() -> None:
+    draft = DraftRecordingEntry(
+        item_id="recording-sonoda-dominant",
+        title="園田高弘 - 2023.10.31",
+        composer_name="路德维希·凡·贝多芬",
+        composer_name_latin="Ludwig van Beethoven",
+        work_title="第二十三号奏鸣曲，热情",
+        work_title_latin="Piano Sonata No.23, Op.57",
+        catalogue="",
+        performance_date_text="2023.10.31",
+        venue_text="",
+        album_title="",
+        label="",
+        release_date="",
+        notes="",
+        source_line="路德维希·凡·贝多芬 | 第二十三号奏鸣曲，热情 | 園田高弘 | 2023.10.31",
+        raw_text="路德维希·凡·贝多芬 | 第二十三号奏鸣曲，热情 | 園田高弘 | 2023.10.31",
+        existing_links=[],
+        primary_names=["園田高弘"],
+        primary_names_latin=["Takahiro Sonoda"],
+        secondary_names=[],
+        secondary_names_latin=[],
+        lead_names=["園田高弘"],
+        lead_names_latin=["Takahiro Sonoda"],
+        ensemble_names=[],
+        ensemble_names_latin=[],
+    )
+    target = LinkCandidate(
+        platform="bilibili",
+        url="https://www.bilibili.com/video/BV1ouNbzqEQt/",
+        title="贝多芬-第二十三钢琴奏鸣曲-热情op.57（園田高弘）",
+        source_label="Bilibili Search",
+        confidence=0.51,
+    )
+    runner_up = LinkCandidate(
+        platform="bilibili",
+        url="https://www.bilibili.com/video/BV1Rt411J7nt/",
+        title="Piano Sonata No 23 in F flat minor Appassionata, Op.57 Ludwig van Beethoven-e",
+        source_label="Bilibili Search",
+        confidence=0.45,
+    )
+    record_map = {
+        target.url: SourceRecord(
+            url=target.url,
+            source_label="Bilibili Search",
+            source_kind="streaming",
+            title=target.title,
+            description=(
+                "Piano Sonata No. 23 in f minor, op.57 Composer：Ludwig van Beethoven "
+                "Piano/Editor：Takahiro Sonoda 園田高弘 2003年10月31日75岁现场"
+            ),
+            platform="bilibili",
+            weight=0.68,
+            same_recording_score=0.51,
+            duration_seconds=1447,
+            uploader="挽晚风儿儿儿",
+            view_count=2497,
+            fields={},
+            images=[],
+        ),
+        runner_up.url: SourceRecord(
+            url=runner_up.url,
+            source_label="Bilibili Search",
+            source_kind="streaming",
+            title=runner_up.title,
+            description="youtube eoIkpHCDlkg",
+            platform="bilibili",
+            weight=0.68,
+            same_recording_score=0.45,
+            duration_seconds=1648,
+            uploader="muzikair",
+            view_count=345,
+            fields={},
+            images=[],
+        ),
+    }
+
+    dominant = pick_dominant_link_candidate(draft, [target, runner_up], record_map)
+
+    assert dominant is not None
+    assert dominant.url == target.url
+
+
+def test_candidate_year_conflicts_reference_tolerates_chamber_single_lead_same_month_day_typo() -> None:
+    draft = DraftRecordingEntry(
+        item_id="recording-sonoda-year-typo",
+        title="園田高弘 - 2023.10.31",
+        composer_name="路德维希·凡·贝多芬",
+        composer_name_latin="Ludwig van Beethoven",
+        work_title="第二十三号奏鸣曲，热情",
+        work_title_latin="Piano Sonata No.23, Op.57",
+        catalogue="Op.57",
+        performance_date_text="2023.10.31",
+        venue_text="",
+        album_title="",
+        label="",
+        release_date="",
+        notes="",
+        source_line="路德维希·凡·贝多芬 | 第二十三号奏鸣曲，热情 | 園田高弘 | 2023.10.31",
+        raw_text="路德维希·凡·贝多芬 | 第二十三号奏鸣曲，热情 | 園田高弘 | 2023.10.31",
+        existing_links=[],
+        primary_names=["園田高弘"],
+        primary_names_latin=["Takahiro Sonoda"],
+        secondary_names=[],
+        secondary_names_latin=[],
+        lead_names=["園田高弘"],
+        lead_names_latin=["Takahiro Sonoda"],
+        ensemble_names=[],
+        ensemble_names_latin=[],
+        work_type_hint="chamber_solo",
+    )
+    candidate = LinkCandidate(
+        platform="bilibili",
+        url="https://www.bilibili.com/video/BV1ouNbzqEQt/",
+        title="贝多芬-第二十三钢琴奏鸣曲-热情op.57（園田高弘）",
+        sourceLabel="Bilibili Search",
+        confidence=0.51,
+    )
+    record = SourceRecord(
+        url=candidate.url,
+        source_label="Bilibili Search",
+        source_kind="streaming",
+        title=candidate.title,
+        description=(
+            "Piano Sonata No. 23 in f minor, op.57 Composer：Ludwig van Beethoven "
+            "路德维希·凡·贝多芬 Piano/Editor：Takahiro Sonoda 園田高弘 2003年10月31日75岁现场"
+        ),
+        platform="bilibili",
+        weight=0.68,
+        same_recording_score=0.51,
+        duration_seconds=1447,
+        uploader="挽晚风儿儿儿",
+        view_count=2497,
+        fields={},
+        images=[],
+    )
+
+    assert candidate_year_conflicts_reference(draft, candidate, record) is False
+
+
+def test_candidate_year_conflicts_reference_keeps_concerto_year_conflict_strict() -> None:
+    draft = DraftRecordingEntry(
+        item_id="recording-cortot-year-conflict",
+        title="Alfred Cortot 1951",
+        composer_name="Robert Schumann",
+        composer_name_latin="Robert Schumann",
+        work_title="Piano Concerto in A minor, Op.54",
+        work_title_latin="Piano Concerto in A minor, Op.54",
+        catalogue="Op.54",
+        performance_date_text="1951.10.31",
+        venue_text="",
+        album_title="",
+        label="",
+        release_date="",
+        notes="",
+        source_line="Robert Schumann | Piano Concerto in A minor, Op.54 | Alfred Cortot | 1951.10.31",
+        raw_text="Robert Schumann | Piano Concerto in A minor, Op.54 | Alfred Cortot | 1951.10.31",
+        existing_links=[],
+        primary_names=["Alfred Cortot"],
+        primary_names_latin=["Alfred Cortot"],
+        secondary_names=[],
+        secondary_names_latin=[],
+        lead_names=["Alfred Cortot"],
+        lead_names_latin=["Alfred Cortot"],
+        ensemble_names=[],
+        ensemble_names_latin=[],
+        work_type_hint="concerto",
+    )
+    candidate = LinkCandidate(
+        platform="bilibili",
+        url="https://www.bilibili.com/video/BV1fakeconcerto/",
+        title="Schumann Piano Concerto Alfred Cortot",
+        sourceLabel="Bilibili Search",
+        confidence=0.51,
+    )
+    record = SourceRecord(
+        url=candidate.url,
+        source_label="Bilibili Search",
+        source_kind="streaming",
+        title=candidate.title,
+        description="Schumann Piano Concerto Alfred Cortot 1931年10月31日 live",
+        platform="bilibili",
+        weight=0.68,
+        same_recording_score=0.51,
+        duration_seconds=1880,
+        uploader="Archive",
+        view_count=2497,
+        fields={},
+        images=[],
+    )
+
+    assert candidate_year_conflicts_reference(draft, candidate, record) is True
+
+
+def test_pipeline_rescues_sonoda_appassionata_candidate_despite_same_month_day_year_typo() -> None:
+    class SonodaProvider:
+        async def inspect_existing_links(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_high_quality(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_streaming(self, draft, profile):
+            del draft, profile
+            return [
+                {
+                    "url": "https://www.bilibili.com/video/BV1ouNbzqEQt/",
+                    "source_label": "Bilibili Search",
+                    "source_kind": "streaming",
+                    "title": "贝多芬-第二十三钢琴奏鸣曲-热情op.57（園田高弘）",
+                    "description": (
+                        "Piano Sonata No. 23 in f minor, op.57 Composer：Ludwig van Beethoven "
+                        "路德维希·凡·贝多芬 Piano/Editor：Takahiro Sonoda 園田高弘 2003年10月31日75岁现场"
+                    ),
+                    "platform": "bilibili",
+                    "weight": 0.68,
+                    "same_recording_score": 0.51,
+                    "duration_seconds": 1447,
+                    "uploader": "挽晚风儿儿儿",
+                    "view_count": 2497,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://www.bilibili.com/video/BV1PJ411B7xk/",
+                    "source_label": "Bilibili Search",
+                    "source_kind": "streaming",
+                    "title": '贝多芬热情奏鸣曲Piano Sonata No. 23 "Appassionata", Op. 57 Performed by Emil Gilels',
+                    "description": "https://www.youtube.com/watch?v=QImFm4Y_QPM Ludwig van Beethoven Piano Sonata No. 23 Appassionata",
+                    "platform": "bilibili",
+                    "weight": 0.68,
+                    "same_recording_score": 0.49,
+                    "duration_seconds": 1528,
+                    "uploader": "Ruijerd39",
+                    "view_count": 3900,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://www.bilibili.com/video/BV1oZ421u7M6/",
+                    "source_label": "Bilibili Search",
+                    "source_kind": "streaming",
+                    "title": "贝多芬Op.57《f小调第23号钢琴奏鸣曲-热情》园田高弘 DENON全集版 Beethoven Piano Sonata No.23",
+                    "description": "",
+                    "platform": "bilibili",
+                    "weight": 0.68,
+                    "same_recording_score": 0.45,
+                    "duration_seconds": 1460,
+                    "uploader": "贝多芬圣殿",
+                    "view_count": 22,
+                    "fields": {},
+                    "images": [],
+                },
+            ]
+
+        async def search_fallback(self, draft, profile):
+            del draft, profile
+            return []
+
+    class EmptyAcceptedUrlsLlm:
+        minimum_synthesis_timeout_seconds = 0.0
+        allow_realtime_synthesis = True
+
+        async def synthesize(self, draft, profile, records):
+            del draft, profile, records
+            return {"summary": "", "notes": "", "warnings": [], "acceptedUrls": []}
+
+    payload = sample_request()
+    payload["items"][0]["workTypeHint"] = "chamber_solo"
+    payload["items"][0]["sourceLine"] = "路德维希·凡·贝多芬 | 第二十三号奏鸣曲，热情 | 園田高弘 | 2023.10.31"
+    payload["items"][0]["seed"]["title"] = "園田高弘 - 2023.10.31"
+    payload["items"][0]["seed"]["composerName"] = "路德维希·凡·贝多芬"
+    payload["items"][0]["seed"]["composerNameLatin"] = "Ludwig van Beethoven"
+    payload["items"][0]["seed"]["workTitle"] = "第二十三号奏鸣曲，热情"
+    payload["items"][0]["seed"]["workTitleLatin"] = "Piano Sonata No.23, Op.57"
+    payload["items"][0]["seed"]["catalogue"] = "Op.57"
+    payload["items"][0]["seed"]["performanceDateText"] = "2023.10.31"
+    payload["items"][0]["seed"]["credits"] = [
+        {"role": "soloist", "displayName": "園田高弘", "label": "钢琴"},
+    ]
+    request = CreateJobRequest.model_validate(payload)
+    pipeline = RetrievalPipeline(source_provider=SonodaProvider(), llm_client=EmptyAcceptedUrlsLlm())
+
+    result = asyncio.run(pipeline.retrieve(request.items[0]))
+
+    final_urls = [link.url for link in result.result.links]
+    assert "https://www.bilibili.com/video/BV1ouNbzqEQt/" in final_urls
+    assert "https://www.bilibili.com/video/BV1PJ411B7xk/" not in final_urls
 
 
 def test_pipeline_isolates_access_events_between_concurrent_retrievals() -> None:
@@ -3014,6 +3532,352 @@ def test_pipeline_keeps_close_same_platform_heifetz_alternate_when_fast_llm_acce
     assert "https://www.youtube.com/watch?v=-rUNkiGgJx8" not in final_urls
 
 
+def test_pipeline_keeps_close_same_platform_complete_alternate_without_accepted_urls() -> None:
+    class SpringAlternateProvider:
+        async def inspect_existing_links(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_high_quality(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_streaming(self, draft, profile):
+            del draft, profile
+            return [
+                {
+                    "url": "https://www.youtube.com/watch?v=topspring001",
+                    "source_label": "YouTube Search",
+                    "source_kind": "streaming",
+                    "title": "Mogilevsky & Kreutzer - Beethoven : Spring Sonata in F Op.24 (1931) 再復刻",
+                    "description": "High-confidence alternate upload",
+                    "platform": "youtube",
+                    "weight": 0.68,
+                    "same_recording_score": 0.97,
+                    "duration_seconds": 1462,
+                    "uploader": "Archive A",
+                    "view_count": 12000,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://www.youtube.com/watch?v=topspring002",
+                    "source_label": "YouTube Search",
+                    "source_kind": "streaming",
+                    "title": 'Alexander Mogilevsky and Leonid Kreutzer - Violin Sonata No. 5 "Spring" (Beethoven) 1931',
+                    "description": "Another high-confidence alternate upload",
+                    "platform": "youtube",
+                    "weight": 0.68,
+                    "same_recording_score": 0.97,
+                    "duration_seconds": 1458,
+                    "uploader": "Archive B",
+                    "view_count": 11000,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://www.youtube.com/watch?v=canonicalspring",
+                    "source_label": "YouTube Search",
+                    "source_kind": "streaming",
+                    "title": "Alexandre Moguilewsky & Leonid Kreutzer: Beethoven: Violin Sonata No. 5 (R. ca 1931)",
+                    "description": "Canonical upload with transliterated spelling",
+                    "platform": "youtube",
+                    "weight": 0.68,
+                    "same_recording_score": 0.47,
+                    "duration_seconds": 1449,
+                    "uploader": "Archive C",
+                    "view_count": 4200,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://www.youtube.com/watch?v=spring-part2",
+                    "source_label": "YouTube Search",
+                    "source_kind": "streaming",
+                    "title": 'Alexandre Moguilewsky & Leonid Kreutzer play Beethoven Sonata No. 5 in F major Op. 24 "Spring" (2/2)',
+                    "description": "Split upload second half",
+                    "platform": "youtube",
+                    "weight": 0.68,
+                    "same_recording_score": 0.49,
+                    "duration_seconds": 690,
+                    "uploader": "Archive D",
+                    "view_count": 2300,
+                    "fields": {},
+                    "images": [],
+                },
+            ]
+
+        async def search_fallback(self, draft, profile):
+            del draft, profile
+            return []
+
+    payload = sample_request()
+    payload["items"][0]["workTypeHint"] = "chamber_solo"
+    payload["items"][0]["sourceLine"] = (
+        'Ludwig van Beethoven | Violin Sonata No.5, Op.24 "Spring" | '
+        "Alexander Mogilevsky | Leonid Kreutzer | 1931"
+    )
+    payload["items"][0]["seed"]["title"] = "Mogilevsky & Kreutzer"
+    payload["items"][0]["seed"]["composerNameLatin"] = "Ludwig van Beethoven"
+    payload["items"][0]["seed"]["workTitleLatin"] = 'Violin Sonata No.5, Op.24 "Spring"'
+    payload["items"][0]["seed"]["catalogue"] = "Op.24"
+    payload["items"][0]["seed"]["performanceDateText"] = "1931"
+    payload["items"][0]["seed"]["credits"] = [
+        {"role": "soloist", "displayName": "Alexander Mogilevsky", "label": "Alexander Mogilevsky"},
+        {"role": "soloist", "displayName": "Leonid Kreutzer", "label": "Leonid Kreutzer"},
+    ]
+    request = CreateJobRequest.model_validate(payload)
+    pipeline = RetrievalPipeline(source_provider=SpringAlternateProvider(), llm_client=None)
+
+    result = asyncio.run(pipeline.retrieve(request.items[0]))
+
+    final_urls = [link.url for link in result.result.links]
+    assert "https://www.youtube.com/watch?v=topspring001" in final_urls
+    assert "https://www.youtube.com/watch?v=topspring002" in final_urls
+    assert "https://www.youtube.com/watch?v=canonicalspring" in final_urls
+    assert "https://www.youtube.com/watch?v=spring-part2" not in final_urls
+
+
+def test_pipeline_keeps_close_same_platform_longform_alternate_when_llm_accepts_other_platform_winners() -> None:
+    class CortotProvider:
+        async def inspect_existing_links(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_high_quality(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_streaming(self, draft, profile):
+            del draft, profile
+            return [
+                {
+                    "url": "https://www.youtube.com/watch?v=IqqhlFh0_rI",
+                    "source_label": "YouTube Search",
+                    "source_kind": "streaming",
+                    "title": "Alfred Cortot plays Schumann Piano Concerto in A minor, op. 54 (1951)",
+                    "description": "Back Blue Classics upload",
+                    "platform": "youtube",
+                    "weight": 0.68,
+                    "same_recording_score": 0.81,
+                    "duration_seconds": 1998,
+                    "uploader": "Back Blue Classics",
+                    "view_count": 438,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://www.bilibili.com/video/BV1Pr4y1Q74W/",
+                    "source_label": "Bilibili Search",
+                    "source_kind": "streaming",
+                    "title": "舒曼钢协和诗人之恋，Cortot钢琴，Souzay男中，Fricsay指挥",
+                    "description": "Long-form upload containing Schumann concerto and Dichterliebe",
+                    "platform": "bilibili",
+                    "weight": 0.68,
+                    "same_recording_score": 0.49,
+                    "duration_seconds": 3686,
+                    "uploader": "_HideousLight_",
+                    "view_count": 2348,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://www.bilibili.com/video/BV1Y34y1p7e7/",
+                    "source_label": "Bilibili Search",
+                    "source_kind": "streaming",
+                    "title": "科尔托五十年代舒曼钢协录音 弗里乔伊指挥 Alfred Cortot plays Schuman PC Conducted by Ferenc Fricsay",
+                    "description": "Shorter exact upload",
+                    "platform": "bilibili",
+                    "weight": 0.68,
+                    "same_recording_score": 0.49,
+                    "duration_seconds": 1932,
+                    "uploader": "赫尔曼-阿本德罗特",
+                    "view_count": 422,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://www.youtube.com/watch?v=rpOF3eNNaxE",
+                    "source_label": "YouTube Search",
+                    "source_kind": "streaming",
+                    "title": "Alfred Cortot Schumann Piano Concerto in A-min. Op. 54",
+                    "description": "Alternate YouTube upload",
+                    "platform": "youtube",
+                    "weight": 0.68,
+                    "same_recording_score": 0.47,
+                    "duration_seconds": 1787,
+                    "uploader": "rimb68",
+                    "view_count": 1167,
+                    "fields": {},
+                    "images": [],
+                },
+            ]
+
+        async def search_fallback(self, draft, profile):
+            del draft, profile
+            return []
+
+    class CortotFullLlm:
+        minimum_synthesis_timeout_seconds = 0.0
+        allow_realtime_synthesis = True
+
+        async def synthesize(self, draft, profile, records):
+            del draft, profile, records
+            return {
+                "summary": "",
+                "notes": "",
+                "warnings": [],
+                "acceptedUrls": [
+                    "https://www.youtube.com/watch?v=IqqhlFh0_rI",
+                    "https://www.bilibili.com/video/BV1Y34y1p7e7/",
+                ],
+            }
+
+    payload = sample_request()
+    payload["items"][0]["workTypeHint"] = "concerto"
+    payload["items"][0]["sourceLine"] = (
+        "Robert Schumann | Piano Concerto in A minor, Op.54 | Alfred Cortot | "
+        "Ferenc Fricsay | Berliner Philharmoniker | 1951"
+    )
+    payload["items"][0]["seed"]["title"] = "Alfred Cortot 1951"
+    payload["items"][0]["seed"]["composerNameLatin"] = "Robert Schumann"
+    payload["items"][0]["seed"]["workTitleLatin"] = "Piano Concerto in A minor, Op.54"
+    payload["items"][0]["seed"]["catalogue"] = "Op.54"
+    payload["items"][0]["seed"]["performanceDateText"] = "1951"
+    payload["items"][0]["seed"]["credits"] = [
+        {"role": "soloist", "displayName": "Alfred Cortot", "label": "Alfred Cortot"},
+        {"role": "conductor", "displayName": "Ferenc Fricsay", "label": "Ferenc Fricsay"},
+        {"role": "orchestra", "displayName": "Berliner Philharmoniker", "label": "Berliner Philharmoniker"},
+    ]
+    request = CreateJobRequest.model_validate(payload)
+    pipeline = RetrievalPipeline(source_provider=CortotProvider(), llm_client=CortotFullLlm())
+
+    result = asyncio.run(pipeline.retrieve(request.items[0]))
+
+    final_urls = [link.url for link in result.result.links]
+    assert "https://www.youtube.com/watch?v=IqqhlFh0_rI" in final_urls
+    assert "https://www.bilibili.com/video/BV1Y34y1p7e7/" in final_urls
+    assert "https://www.bilibili.com/video/BV1Pr4y1Q74W/" in final_urls
+
+
+def test_pipeline_keeps_accepted_longform_same_platform_alternate_through_final_limit() -> None:
+    class CortotPartialProvider:
+        async def inspect_existing_links(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_high_quality(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_streaming(self, draft, profile):
+            del draft, profile
+            return [
+                {
+                    "url": "https://www.bilibili.com/video/BV1vL5ozzEyp/",
+                    "source_label": "Bilibili Search",
+                    "source_kind": "streaming",
+                    "title": "弗里乔伊（Ferenc Fricsay），科尔托（Alfred Cortot）/ 柴可夫斯基：第5交响曲；舒曼：钢琴协奏曲",
+                    "description": "Accepted long compilation upload",
+                    "platform": "bilibili",
+                    "weight": 0.68,
+                    "same_recording_score": 0.81,
+                    "duration_seconds": 4681,
+                    "uploader": "virgo_bottle",
+                    "view_count": 270,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://www.youtube.com/watch?v=IqqhlFh0_rI",
+                    "source_label": "YouTube Search",
+                    "source_kind": "streaming",
+                    "title": "Alfred Cortot plays Schumann Piano Concerto in A minor, op. 54 (1951)",
+                    "description": "Strong YouTube upload",
+                    "platform": "youtube",
+                    "weight": 0.68,
+                    "same_recording_score": 0.81,
+                    "duration_seconds": 1998,
+                    "uploader": "Back Blue Classics",
+                    "view_count": 438,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://www.bilibili.com/video/BV1Pr4y1Q74W/",
+                    "source_label": "Bilibili Search",
+                    "source_kind": "streaming",
+                    "title": "舒曼钢协和诗人之恋，Cortot钢琴，Souzay男中，Fricsay指挥",
+                    "description": "Accepted long-form alternate upload",
+                    "platform": "bilibili",
+                    "weight": 0.68,
+                    "same_recording_score": 0.49,
+                    "duration_seconds": 3686,
+                    "uploader": "_HideousLight_",
+                    "view_count": 2348,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://www.bilibili.com/video/BV1Y34y1p7e7/",
+                    "source_label": "Bilibili Search",
+                    "source_kind": "streaming",
+                    "title": "科尔托五十年代舒曼钢协录音 弗里乔伊指挥 Alfred Cortot plays Schuman PC Conducted by Ferenc Fricsay",
+                    "description": "Accepted shorter exact upload",
+                    "platform": "bilibili",
+                    "weight": 0.68,
+                    "same_recording_score": 0.49,
+                    "duration_seconds": 1932,
+                    "uploader": "赫尔曼-阿本德罗特",
+                    "view_count": 422,
+                    "fields": {},
+                    "images": [],
+                },
+            ]
+
+        async def search_fallback(self, draft, profile):
+            del draft, profile
+            return []
+
+    class CortotPartialLlm:
+        minimum_synthesis_timeout_seconds = 0.0
+        allow_realtime_synthesis = True
+
+        async def synthesize(self, draft, profile, records):
+            del draft, profile, records
+            return {
+                "summary": "",
+                "notes": "",
+                "warnings": [],
+                "acceptedUrls": [
+                    "https://www.bilibili.com/video/BV1vL5ozzEyp/",
+                    "https://www.bilibili.com/video/BV1Pr4y1Q74W/",
+                    "https://www.bilibili.com/video/BV1Y34y1p7e7/",
+                ],
+            }
+
+    payload = sample_request()
+    payload["items"][0]["workTypeHint"] = "concerto"
+    payload["items"][0]["sourceLine"] = "Robert Schumann | Piano Concerto in A minor, Op.54 | Alfred Cortot | - | -"
+    payload["items"][0]["seed"]["title"] = "Alfred Cortot"
+    payload["items"][0]["seed"]["composerNameLatin"] = "Robert Schumann"
+    payload["items"][0]["seed"]["workTitleLatin"] = "Piano Concerto in A minor, Op.54"
+    payload["items"][0]["seed"]["catalogue"] = "Op.54"
+    payload["items"][0]["seed"]["performanceDateText"] = "1951"
+    payload["items"][0]["seed"]["credits"] = [
+        {"role": "soloist", "displayName": "Alfred Cortot", "label": "Alfred Cortot"},
+    ]
+    request = CreateJobRequest.model_validate(payload)
+    pipeline = RetrievalPipeline(source_provider=CortotPartialProvider(), llm_client=CortotPartialLlm())
+
+    result = asyncio.run(pipeline.retrieve(request.items[0]))
+
+    final_urls = [link.url for link in result.result.links]
+    assert "https://www.bilibili.com/video/BV1vL5ozzEyp/" in final_urls
+    assert "https://www.bilibili.com/video/BV1Pr4y1Q74W/" in final_urls
+    assert "https://www.bilibili.com/video/BV1Y34y1p7e7/" in final_urls
+
+
 def test_pipeline_aclose_closes_source_provider() -> None:
     provider = ClosableSourceProvider()
     pipeline = RetrievalPipeline(source_provider=provider, llm_client=None)
@@ -3975,6 +4839,296 @@ def test_pipeline_final_links_do_not_keep_same_platform_alternates_once_primary_
         "https://www.bilibili.com/video/BV1bestbili/",
         "https://www.youtube.com/watch?v=ytbest001",
         "https://music.apple.com/us/album/piano-concerto-in-a-minor-op-54/123456789?i=987654321",
+    ]
+
+
+def test_pipeline_chamber_solo_adds_low_confidence_cross_platform_rescues_for_appassionata_cluster() -> None:
+    class ChamberSoloCrossPlatformProvider:
+        async def inspect_existing_links(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_high_quality(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_streaming(self, draft, profile):
+            del draft, profile
+            return [
+                {
+                    "url": "https://www.bilibili.com/video/BV1JV411o7WK/",
+                    "source_label": "Bilibili Search",
+                    "source_kind": "streaming",
+                    "title": "Egon Petri plays Beethoven Piano Sonata No.23 Appassionata Op.57",
+                    "description": "Historic upload. Egon Petri 1956.",
+                    "platform": "bilibili",
+                    "weight": 0.72,
+                    "same_recording_score": 0.73,
+                    "duration_seconds": 1370,
+                    "uploader": "Archive A",
+                    "view_count": 6200,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://www.bilibili.com/video/BV1WnkiYWErt/",
+                    "source_label": "Bilibili Search",
+                    "source_kind": "streaming",
+                    "title": "所罗门《贝多芬：第二十三钢琴奏鸣曲“热情”》",
+                    "description": "Wrong soloist",
+                    "platform": "bilibili",
+                    "weight": 0.7,
+                    "same_recording_score": 0.53,
+                    "duration_seconds": 1315,
+                    "uploader": "Archive B",
+                    "view_count": 2300,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://www.youtube.com/watch?v=jEVt42o8UEQ",
+                    "source_label": "YouTube Search",
+                    "source_kind": "streaming",
+                    "title": 'Beethoven: Piano Sonata No. 23 in F Minor, Op. 57 "Appassionata": I. Allegro assai',
+                    "description": "Egon Petri 1956 complete recording",
+                    "platform": "youtube",
+                    "weight": 0.68,
+                    "same_recording_score": 0.61,
+                    "duration_seconds": 1360,
+                    "uploader": "Archive YT 1",
+                    "view_count": 4100,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://www.youtube.com/watch?v=3oo93lgs15Y",
+                    "source_label": "YouTube Search",
+                    "source_kind": "streaming",
+                    "title": 'Beethoven: Piano Sonata No. 23 in F Minor, Op. 57 "Appassionata": I. Allegro assai',
+                    "description": "Egon Petri 1956 complete recording",
+                    "platform": "youtube",
+                    "weight": 0.68,
+                    "same_recording_score": 0.61,
+                    "duration_seconds": 1362,
+                    "uploader": "Archive YT 2",
+                    "view_count": 3800,
+                    "fields": {},
+                    "images": [],
+                },
+            ]
+
+        async def search_fallback(self, draft, profile):
+            del draft, profile
+            return []
+
+    payload = sample_request()
+    payload["items"][0]["workTypeHint"] = "chamber_solo"
+    payload["items"][0]["sourceLine"] = "Ludwig van Beethoven | Piano Sonata No.23, Op.57 | Egon Petri | 1956"
+    payload["items"][0]["seed"]["title"] = "Egon Petri 1956"
+    payload["items"][0]["seed"]["composerNameLatin"] = "Ludwig van Beethoven"
+    payload["items"][0]["seed"]["workTitleLatin"] = "Piano Sonata No.23, Op.57"
+    payload["items"][0]["seed"]["workTitle"] = "第二十三号奏鸣曲，热情"
+    payload["items"][0]["seed"]["catalogue"] = "Op.57"
+    payload["items"][0]["seed"]["credits"] = [
+        {"role": "soloist", "displayName": "Egon Petri", "label": "Egon Petri"},
+    ]
+    request = CreateJobRequest.model_validate(payload)
+    pipeline = RetrievalPipeline(source_provider=ChamberSoloCrossPlatformProvider(), llm_client=None)
+
+    result = asyncio.run(pipeline.retrieve(request.items[0]))
+
+    final_urls = [candidate.url for candidate in result.result.links]
+    assert "https://www.bilibili.com/video/BV1JV411o7WK/" in final_urls
+    assert "https://www.youtube.com/watch?v=jEVt42o8UEQ" in final_urls
+    assert "https://www.youtube.com/watch?v=3oo93lgs15Y" in final_urls
+    assert len(final_urls) >= 3
+
+
+def test_pipeline_chamber_solo_adds_same_platform_low_confidence_exact_title_rescue() -> None:
+    class ChamberSoloSamePlatformProvider:
+        async def inspect_existing_links(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_high_quality(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_streaming(self, draft, profile):
+            del draft, profile
+            return [
+                {
+                    "url": "https://music.apple.com/us/album/sonata-no-23-in-f-minor-op-57-appassionata-i-allegro-assai/589787212?i=589787324&uo=4",
+                    "source_label": "Apple Music Search",
+                    "source_kind": "streaming",
+                    "title": 'Sonata No. 23 in F Minor, Op. 57 "Appassionata": I. Allegro assai',
+                    "description": "Walter Gieseking",
+                    "platform": "apple_music",
+                    "weight": 0.7,
+                    "same_recording_score": 0.69,
+                    "duration_seconds": 620,
+                    "uploader": "Walter Gieseking",
+                    "view_count": 0,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://www.youtube.com/watch?v=A-LWnNJ1Yhc",
+                    "source_label": "YouTube Search",
+                    "source_kind": "streaming",
+                    "title": "Walter Gieseking, piano - Beethoven - Sonata in F minor, Op. 57 ('Appassionata') (1949 - complete)",
+                    "description": "Complete recording",
+                    "platform": "youtube",
+                    "weight": 0.72,
+                    "same_recording_score": 0.8,
+                    "duration_seconds": 1365,
+                    "uploader": "Uploader YT A",
+                    "view_count": 5200,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://www.youtube.com/watch?v=bETptkdwA5U",
+                    "source_label": "YouTube Search",
+                    "source_kind": "streaming",
+                    "title": "Beethoven - Piano sonata n°23 - Gieseking 1939",
+                    "description": "Historic recording",
+                    "platform": "youtube",
+                    "weight": 0.71,
+                    "same_recording_score": 0.77,
+                    "duration_seconds": 1320,
+                    "uploader": "Uploader YT B",
+                    "view_count": 4100,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://www.youtube.com/watch?v=eMi5KZ4lDCA",
+                    "source_label": "YouTube Search",
+                    "source_kind": "streaming",
+                    "title": 'Walter Gieseking plays Beethoven Piano Sonata No.23 "Appassionata" (1947)',
+                    "description": "Target exact upload",
+                    "platform": "youtube",
+                    "weight": 0.68,
+                    "same_recording_score": 0.49,
+                    "duration_seconds": 1342,
+                    "uploader": "Uploader YT C",
+                    "view_count": 1800,
+                    "fields": {},
+                    "images": [],
+                },
+            ]
+
+        async def search_fallback(self, draft, profile):
+            del draft, profile
+            return []
+
+    payload = sample_request()
+    payload["items"][0]["workTypeHint"] = "chamber_solo"
+    payload["items"][0]["sourceLine"] = "Ludwig van Beethoven | Piano Sonata No.23, Op.57 | Walter Gieseking | 1947"
+    payload["items"][0]["seed"]["title"] = "Walter Gieseking 1947"
+    payload["items"][0]["seed"]["composerNameLatin"] = "Ludwig van Beethoven"
+    payload["items"][0]["seed"]["workTitleLatin"] = "Piano Sonata No.23, Op.57"
+    payload["items"][0]["seed"]["workTitle"] = "第二十三号奏鸣曲，热情"
+    payload["items"][0]["seed"]["catalogue"] = "Op.57"
+    payload["items"][0]["seed"]["credits"] = [
+        {"role": "soloist", "displayName": "Walter Gieseking", "label": "Walter Gieseking"},
+    ]
+    request = CreateJobRequest.model_validate(payload)
+    pipeline = RetrievalPipeline(source_provider=ChamberSoloSamePlatformProvider(), llm_client=None)
+
+    result = asyncio.run(pipeline.retrieve(request.items[0]))
+
+    final_urls = [candidate.url for candidate in result.result.links]
+    assert "https://www.youtube.com/watch?v=A-LWnNJ1Yhc" in final_urls
+    assert "https://www.youtube.com/watch?v=eMi5KZ4lDCA" in final_urls
+
+
+def test_pipeline_concerto_does_not_enable_chamber_low_confidence_cross_platform_rescue() -> None:
+    class ConcertoCrossPlatformProvider:
+        async def inspect_existing_links(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_high_quality(self, draft, profile):
+            del draft, profile
+            return []
+
+        async def search_streaming(self, draft, profile):
+            del draft, profile
+            return [
+                {
+                    "url": "https://www.bilibili.com/video/BV1bestconcerto/",
+                    "source_label": "Bilibili Search",
+                    "source_kind": "streaming",
+                    "title": "Richter Ferencsik Schumann Piano Concerto Op.54 complete",
+                    "description": "Budapest 1954 full performance",
+                    "platform": "bilibili",
+                    "weight": 0.72,
+                    "same_recording_score": 0.73,
+                    "duration_seconds": 2430,
+                    "uploader": "Archive Bili",
+                    "view_count": 6200,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://www.youtube.com/watch?v=ytalt001",
+                    "source_label": "YouTube Search",
+                    "source_kind": "streaming",
+                    "title": "Schumann Piano Concerto Op.54 Richter",
+                    "description": "Alternative upload",
+                    "platform": "youtube",
+                    "weight": 0.68,
+                    "same_recording_score": 0.61,
+                    "duration_seconds": 2400,
+                    "uploader": "Archive YT 1",
+                    "view_count": 4100,
+                    "fields": {},
+                    "images": [],
+                },
+                {
+                    "url": "https://www.youtube.com/watch?v=ytalt002",
+                    "source_label": "YouTube Search",
+                    "source_kind": "streaming",
+                    "title": "Schumann Piano Concerto Op.54 Richter live",
+                    "description": "Alternative upload",
+                    "platform": "youtube",
+                    "weight": 0.68,
+                    "same_recording_score": 0.61,
+                    "duration_seconds": 2395,
+                    "uploader": "Archive YT 2",
+                    "view_count": 3900,
+                    "fields": {},
+                    "images": [],
+                },
+            ]
+
+        async def search_fallback(self, draft, profile):
+            del draft, profile
+            return []
+
+    payload = sample_request()
+    payload["items"][0]["workTypeHint"] = "concerto"
+    payload["items"][0]["sourceLine"] = (
+        "Robert Schumann | Piano Concerto in A minor, Op.54 | Sviatoslav Richter | "
+        "Janos Ferencsik | Budapest | 1954"
+    )
+    payload["items"][0]["seed"]["title"] = "Richter Budapest 1954"
+    payload["items"][0]["seed"]["composerNameLatin"] = "Robert Schumann"
+    payload["items"][0]["seed"]["workTitleLatin"] = "Piano Concerto in A minor, Op.54"
+    payload["items"][0]["seed"]["catalogue"] = "Op.54"
+    payload["items"][0]["seed"]["credits"] = [
+        {"role": "soloist", "displayName": "Sviatoslav Richter", "label": "Sviatoslav Richter"},
+        {"role": "conductor", "displayName": "Janos Ferencsik", "label": "Janos Ferencsik"},
+    ]
+    request = CreateJobRequest.model_validate(payload)
+    pipeline = RetrievalPipeline(source_provider=ConcertoCrossPlatformProvider(), llm_client=None)
+
+    result = asyncio.run(pipeline.retrieve(request.items[0]))
+
+    assert [candidate.url for candidate in result.result.links] == [
+        "https://www.bilibili.com/video/BV1bestconcerto/",
     ]
 
 

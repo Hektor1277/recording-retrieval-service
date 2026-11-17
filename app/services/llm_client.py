@@ -30,12 +30,43 @@ class LlmConfigBundle:
     reasoning: ModelConfig
 
 
+def runtime_config_root() -> Path:
+    app_data_dir = str(os.getenv("ICM_APP_DATA_DIR", "")).strip()
+    if app_data_dir:
+        return Path(app_data_dir).resolve() / "retrieval-service" / "config"
+    return Path(__file__).resolve().parents[2] / "config"
+
+
 def default_llm_config_path() -> Path:
-    return Path(__file__).resolve().parents[2] / "config" / "llm.local.json"
+    return runtime_config_root() / "llm.local.json"
+
+
+def example_llm_config_path() -> Path:
+    return Path(__file__).resolve().parents[2] / "config" / "llm.example.json"
 
 
 def legacy_llm_config_path() -> Path:
     return materials_root() / "LLM config.txt"
+
+
+def default_llm_config_payload() -> dict[str, Any]:
+    return {
+        "enabled": False,
+        "fastModel": {
+            "enabled": False,
+            "baseUrl": "",
+            "apiKey": "",
+            "model": "",
+            "timeoutMs": 12000,
+        },
+        "reasoningModel": {
+            "enabled": False,
+            "baseUrl": "",
+            "apiKey": "",
+            "model": "",
+            "timeoutMs": 30000,
+        },
+    }
 
 
 def _normalize_model_config(payload: dict[str, Any]) -> ModelConfig:
@@ -117,10 +148,25 @@ def migrate_legacy_llm_config(legacy_path: Path | None = None, runtime_path: Pat
     return True
 
 
+def ensure_runtime_llm_config(runtime_path: Path | None = None, example_path: Path | None = None) -> Path:
+    target_path = runtime_path or default_llm_config_path()
+    if target_path.is_file():
+        return target_path
+
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    source_path = example_path or example_llm_config_path()
+    if source_path.is_file():
+        target_path.write_text(source_path.read_text(encoding="utf-8"), encoding="utf-8")
+    else:
+        target_path.write_text(json.dumps(default_llm_config_payload(), ensure_ascii=False, indent=2), encoding="utf-8")
+    return target_path
+
+
 def load_llm_config(path: Path | None = None) -> LlmConfigBundle:
     config_path = path or default_llm_config_path()
     if path is None:
         migrate_legacy_llm_config()
+        ensure_runtime_llm_config(config_path)
 
     payload: dict[str, Any] = {}
     if config_path.is_file():

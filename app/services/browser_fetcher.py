@@ -152,6 +152,8 @@ class PlaywrightBrowserFetcher:
         except asyncio.TimeoutError as error:
             task.cancel()
             task.add_done_callback(_silence_task_exception)
+            with suppress(asyncio.CancelledError, Exception):
+                await task
             raise TimeoutError("browser fetch timed out") from error
 
     async def _fetch_page_inner(self, url: str, *, timeout_seconds: float) -> dict[str, str]:

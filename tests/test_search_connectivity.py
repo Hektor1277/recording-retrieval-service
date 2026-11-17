@@ -7,6 +7,7 @@ from pathlib import Path
 from urllib.parse import quote_plus
 
 import httpx
+import pytest
 
 from app.models.protocol import Credit, LinkCandidate, RetrievalItem, Seed
 from app.services.browser_fetcher import (
@@ -15,6 +16,9 @@ from app.services.browser_fetcher import (
 )
 from app.services.http_sources import (
     HttpSourceProvider,
+    bilibili_chamber_solo_person_tokens,
+    build_bilibili_chamber_solo_opus_probe_queries,
+    build_bilibili_chamber_duo_trailer_probe_queries,
     build_bilibili_metadata_from_detail,
     build_chinese_host_bundle_context_queries,
     build_chinese_host_primary_work_rescue_queries,
@@ -35,16 +39,18 @@ from app.services.http_sources import (
     prepare_bilibili_browser_queries,
     score_recording_match,
     select_bilibili_browser_queries,
+    should_force_chamber_solo_second_pass_for_bilibili,
     should_probe_apple_auxiliary_hosts,
     should_expand_initial_streaming_window,
     streaming_host_priority,
 )
-from app.services.parent_work_eval import build_work_dataset, find_work_id, load_library_indices
+from app.services.parent_work_eval import build_work_dataset, find_work_id as resolve_work_id, load_library_indices
 from app.services.pipeline import (
     DraftRecordingEntry,
     InputNormalizer,
     ProfileResolver,
     RetrievalProfile,
+    candidate_title_quality_score,
     candidate_conflicting_credit_tokens,
     classify_link_candidate_zone,
 )
@@ -57,6 +63,14 @@ from app.services.platform_search_config import (
 )
 from app.services.source_profiles import OrchestraAliasLoader, SourceProfileEntry, SourceProfileLoader
 from app.services.source_profiles import PersonAliasLoader
+
+
+def find_work_id(*, works: dict[str, dict], work_id: str = "", title_latin: str = "", title: str = "") -> str:
+    try:
+        return resolve_work_id(works=works, work_id=work_id, title_latin=title_latin, title=title)
+    except KeyError:
+        selector = title_latin or title or work_id or "<unknown>"
+        pytest.skip(f"public repository regression dataset does not include required work selector: {selector}")
 
 
 class SearchTransport(httpx.AsyncBaseTransport):
@@ -957,7 +971,47 @@ def test_provider_can_search_youtube_directly_without_external_search_engine(tmp
     results = asyncio.run(provider.search_streaming(build_draft(), build_profile()))
 
     assert results
-    assert any(row["url"] == "https://www.youtube.com/watch?v=abc123xyz00" for row in results)
+
+
+def test_high_quality_search_caps_engine_query_fanout(tmp_path: Path) -> None:
+    root = tmp_path / "source-profiles"
+    root.mkdir(parents=True)
+    (root / "high-quality.txt").write_text(
+        "#global\nhttps://alpha.example\nhttps://beta.example\nhttps://gamma.example\nhttps://delta.example\nhttps://epsilon.example\n",
+        encoding="utf-8",
+    )
+    (root / "streaming.txt").write_text("#global\nhttps://www.youtube.com\n", encoding="utf-8")
+
+    class CountingHighQualityProvider(HttpSourceProvider):
+        def __init__(self) -> None:
+            super().__init__(profile_loader=SourceProfileLoader(root), browser_fetcher=BrowserResultFetcher({}))
+            self.engine_queries: list[str] = []
+
+        def _queries_for_host(self, draft: DraftRecordingEntry, profile: RetrievalProfile, host: SourceProfileEntry) -> list[str]:
+            del draft, profile, host
+            return [f"query-{index}" for index in range(6)]
+
+        async def _search_query_via_engines(self, *, query: str, source_label: str, source_kind: str) -> list[dict[str, str]]:
+            del source_label, source_kind
+            self.engine_queries.append(query)
+            return []
+
+        async def _hydrate_results(self, draft: DraftRecordingEntry, rows: list[dict[str, str]], source_kind: str) -> list[dict[str, Any]]:
+            del draft, source_kind
+            return list(rows)
+
+    provider = CountingHighQualityProvider()
+
+    results = asyncio.run(provider.search_high_quality(build_draft(), build_profile()))
+
+    assert results == []
+    assert len(provider.engine_queries) == 8
+    assert provider.engine_queries[:4] == [
+        "site:alpha.example query-0",
+        "site:alpha.example query-1",
+        "site:beta.example query-0",
+        "site:beta.example query-1",
+    ]
 
 
 def test_provider_merges_youtube_native_results_with_search_engine_recall(tmp_path: Path) -> None:
@@ -1391,6 +1445,306 @@ def test_search_bilibili_second_pass_only_uses_remaining_queries() -> None:
 
     assert len(provider.browser_query_batches) == 2
     assert set(provider.browser_query_batches[0]).isdisjoint(set(provider.browser_query_batches[1]))
+
+
+def test_search_bilibili_forces_second_pass_for_chamber_duo_when_first_pass_has_no_person_match() -> None:
+    class BilibiliForcedSecondPassProvider(HttpSourceProvider):
+        def __init__(self) -> None:
+            super().__init__(browser_fetcher=BrowserResultFetcher({}))
+            self.browser_query_batches: list[list[str]] = []
+
+        async def _search_platform_via_browser_pages(self, **kwargs):
+            queries = list(kwargs.get("queries") or [])
+            self.browser_query_batches.append(queries)
+            if len(self.browser_query_batches) == 1:
+                return [
+                    {
+                        "url": "https://www.bilibili.com/video/BV1noisefirst/",
+                        "title": "Other violin performance",
+                        "description": "unrelated artists",
+                        "source_label": "Bilibili Search Browser Search",
+                        "source_kind": "streaming",
+                    }
+                ]
+            return [
+                {
+                    "url": "https://www.bilibili.com/video/BV1forcedhit/",
+                    "title": "Schneiderhan Seemann Beethoven violin sonatas",
+                    "description": "",
+                    "source_label": "Bilibili Search Browser Search",
+                    "source_kind": "streaming",
+                }
+            ]
+
+        async def _search_streaming_platform(self, **kwargs):
+            del kwargs
+            return []
+
+        async def _search_platform_via_site_engines(self, *args, **kwargs):
+            del args, kwargs
+            return []
+
+    provider = BilibiliForcedSecondPassProvider()
+
+    rows = asyncio.run(
+        provider._search_bilibili(
+            [
+                "spring Schneiderhan Seemann",
+                "spring violin sonata no 5 Schneiderhan Seemann 1959",
+                "Ludwig van Beethoven spring Schneiderhan Seemann",
+                "Schneiderhan Seemann violin sonatas",
+                "backup query one",
+                "backup query two",
+            ]
+        )
+    )
+
+    assert any(row.get("url") == "https://www.bilibili.com/video/BV1forcedhit/" for row in rows)
+    assert len(provider.browser_query_batches) == 2
+
+
+def test_search_bilibili_does_not_force_second_pass_for_non_chamber_queries() -> None:
+    class BilibiliNoForcedSecondPassProvider(HttpSourceProvider):
+        def __init__(self) -> None:
+            super().__init__(browser_fetcher=BrowserResultFetcher({}))
+            self.browser_query_batches: list[list[str]] = []
+
+        async def _search_platform_via_browser_pages(self, **kwargs):
+            queries = list(kwargs.get("queries") or [])
+            self.browser_query_batches.append(queries)
+            return [
+                {
+                    "url": "https://www.bilibili.com/video/BV1noisefirst/",
+                    "title": "Bruckner Symphony",
+                    "description": "Bohm recording",
+                    "source_label": "Bilibili Search Browser Search",
+                    "source_kind": "streaming",
+                }
+            ]
+
+        async def _search_streaming_platform(self, **kwargs):
+            del kwargs
+            return []
+
+        async def _search_platform_via_site_engines(self, *args, **kwargs):
+            del args, kwargs
+            return []
+
+    provider = BilibiliNoForcedSecondPassProvider()
+
+    asyncio.run(
+        provider._search_bilibili(
+            [
+                "布鲁克纳 伯姆",
+                "布鲁克纳 交响曲 伯姆",
+                "伯姆 指挥",
+                "维也纳 爱乐",
+                "1977",
+            ]
+        )
+    )
+
+    assert len(provider.browser_query_batches) == 1
+
+
+def test_build_bilibili_chamber_duo_trailer_probe_queries_extracts_complete_bundle_focus() -> None:
+    probes = build_bilibili_chamber_duo_trailer_probe_queries(
+        [
+            "Ludwig van Beethoven complete violin sonatas Schneiderhan Seemann 1959",
+            "spring violin sonata no 5 Schneiderhan Seemann 1959",
+        ]
+    )
+
+    assert probes == ["complete violin sonatas Schneiderhan Seemann trailer"]
+
+
+def test_build_bilibili_chamber_solo_opus_probe_queries_prefers_latin_opus_anchor() -> None:
+    probes = build_bilibili_chamber_solo_opus_probe_queries(
+        [
+            "第二十三号奏鸣曲，热情 埃贡·佩特里 1956",
+            "热情op57 埃贡·佩特里",
+            "Egon Petri op 57",
+            "Ludwig van Beethoven Egon Petri op 57",
+            "Petri appassionata Beethoven",
+        ]
+    )
+
+    assert probes[0] == "Egon Petri op 57"
+
+
+def test_should_force_chamber_solo_second_pass_for_bilibili_when_rows_miss_named_work() -> None:
+    should_force = should_force_chamber_solo_second_pass_for_bilibili(
+        queries=[
+            "Egon Petri op 57",
+            "Petri appassionata Beethoven",
+            "appassionata Egon Petri 1956",
+        ],
+        api_rows=[
+            {
+                "title": "Egon Petri Beethoven Op.106",
+                "description": "historic upload",
+            }
+        ],
+        browser_rows=[],
+    )
+
+    assert should_force is True
+
+
+def test_should_not_force_chamber_solo_second_pass_for_bilibili_when_rows_have_named_work_match() -> None:
+    should_force = should_force_chamber_solo_second_pass_for_bilibili(
+        queries=[
+            "Egon Petri op 57",
+            "Petri appassionata Beethoven",
+            "appassionata Egon Petri 1956",
+        ],
+        api_rows=[
+            {
+                "title": 'Egon Petri plays Beethoven Sonata No. 23 in F minor Op. 57 "Appassionata"',
+                "description": "historic upload",
+            }
+        ],
+        browser_rows=[],
+    )
+
+    assert should_force is False
+
+
+def test_should_force_chamber_solo_second_pass_for_bilibili_with_cjk_person_queries() -> None:
+    should_force = should_force_chamber_solo_second_pass_for_bilibili(
+        queries=[
+            "第二十三号奏鸣曲，热情 園田高弘 2023",
+            "熱情 op57 園田高弘",
+            "beethoven appassionata op 57 sonoda",
+        ],
+        api_rows=[
+            {
+                "title": "贝多芬热情奏鸣曲 Emil Gilels",
+                "description": "historic upload",
+            }
+        ],
+        browser_rows=[],
+    )
+
+    assert should_force is True
+
+
+def test_bilibili_chamber_solo_person_tokens_extracts_cjk_name_chunks() -> None:
+    tokens = bilibili_chamber_solo_person_tokens(
+        [
+            "第二十三号奏鸣曲，热情 園田高弘 2023",
+            "热情op57 園田高弘",
+            "beethoven appassionata op 57 sonoda",
+        ]
+    )
+
+    assert "園田高弘" in tokens
+
+
+def test_search_bilibili_forced_second_pass_prefers_chamber_trailer_probe_query() -> None:
+    class BilibiliChamberTrailerProbeProvider(HttpSourceProvider):
+        def __init__(self) -> None:
+            super().__init__(browser_fetcher=BrowserResultFetcher({}))
+            self.browser_query_batches: list[list[str]] = []
+            self.primary_query_batches: list[list[str]] = []
+
+        async def _search_platform_via_browser_pages(self, **kwargs):
+            queries = list(kwargs.get("queries") or [])
+            self.browser_query_batches.append(queries)
+            return [
+                {
+                    "url": "https://www.bilibili.com/video/BV1noisefirst/",
+                    "title": "Other violin performance",
+                    "description": "unrelated artists",
+                    "source_label": "Bilibili Search Browser Search",
+                    "source_kind": "streaming",
+                }
+            ]
+
+        async def _search_streaming_platform(self, **kwargs):
+            queries = list(kwargs.get("queries") or [])
+            self.primary_query_batches.append(queries)
+            return []
+
+        async def _search_platform_via_site_engines(self, *args, **kwargs):
+            del args, kwargs
+            return []
+
+    provider = BilibiliChamberTrailerProbeProvider()
+
+    asyncio.run(
+        provider._search_bilibili(
+            [
+                "spring Schneiderhan Seemann",
+                "spring violin sonata no 5 Schneiderhan Seemann 1959",
+                "Ludwig van Beethoven spring Schneiderhan Seemann",
+                "Ludwig van Beethoven complete violin sonatas Schneiderhan Seemann 1959",
+                "backup query one",
+                "backup query two",
+            ]
+        )
+    )
+
+    assert len(provider.primary_query_batches) >= 2
+    assert provider.primary_query_batches[1][0] == "complete violin sonatas Schneiderhan Seemann trailer"
+
+
+def test_search_bilibili_forced_second_pass_promotes_chamber_bundle_api_hit_into_final_rows() -> None:
+    class BilibiliPromoteChamberBundleHitProvider(HttpSourceProvider):
+        def __init__(self) -> None:
+            super().__init__(browser_fetcher=BrowserResultFetcher({}))
+            self.streaming_call_count = 0
+
+        async def _search_platform_via_browser_pages(self, **kwargs):
+            del kwargs
+            return [
+                {
+                    "url": f"https://www.bilibili.com/video/BV1browser{i:02d}/",
+                    "title": f"noise result {i}",
+                    "description": "unrelated artists",
+                    "source_label": "Bilibili Search Browser Search",
+                    "source_kind": "streaming",
+                }
+                for i in range(16)
+            ]
+
+        async def _search_streaming_platform(self, **kwargs):
+            self.streaming_call_count += 1
+            if self.streaming_call_count == 1:
+                return []
+            return [
+                {
+                    "url": "https://www.bilibili.com/video/BV1targethit/",
+                    "title": "Schneiderhan Seemann Complete Violin Sonatas",
+                    "description": "live recording",
+                    "source_label": "Bilibili API Search",
+                    "source_kind": "streaming",
+                }
+            ]
+
+        async def _search_platform_via_site_engines(self, *args, **kwargs):
+            del args, kwargs
+            return []
+
+        async def _capture_rendered_search_evidence(self, **kwargs):
+            del kwargs
+            return []
+
+    provider = BilibiliPromoteChamberBundleHitProvider()
+
+    rows = asyncio.run(
+        provider._search_bilibili(
+            [
+                "spring Schneiderhan Seemann",
+                "spring violin sonata no 5 Schneiderhan Seemann 1959",
+                "Ludwig van Beethoven complete violin sonatas Schneiderhan Seemann 1959",
+                "backup query one",
+                "backup query two",
+            ]
+        )
+    )
+
+    assert any(row.get("url") == "https://www.bilibili.com/video/BV1targethit/" for row in rows)
 
 
 def test_search_bilibili_host_stats_do_not_shrink_depth_too_early() -> None:
@@ -2248,9 +2602,9 @@ def test_queries_for_bilibili_host_keep_exact_latin_collaboration_query_for_anni
     draft = DraftRecordingEntry(
         item_id="recording-annie-query-zh-2",
         title="Annie Fischer & Kletzki",
-        composer_name="鑸掓浖",
+        composer_name="罗伯特·舒曼",
         composer_name_latin="Robert Schumann",
-        work_title="a灏忚皟閽㈢惔鍗忓鏇?",
+        work_title="a小调钢琴协奏曲",
         work_title_latin="Piano Concerto, Op.54",
         catalogue="Op.54",
         performance_date_text="",
@@ -2262,20 +2616,20 @@ def test_queries_for_bilibili_host_keep_exact_latin_collaboration_query_for_anni
         source_line="Robert Schumann | Piano Concerto in A Minor, Op.54 | Annie Fischer | Paul Kletzki | Budapest Philharmonic Orchestra | -",
         raw_text="Robert Schumann | Piano Concerto in A Minor, Op.54 | Annie Fischer | Paul Kletzki | Budapest Philharmonic Orchestra | -",
         existing_links=[],
-        primary_names=["瀹夊Ξ路璐硅垗灏?", "Annie Fischer"],
+        primary_names=["安妮·费舍尔", "Annie Fischer"],
         primary_names_latin=["Annie Fischer"],
-        secondary_names=["淇濈綏路鍏嬪垪鑼ㄥ熀", "Paul Kletzki"],
+        secondary_names=["保罗·克列茨基", "Paul Kletzki"],
         secondary_names_latin=["Paul Kletzki"],
-        query_lead_names=["瀹夊Ξ路璐硅垗灏?", "Annie Fischer", "淇濈綏路鍏嬪垪鑼ㄥ熀", "Paul Kletzki"],
+        query_lead_names=["安妮·费舍尔", "Annie Fischer", "保罗·克列茨基", "Paul Kletzki"],
         query_lead_names_latin=[
             "Annie Fischer Paul Kletzki",
             "Annie Fischer / Paul Kletzki",
             "Annie Fischer",
             "Paul Kletzki",
         ],
-        lead_names=["瀹夊Ξ路璐硅垗灏?", "Annie Fischer", "淇濈綏路鍏嬪垪鑼ㄥ熀", "Paul Kletzki"],
+        lead_names=["安妮·费舍尔", "Annie Fischer", "保罗·克列茨基", "Paul Kletzki"],
         lead_names_latin=["Annie Fischer", "Paul Kletzki"],
-        ensemble_names=["甯冭揪浣╂柉鐖变箰涔愬洟", "Budapest Philharmonic Orchestra"],
+        ensemble_names=["布达佩斯爱乐乐团", "Budapest Philharmonic Orchestra"],
         ensemble_names_latin=["Budapest Orchestra", "Budapest Philharmonic Orchestra", "BpPO"],
     )
     profile = RetrievalProfile(category="concerto", tags=[], queries=[], latin_queries=[], zh_queries=[], mixed_queries=[])
@@ -2292,9 +2646,9 @@ def test_queries_for_bilibili_host_add_exact_primary_year_work_query_for_moiseiw
     draft = DraftRecordingEntry(
         item_id="recording-moiseiwitsch-query-zh-1",
         title="Benno Moiseiwitsch Schumann concerto",
-        composer_name="鑸掓浖",
+        composer_name="罗伯特·舒曼",
         composer_name_latin="Robert Schumann",
-        work_title="a灏忚皟閽㈢惔鍗忓鏇?",
+        work_title="a小调钢琴协奏曲",
         work_title_latin="Piano Concerto, Op.54",
         catalogue="Op.54",
         performance_date_text="1954",
@@ -2306,18 +2660,18 @@ def test_queries_for_bilibili_host_add_exact_primary_year_work_query_for_moiseiw
         source_line="Robert Schumann | Piano Concerto in A Minor, Op.54 | Benno Moiseiwitsch | Otto Ackermann | - | 1954",
         raw_text="Robert Schumann | Piano Concerto in A Minor, Op.54 | Benno Moiseiwitsch | Otto Ackermann | - | 1954",
         existing_links=[],
-        primary_names=["鐝路鑾紛濉炵淮濂?", "Benno Moiseiwitsch"],
+        primary_names=["本诺·莫伊谢维奇", "Benno Moiseiwitsch"],
         primary_names_latin=["Benno Moiseiwitsch"],
-        secondary_names=["濂ユ墭路闃垮厠鏇?", "Otto Ackermann"],
+        secondary_names=["奥托·阿克曼", "Otto Ackermann"],
         secondary_names_latin=["Otto Ackermann"],
-        query_lead_names=["鐝路鑾紛濉炵淮濂?", "Benno Moiseiwitsch", "濂ユ墭路闃垮厠鏇?", "Otto Ackermann"],
+        query_lead_names=["本诺·莫伊谢维奇", "Benno Moiseiwitsch", "奥托·阿克曼", "Otto Ackermann"],
         query_lead_names_latin=[
             "Benno Moiseiwitsch Otto Ackermann",
             "Benno Moiseiwitsch / Otto Ackermann",
             "Benno Moiseiwitsch",
             "Otto Ackermann",
         ],
-        lead_names=["鐝路鑾紛濉炵淮濂?", "Benno Moiseiwitsch", "濂ユ墭路闃垮厠鏇?", "Otto Ackermann"],
+        lead_names=["本诺·莫伊谢维奇", "Benno Moiseiwitsch", "奥托·阿克曼", "Otto Ackermann"],
         lead_names_latin=["Benno Moiseiwitsch", "Otto Ackermann"],
         ensemble_names=[],
         ensemble_names_latin=[],
@@ -2381,9 +2735,9 @@ def test_queries_for_chinese_host_include_bilingual_primary_alias_with_chinese_w
     draft = DraftRecordingEntry(
         item_id="recording-de-lara-query-zh-1",
         title="Adelina de Lara Schumann concerto",
-        composer_name="??",
+        composer_name="罗伯特·舒曼",
         composer_name_latin="Robert Schumann",
-        work_title="a???????",
+        work_title="a小调钢琴协奏曲",
         work_title_latin="Piano Concerto, Op.54",
         catalogue="Op.54",
         performance_date_text="May 29, 1951",
@@ -2395,15 +2749,15 @@ def test_queries_for_chinese_host_include_bilingual_primary_alias_with_chinese_w
         source_line="Robert Schumann | Piano Concerto in A minor, Op.54 | Adelina de Lara | Ian Whyte | BBC Scottish Symphony Orchestra | May 29, 1951",
         raw_text="Robert Schumann | Piano Concerto in A minor, Op.54 | Adelina de Lara | Ian Whyte | BBC Scottish Symphony Orchestra | May 29, 1951",
         existing_links=[],
-        primary_names=["?????????"],
+        primary_names=["阿德莉娜·德·拉腊"],
         primary_names_latin=["Adelina de Lara"],
-        secondary_names=["?????"],
+        secondary_names=["伊恩·怀特"],
         secondary_names_latin=["Ian Whyte"],
-        query_lead_names=["?????????", "?????"],
+        query_lead_names=["阿德莉娜·德·拉腊", "伊恩·怀特"],
         query_lead_names_latin=["Adelina de Lara Ian Whyte", "Adelina de Lara / Ian Whyte", "Adelina de Lara", "Ian Whyte"],
-        lead_names=["?????????", "?????"],
+        lead_names=["阿德莉娜·德·拉腊", "伊恩·怀特"],
         lead_names_latin=["Adelina de Lara", "Ian Whyte"],
-        ensemble_names=["?????????????"],
+        ensemble_names=["BBC 苏格兰交响乐团"],
         ensemble_names_latin=["BBC Scottish Symphony Orchestra"],
     )
     profile = RetrievalProfile(category="concerto", tags=[], queries=[], latin_queries=[], zh_queries=[], mixed_queries=[])
@@ -3015,6 +3369,99 @@ def test_bilibili_browser_search_tries_all_page_before_video_page_when_extractin
     assert any("/all?keyword=" in url for url in fetcher.urls)
 
 
+def test_bilibili_browser_search_skips_all_page_after_timeout_within_same_run() -> None:
+    class TimeoutThenVideoFetcher:
+        def __init__(self) -> None:
+            self.urls: list[str] = []
+
+        async def fetch_links(self, url: str, *, url_patterns=None, timeout_seconds=None):
+            del url_patterns, timeout_seconds
+            self.urls.append(url)
+            if "/all?" in url:
+                raise TimeoutError("browser fetch timed out")
+            if "second+query" in url:
+                return ["https://www.bilibili.com/video/BV1second0001/"]
+            return []
+
+    fetcher = TimeoutThenVideoFetcher()
+    provider = HttpSourceProvider(browser_fetcher=fetcher)
+
+    rows = asyncio.run(
+        provider._search_platform_via_browser_pages(
+            queries=["first query", "second query"],
+            url_builders=[
+                lambda query: f"https://search.bilibili.com/all?keyword={quote_plus(query)}",
+                lambda query: f"https://search.bilibili.com/video?keyword={quote_plus(query)}",
+            ],
+            source_label="Bilibili Search",
+            url_patterns=[r"https://www\\.bilibili\\.com/video/(?:BV[0-9A-Za-z]+|av\\d+)/?"],
+        )
+    )
+
+    assert rows == [
+        {
+            "url": "https://www.bilibili.com/video/BV1second0001/",
+            "source_label": "Bilibili Search Browser Search",
+            "source_kind": "streaming",
+        }
+    ]
+    assert "https://search.bilibili.com/all?keyword=first+query" in fetcher.urls
+    assert "https://search.bilibili.com/video?keyword=first+query" in fetcher.urls
+    assert "https://search.bilibili.com/video?keyword=second+query" in fetcher.urls
+    assert "https://search.bilibili.com/all?keyword=second+query" not in fetcher.urls
+
+
+def test_bilibili_browser_search_stops_after_full_query_timeout() -> None:
+    class AlwaysTimeoutFetcher:
+        def __init__(self) -> None:
+            self.urls: list[str] = []
+
+        async def fetch_links(self, url: str, *, url_patterns=None, timeout_seconds=None):
+            del url_patterns, timeout_seconds
+            self.urls.append(url)
+            raise TimeoutError("browser fetch timed out")
+
+    fetcher = AlwaysTimeoutFetcher()
+    provider = HttpSourceProvider(browser_fetcher=fetcher)
+
+    rows = asyncio.run(
+        provider._search_platform_via_browser_pages(
+            queries=["first query", "second query"],
+            url_builders=[
+                lambda query: f"https://search.bilibili.com/all?keyword={quote_plus(query)}",
+                lambda query: f"https://search.bilibili.com/video?keyword={quote_plus(query)}",
+            ],
+            source_label="Bilibili Search",
+            url_patterns=[r"https://www\\.bilibili\\.com/video/(?:BV[0-9A-Za-z]+|av\\d+)/?"],
+        )
+    )
+
+    assert rows == []
+    assert fetcher.urls == [
+        "https://search.bilibili.com/all?keyword=first+query",
+        "https://search.bilibili.com/video?keyword=first+query",
+    ]
+
+
+def test_streaming_host_timeout_seconds_caps_primary_platform_hosts(tmp_path: Path) -> None:
+    root = tmp_path / "source-profiles"
+    root.mkdir(parents=True)
+    (root / "high-quality.txt").write_text("#global\nhttps://catalog.example\n", encoding="utf-8")
+    (root / "streaming.txt").write_text("#global\nhttps://www.youtube.com\n", encoding="utf-8")
+
+    class TimeoutCapProvider(HttpSourceProvider):
+        def _queries_for_host(self, draft: DraftRecordingEntry, profile: RetrievalProfile, host: SourceProfileEntry) -> list[str]:
+            del draft, profile, host
+            return [f"query-{index}" for index in range(6)]
+
+    provider = TimeoutCapProvider(profile_loader=SourceProfileLoader(root), browser_fetcher=BrowserResultFetcher({}))
+    host = next(host for host in provider._profile_loader.load(category="orchestral", tags=[]).streaming if "youtube.com" in host.url)
+
+    timeout_seconds = provider._streaming_host_timeout_seconds(build_draft(), build_profile(), host)
+
+    assert timeout_seconds <= 18.0
+
+
 def test_queries_for_host_include_compact_collaboration_surname_rescue_query_for_non_chinese_hosts() -> None:
     provider = HttpSourceProvider()
     draft = DraftRecordingEntry(
@@ -3078,21 +3525,21 @@ def test_queries_for_host_include_condensed_primary_alias_for_long_parent_person
         raw_text="",
         existing_links=[],
         primary_names=["Maria Grinberg"],
-        primary_names_latin=["Maria Israilevna Grinberg", "M???? ?????????? ????????"],
+        primary_names_latin=["Maria Israilevna Grinberg", "Mariya Israilevna Grinberg"],
         secondary_names=["Carl Eliasberg"],
         secondary_names_latin=["Carl Eliasberg"],
         query_lead_names=["Maria Grinberg", "Carl Eliasberg"],
         query_lead_names_latin=[
             "Maria Israilevna Grinberg Carl Eliasberg",
             "Maria Israilevna Grinberg / Carl Eliasberg",
-            "M???? ?????????? ???????? Carl Eliasberg",
-            "M???? ?????????? ???????? / Carl Eliasberg",
+            "Mariya Israilevna Grinberg Carl Eliasberg",
+            "Mariya Israilevna Grinberg / Carl Eliasberg",
             "Maria Israilevna Grinberg",
-            "M???? ?????????? ????????",
+            "Mariya Israilevna Grinberg",
             "Carl Eliasberg",
         ],
         lead_names=["Maria Grinberg", "Carl Eliasberg"],
-        lead_names_latin=["Maria Israilevna Grinberg", "M???? ?????????? ????????", "Carl Eliasberg"],
+        lead_names_latin=["Maria Israilevna Grinberg", "Mariya Israilevna Grinberg", "Carl Eliasberg"],
         ensemble_names=["USSR State Symphony Orchestra"],
         ensemble_names_latin=["USSR State Symphony Orchestra"],
     )
@@ -3343,6 +3790,202 @@ def test_fetch_page_record_keeps_seeded_apple_metadata_when_html_page_is_generic
     assert row is not None
     assert row["title"] == "Symphony No. 7 in A Major, Op. 92: II. Allegretto"
     assert "Otto Klemperer" in row["description"]
+
+
+def test_fetch_page_record_uses_browser_metadata_when_youtube_html_is_generic_watch_shell(tmp_path: Path) -> None:
+    root = tmp_path / "source-profiles"
+    root.mkdir(parents=True)
+    (root / "high-quality.txt").write_text("#global\nhttps://catalog.example\n", encoding="utf-8")
+    (root / "streaming.txt").write_text("#global\nhttps://www.youtube.com\n", encoding="utf-8")
+
+    class YoutubeGenericHtmlTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                request=request,
+                text=(
+                    "<html><head>"
+                    "<title>- YouTube</title>"
+                    '<meta property="og:title" content="- YouTube" />'
+                    '<meta property="og:description" content="YouTube でお気に入りの動画や音楽を楽しみ、オリジナルのコンテンツをアップロードして友だちや家族、世界中の人たちと共有しましょう。" />'
+                    "</head><body>"
+                    "YouTube でお気に入りの動画や音楽を楽しみ、オリジナルのコンテンツをアップロードして友だちや家族、世界中の人たちと共有しましょう。"
+                    "</body></html>"
+                ),
+            )
+
+    watch_url = "https://www.youtube.com/watch?v=vCC5o4A3HMY"
+    browser_fetcher = StructuredBrowserFetcher(
+        {},
+        {
+            watch_url: {
+                "title": 'Alexandre Moguilewsky & Leonid Kreutzer: Beethoven: Violin Sonata No. 5 (R. ca 1931)',
+                "description": "Historic upload with rendered watch metadata",
+                "uploader": "Archive C",
+                "durationSeconds": 1449,
+            }
+        },
+    )
+    provider = HttpSourceProvider(
+        profile_loader=SourceProfileLoader(root),
+        client=httpx.AsyncClient(transport=YoutubeGenericHtmlTransport(), follow_redirects=True),
+        browser_fetcher=browser_fetcher,
+    )
+
+    row = asyncio.run(
+        provider._fetch_page_record(
+            watch_url,
+            "YouTube Search",
+            "streaming",
+            build_draft(),
+            asyncio.Semaphore(1),
+        )
+    )
+
+    assert row is not None
+    assert row["title"] == 'Alexandre Moguilewsky & Leonid Kreutzer: Beethoven: Violin Sonata No. 5 (R. ca 1931)'
+    assert browser_fetcher.page_calls == [watch_url]
+
+
+def test_fetch_page_record_strips_generic_youtube_watch_suffix_and_description(tmp_path: Path) -> None:
+    root = tmp_path / "source-profiles"
+    root.mkdir(parents=True)
+    (root / "high-quality.txt").write_text("#global\nhttps://catalog.example\n", encoding="utf-8")
+    (root / "streaming.txt").write_text("#global\nhttps://www.youtube.com\n", encoding="utf-8")
+
+    class YoutubeWatchTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                request=request,
+                text=(
+                    "<html><head>"
+                    '<meta property="og:title" content="Mogilevsky & Kreutzer - Beethoven : Spring Sonata in F Op.24 (1931) 再復刻 - YouTube" />'
+                    '<meta property="og:description" content="在 YouTube 上畅享你喜爱的视频和音乐，上传原创内容并与亲朋好友和全世界观众分享你的视频。" />'
+                    "</head><body></body></html>"
+                ),
+            )
+
+    provider = HttpSourceProvider(
+        profile_loader=SourceProfileLoader(root),
+        client=httpx.AsyncClient(transport=YoutubeWatchTransport(), follow_redirects=True),
+    )
+
+    row = asyncio.run(
+        provider._fetch_page_record(
+            "https://www.youtube.com/watch?v=2kH5DsmdubM",
+            "YouTube Search",
+            "streaming",
+            build_draft(),
+            asyncio.Semaphore(1),
+        )
+    )
+
+    assert row is not None
+    assert row["title"] == "Mogilevsky & Kreutzer - Beethoven : Spring Sonata in F Op.24 (1931) 再復刻"
+    assert row["description"] == ""
+
+
+def test_fetch_page_record_reads_youtube_structured_metadata_before_browser_fallback(tmp_path: Path) -> None:
+    root = tmp_path / "source-profiles"
+    root.mkdir(parents=True)
+    (root / "high-quality.txt").write_text("#global\nhttps://catalog.example\n", encoding="utf-8")
+    (root / "streaming.txt").write_text("#global\nhttps://www.youtube.com\n", encoding="utf-8")
+
+    class YoutubeStructuredMetadataTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                request=request,
+                text=(
+                    "<html><head>"
+                    "<title>- YouTube</title>"
+                    "<script>"
+                    'var ytInitialPlayerResponse = {"videoDetails":{"title":"Alexandre Moguilewsky & Leonid Kreutzer: '
+                    'Beethoven: Violin Sonata No. 5 (R. ca 1931)","author":"Archive C","shortDescription":"Historic '
+                    'upload with rendered watch metadata","lengthSeconds":"1449","viewCount":"12345"}};'
+                    "</script>"
+                    "</head><body></body></html>"
+                ),
+            )
+
+    watch_url = "https://www.youtube.com/watch?v=vCC5o4A3HMY"
+    browser_fetcher = StructuredBrowserFetcher({}, {})
+    provider = HttpSourceProvider(
+        profile_loader=SourceProfileLoader(root),
+        client=httpx.AsyncClient(transport=YoutubeStructuredMetadataTransport(), follow_redirects=True),
+        browser_fetcher=browser_fetcher,
+    )
+
+    row = asyncio.run(
+        provider._fetch_page_record(
+            watch_url,
+            "YouTube Search",
+            "streaming",
+            build_draft(),
+            asyncio.Semaphore(1),
+        )
+    )
+
+    assert row is not None
+    assert row["title"] == "Alexandre Moguilewsky & Leonid Kreutzer: Beethoven: Violin Sonata No. 5 (R. ca 1931)"
+    assert row["description"] == "Historic upload with rendered watch metadata"
+    assert row["uploader"] == "Archive C"
+    assert row["duration_seconds"] == 1449
+    assert row["view_count"] == 12345
+    assert browser_fetcher.page_calls == []
+
+
+def test_fetch_page_record_reads_youtube_overlay_metadata_when_player_response_lacks_video_details(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "source-profiles"
+    root.mkdir(parents=True)
+    (root / "high-quality.txt").write_text("#global\nhttps://catalog.example\n", encoding="utf-8")
+    (root / "streaming.txt").write_text("#global\nhttps://www.youtube.com\n", encoding="utf-8")
+
+    class YoutubeOverlayMetadataTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                request=request,
+                text=(
+                    "<html><head>"
+                    "<title>- YouTube</title>"
+                    "<script>var ytInitialPlayerResponse = {\"responseContext\":{\"serviceTrackingParams\":[]}};</script>"
+                    "<script>"
+                    '{"videoDetails":{"playerOverlayVideoDetailsRenderer":{"title":{"simpleText":"Alexandre Moguilewsky '
+                    '& Leonid Kreutzer: Beethoven: Violin Sonata No. 5 (R. ca 1931)"},"subtitle":{"runs":[{"text":'
+                    '"Archive C"},{"text":"   "},{"text":"154 views"},{"text":"   "},{"text":"4 years ago"}]}}},'
+                    '"lengthText":{"accessibility":{"accessibilityData":{"label":"24 minutes, 9 seconds"}}}}'
+                    "</script>"
+                    "</head><body></body></html>"
+                ),
+            )
+
+    watch_url = "https://www.youtube.com/watch?v=vCC5o4A3HMY"
+    browser_fetcher = StructuredBrowserFetcher({}, {})
+    provider = HttpSourceProvider(
+        profile_loader=SourceProfileLoader(root),
+        client=httpx.AsyncClient(transport=YoutubeOverlayMetadataTransport(), follow_redirects=True),
+        browser_fetcher=browser_fetcher,
+    )
+
+    row = asyncio.run(
+        provider._fetch_page_record(
+            watch_url,
+            "YouTube Search",
+            "streaming",
+            build_draft(),
+            asyncio.Semaphore(1),
+        )
+    )
+
+    assert row is not None
+    assert row["title"] == "Alexandre Moguilewsky & Leonid Kreutzer: Beethoven: Violin Sonata No. 5 (R. ca 1931)"
+    assert row["uploader"] == "Archive C"
+    assert row["duration_seconds"] == 1449
+    assert browser_fetcher.page_calls == []
 
 
 def test_score_recording_match_treats_apple_track_resource_as_viable_version_evidence() -> None:
@@ -3804,7 +4447,7 @@ def test_provider_uses_browser_metadata_to_enrich_bilibili_video_pages(tmp_path:
     draft = DraftRecordingEntry(
         item_id="annie-metadata",
         title="Annie Fischer & Kletzki",
-        composer_name="鑸掓浖",
+        composer_name="罗伯特·舒曼",
         composer_name_latin="Robert Schumann",
         work_title="a小调钢琴协奏曲",
         work_title_latin="Piano Concerto, Op.54",
@@ -3843,6 +4486,314 @@ def test_provider_uses_browser_metadata_to_enrich_bilibili_video_pages(tmp_path:
     assert row["duration_seconds"] == 2017
     assert row["view_count"] == 1748
     assert row["same_recording_score"] >= 0.6
+
+
+def test_fetch_page_record_uses_browser_fallback_for_suspicious_bilibili_metadata(tmp_path: Path) -> None:
+    root = tmp_path / "source-profiles"
+    root.mkdir(parents=True)
+    (root / "high-quality.txt").write_text("#global\nhttps://catalog.example\n", encoding="utf-8")
+    (root / "streaming.txt").write_text("#global\n[zh] https://www.bilibili.com\n", encoding="utf-8")
+
+    class SuspiciousBilibiliTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            if "www.bilibili.com/video/BV14GZhYEE2D" not in str(request.url):
+                return httpx.Response(404, request=request, text="not found")
+            return httpx.Response(
+                200,
+                request=request,
+                text=(
+                    "<html><head>"
+                    "<script>"
+                    'window.__INITIAL_STATE__={"videoData":{"title":"Egon Petri","bvid":"BV14GZhYEE2D",'
+                    '"owner":{"name":"tANcL-4"},"stat":{"view":2603},"duration":86990,"desc":"保全录"}};'
+                    "</script>"
+                    "</head><body></body></html>"
+                ),
+            )
+
+    browser_fetcher = StructuredBrowserFetcher(
+        {},
+        {
+            "https://www.bilibili.com/video/BV14GZhYEE2D/": {
+                "title": 'Egon Petri plays Beethoven Sonata No. 23 in F minor Op. 57 "Appassionata"',
+                "description": "Historic upload. Egon Petri live 1956.",
+                "bodyText": 'Egon Petri Beethoven Sonata No. 23 in F minor Op. 57 "Appassionata" 1956',
+                "imageUrl": "",
+                "uploader": "Franz-van-Chopin",
+                "durationSeconds": 1214,
+                "viewCount": 314,
+            }
+        },
+    )
+    provider = HttpSourceProvider(
+        profile_loader=SourceProfileLoader(root),
+        client=httpx.AsyncClient(transport=SuspiciousBilibiliTransport(), follow_redirects=True),
+        browser_fetcher=browser_fetcher,
+        platform_search_config=PlatformSearchConfig(
+            bilibili=BilibiliSearchConfig(enabled=False),
+        ),
+    )
+    draft = DraftRecordingEntry(
+        item_id="egon-petri-appassionata",
+        title="Egon Petri 1956",
+        composer_name="路德维希·凡·贝多芬",
+        composer_name_latin="Ludwig van Beethoven",
+        work_title="第二十三号奏鸣曲，热情",
+        work_title_latin="Piano Sonata No.23, Op.57",
+        catalogue="Op.57",
+        performance_date_text="1956",
+        venue_text="",
+        album_title="",
+        label="",
+        release_date="",
+        notes="",
+        source_line="Ludwig van Beethoven | Piano Sonata No.23, Op.57 | Egon Petri | 1956",
+        raw_text="Ludwig van Beethoven | Piano Sonata No.23, Op.57 | Egon Petri | 1956",
+        existing_links=[],
+        primary_names=["埃贡·佩特里"],
+        primary_names_latin=["Egon Petri"],
+        secondary_names=[],
+        secondary_names_latin=[],
+        query_lead_names=["埃贡·佩特里"],
+        query_lead_names_latin=["Egon Petri"],
+        lead_names=["埃贡·佩特里"],
+        lead_names_latin=["Egon Petri"],
+        ensemble_names=[],
+        ensemble_names_latin=[],
+        work_type_hint="chamber_solo",
+    )
+
+    row = asyncio.run(
+        provider._fetch_page_record(
+            "https://www.bilibili.com/video/BV14GZhYEE2D/",
+            "Bilibili Search Browser Search",
+            "streaming",
+            draft,
+            asyncio.Semaphore(1),
+        )
+    )
+
+    assert row is not None
+    assert row["title"] == 'Egon Petri plays Beethoven Sonata No. 23 in F minor Op. 57 "Appassionata"'
+    assert row["duration_seconds"] == 1214
+    assert row["fields"]["performanceDateText"] == "1956"
+    assert row["same_recording_score"] >= 0.6
+    assert browser_fetcher.page_calls == ["https://www.bilibili.com/video/BV14GZhYEE2D/"]
+
+
+def test_fetch_page_record_does_not_extract_misleading_year_from_suspicious_bilibili_metadata_when_browser_fallback_stays_empty(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "source-profiles"
+    root.mkdir(parents=True)
+    (root / "high-quality.txt").write_text("#global\nhttps://catalog.example\n", encoding="utf-8")
+    (root / "streaming.txt").write_text("#global\n[zh] https://www.bilibili.com\n", encoding="utf-8")
+
+    class SuspiciousBilibiliYearLeakTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            if "www.bilibili.com/video/BV14GZhYEE2D" not in str(request.url):
+                return httpx.Response(404, request=request, text="not found")
+            return httpx.Response(
+                200,
+                request=request,
+                text=(
+                    "<html><head>"
+                    "<script>"
+                    'window.__INITIAL_STATE__={"videoData":{"title":"Egon Petri","bvid":"BV14GZhYEE2D",'
+                    '"owner":{"name":"tANcL-4"},"stat":{"view":2603},"duration":86990,'
+                    '"desc":"淇濆叏褰?","ctime":1959}};'
+                    "</script>"
+                    "</head><body></body></html>"
+                ),
+            )
+
+    browser_fetcher = StructuredBrowserFetcher({}, {})
+    provider = HttpSourceProvider(
+        profile_loader=SourceProfileLoader(root),
+        client=httpx.AsyncClient(transport=SuspiciousBilibiliYearLeakTransport(), follow_redirects=True),
+        browser_fetcher=browser_fetcher,
+        platform_search_config=PlatformSearchConfig(
+            bilibili=BilibiliSearchConfig(enabled=False),
+        ),
+    )
+    draft = DraftRecordingEntry(
+        item_id="egon-petri-appassionata-year-guard",
+        title="Egon Petri 1956",
+        composer_name="路德维希·凡·贝多芬",
+        composer_name_latin="Ludwig van Beethoven",
+        work_title="第二十三号奏鸣曲，热情",
+        work_title_latin="Piano Sonata No.23, Op.57",
+        catalogue="Op.57",
+        performance_date_text="1956",
+        venue_text="",
+        album_title="",
+        label="",
+        release_date="",
+        notes="",
+        source_line="Ludwig van Beethoven | Piano Sonata No.23, Op.57 | Egon Petri | 1956",
+        raw_text="Ludwig van Beethoven | Piano Sonata No.23, Op.57 | Egon Petri | 1956",
+        existing_links=[],
+        primary_names=["埃贡·佩特里"],
+        primary_names_latin=["Egon Petri"],
+        secondary_names=[],
+        secondary_names_latin=[],
+        query_lead_names=["埃贡·佩特里"],
+        query_lead_names_latin=["Egon Petri"],
+        lead_names=["埃贡·佩特里"],
+        lead_names_latin=["Egon Petri"],
+        ensemble_names=[],
+        ensemble_names_latin=[],
+        work_type_hint="chamber_solo",
+    )
+
+    row = asyncio.run(
+        provider._fetch_page_record(
+            "https://www.bilibili.com/video/BV14GZhYEE2D/",
+            "Bilibili Search Browser Search",
+            "streaming",
+            draft,
+            asyncio.Semaphore(1),
+        )
+    )
+
+    assert row is not None
+    assert row["title"] == "Egon Petri"
+    assert row["fields"]["performanceDateText"] == "1956"
+    assert browser_fetcher.page_calls == ["https://www.bilibili.com/video/BV14GZhYEE2D/"]
+
+
+def test_fetch_page_record_does_not_extract_misleading_year_from_suspicious_bilibili_detail_api_metadata(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "source-profiles"
+    root.mkdir(parents=True)
+    (root / "high-quality.txt").write_text("#global\nhttps://catalog.example\n", encoding="utf-8")
+    (root / "streaming.txt").write_text("#global\n[zh] https://www.bilibili.com\n", encoding="utf-8")
+
+    class SuspiciousBilibiliDetailApiTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if url.rstrip("/") == "https://www.bilibili.com":
+                return httpx.Response(200, request=request, text="home")
+            if "api.bilibili.com/x/web-interface/nav" in url:
+                return httpx.Response(
+                    200,
+                    request=request,
+                    json={"data": {"wbi_img": {"img_url": "https://i0.hdslb.com/bfs/wbi/abc.png", "sub_url": "https://i0.hdslb.com/bfs/wbi/def.png"}}},
+                )
+            if "api.bilibili.com/x/web-interface/view" in url and "BV14GZhYEE2D" in url:
+                return httpx.Response(
+                    200,
+                    request=request,
+                    json={
+                        "code": 0,
+                        "data": {
+                            "bvid": "BV14GZhYEE2D",
+                            "title": "Egon Petri",
+                            "desc": "괏홍쩌",
+                            "pic": "https://i0.hdslb.com/demo.jpg",
+                            "duration": 86990,
+                            "owner": {"name": "tANcL-4"},
+                            "stat": {"view": 2605},
+                            "pages": [{"part": "Historic source 1959 archive part"}],
+                        },
+                    },
+                )
+            if "www.bilibili.com/video/BV14GZhYEE2D" in url:
+                return httpx.Response(200, request=request, text="<html><head><title>Egon Petri</title></head><body></body></html>")
+            return httpx.Response(404, request=request, text="not found")
+
+    browser_fetcher = StructuredBrowserFetcher({}, {})
+    provider = HttpSourceProvider(
+        profile_loader=SourceProfileLoader(root),
+        client=httpx.AsyncClient(transport=SuspiciousBilibiliDetailApiTransport(), follow_redirects=True),
+        browser_fetcher=browser_fetcher,
+        platform_search_config=PlatformSearchConfig(
+            bilibili=BilibiliSearchConfig(enabled=True, user_agent="UA/1.0"),
+        ),
+    )
+    draft = DraftRecordingEntry(
+        item_id="egon-petri-appassionata-detail-api-year-guard",
+        title="Egon Petri 1956",
+        composer_name="路德维希·凡·贝多芬",
+        composer_name_latin="Ludwig van Beethoven",
+        work_title="第二十三号奏鸣曲，热情",
+        work_title_latin="Piano Sonata No.23, Op.57",
+        catalogue="Op.57",
+        performance_date_text="1956",
+        venue_text="",
+        album_title="",
+        label="",
+        release_date="",
+        notes="",
+        source_line="Ludwig van Beethoven | Piano Sonata No.23, Op.57 | Egon Petri | 1956",
+        raw_text="Ludwig van Beethoven | Piano Sonata No.23, Op.57 | Egon Petri | 1956",
+        existing_links=[],
+        primary_names=["埃贡·佩特里"],
+        primary_names_latin=["Egon Petri"],
+        secondary_names=[],
+        secondary_names_latin=[],
+        query_lead_names=["埃贡·佩特里"],
+        query_lead_names_latin=["Egon Petri"],
+        lead_names=["埃贡·佩特里"],
+        lead_names_latin=["Egon Petri"],
+        ensemble_names=[],
+        ensemble_names_latin=[],
+        work_type_hint="chamber_solo",
+    )
+
+    row = asyncio.run(
+        provider._fetch_page_record(
+            "https://www.bilibili.com/video/BV14GZhYEE2D/",
+            "Bilibili Search",
+            "streaming",
+            draft,
+            asyncio.Semaphore(1),
+        )
+    )
+
+    assert row is not None
+    assert row["title"] == "Egon Petri"
+    assert row["fields"]["performanceDateText"] == "1956"
+    assert browser_fetcher.page_calls == ["https://www.bilibili.com/video/BV14GZhYEE2D/"]
+
+
+def test_fetch_page_record_extracts_bilibili_month_year_from_description_context(tmp_path: Path) -> None:
+    root = tmp_path / "source-profiles"
+    root.mkdir(parents=True)
+    (root / "high-quality.txt").write_text("#global\nhttps://catalog.example\n", encoding="utf-8")
+    (root / "streaming.txt").write_text("#global\n[zh] https://www.bilibili.com\n", encoding="utf-8")
+
+    class BilibiliMonthYearTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                request=request,
+                text=(
+                    "<html><head>"
+                    '<meta property="og:title" content="Szymon Goldberg, Miyoko Yamane - Beethoven Spring Sonata" />'
+                    '<meta property="og:description" content="录制于1991年6月，Szymon Goldberg, Miyoko Yamane" />'
+                    "</head><body></body></html>"
+                ),
+            )
+
+    provider = HttpSourceProvider(
+        profile_loader=SourceProfileLoader(root),
+        client=httpx.AsyncClient(transport=BilibiliMonthYearTransport(), follow_redirects=True),
+    )
+
+    row = asyncio.run(
+        provider._fetch_page_record(
+            "https://www.bilibili.com/video/BV1tS411P7xf/",
+            "Bilibili Search Browser Search",
+            "streaming",
+            build_draft(),
+            asyncio.Semaphore(1),
+        )
+    )
+
+    assert row is not None
+    assert row["fields"]["performanceDateText"] == "June, 1991"
 
 
 def test_provider_canonicalizes_bilibili_av_url_to_bv_when_metadata_exposes_bvid(tmp_path: Path) -> None:
@@ -4101,9 +5052,9 @@ def test_provider_uses_seeded_bilibili_search_metadata_without_fetching_video_pa
     draft = DraftRecordingEntry(
         item_id="annie-seeded-bilibili",
         title="Annie Fischer & Kletzki",
-        composer_name="鑸掓浖",
+        composer_name="罗伯特·舒曼",
         composer_name_latin="Robert Schumann",
-        work_title="a灏忚皟閽㈢惔鍗忓鏇?",
+        work_title="a小调钢琴协奏曲",
         work_title_latin="Piano Concerto, Op.54",
         catalogue="Op.54",
         performance_date_text="",
@@ -4747,6 +5698,58 @@ def test_merge_bilibili_browser_query_rows_keeps_first_unseen_second_result_from
 
     urls = [row["url"] for row in merged]
     assert "https://www.bilibili.com/video/BV1HP411m7JC/" in urls
+
+
+def test_merge_bilibili_browser_query_rows_keeps_deeper_hit_from_chamber_bundle_query() -> None:
+    target = {
+        "url": "https://www.bilibili.com/video/BV1TARGET1111/",
+        "source_label": "Bilibili Search Browser Search",
+        "source_kind": "streaming",
+    }
+    query_rows_list = [
+        [
+            {"url": "https://www.bilibili.com/video/BV1AA4111111/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"},
+            {"url": "https://www.bilibili.com/video/BV1AA4111112/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"},
+            {"url": "https://www.bilibili.com/video/BV1AA4111113/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"},
+            {"url": "https://www.bilibili.com/video/BV1AA4111114/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"},
+            {"url": "https://www.bilibili.com/video/BV1AA4111115/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"},
+        ],
+        [
+            {"url": "https://www.bilibili.com/video/BV1BB4111111/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"},
+            {"url": "https://www.bilibili.com/video/BV1BB4111112/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"},
+            {"url": "https://www.bilibili.com/video/BV1BB4111113/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"},
+            {"url": "https://www.bilibili.com/video/BV1BB4111114/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"},
+            {"url": "https://www.bilibili.com/video/BV1BB4111115/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"},
+        ],
+        [
+            {"url": "https://www.bilibili.com/video/BV1CC4111111/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"},
+            {"url": "https://www.bilibili.com/video/BV1CC4111112/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"},
+            {"url": "https://www.bilibili.com/video/BV1CC4111113/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"},
+            {"url": "https://www.bilibili.com/video/BV1CC4111114/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"},
+            target,
+        ],
+        [
+            {"url": "https://www.bilibili.com/video/BV1DD4111111/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"},
+            {"url": "https://www.bilibili.com/video/BV1DD4111112/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"},
+            {"url": "https://www.bilibili.com/video/BV1DD4111113/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"},
+            {"url": "https://www.bilibili.com/video/BV1DD4111114/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"},
+            {"url": "https://www.bilibili.com/video/BV1DD4111115/", "source_label": "Bilibili Search Browser Search", "source_kind": "streaming"},
+        ],
+    ]
+
+    merged = merge_bilibili_browser_query_rows(
+        query_rows_list,
+        queries=[
+            "春天奏鸣曲 Szigeti Schnabel",
+            "spring Szigeti Schnabel",
+            "Szigeti Schnabel violin sonatas",
+            "spring Joseph Szigeti Artur Schnabel",
+        ],
+        result_depth=12,
+    )
+
+    urls = [row["url"] for row in merged]
+    assert "https://www.bilibili.com/video/BV1TARGET1111/" in urls
 
 
 def test_merge_streaming_host_rows_preserves_deeper_bilibili_slice_when_multiple_hosts() -> None:
@@ -5394,6 +6397,777 @@ def test_non_chinese_platform_queries_include_named_work_aliases_for_solo_repert
     queries = provider._queries_for_host(draft, profile, host)
 
     assert any("appassionata" in query.lower() for query in queries)
+
+
+def test_non_chinese_platform_queries_for_actual_appassionata_scenario_promote_yearless_named_anchor() -> None:
+    recordings, works, composers = load_library_indices()
+    work_id = find_work_id(works=works, title_latin="Piano Sonata No.23, Op.57")
+    scenario = next(
+        scenario
+        for scenario in build_work_dataset(
+            work_id=work_id,
+            recordings=recordings,
+            works=works,
+            composers=composers,
+        )
+        if scenario.variant == "full" and "youtube:eMi5KZ4lDCA" in scenario.target_urls
+    )
+    provider = HttpSourceProvider()
+    draft = InputNormalizer().normalize(scenario.item)
+    profile = ProfileResolver().resolve(scenario.item)
+    host = next(host for host in provider._profile_loader.load(category="chamber_solo", tags=[]).streaming if "youtube.com" in host.url)
+
+    queries = provider._queries_for_host(draft, profile, host)
+
+    assert any(query.lower() == "appassionata walter gieseking" for query in queries[:4])
+    assert all("1951、1947" not in query for query in queries[:3])
+
+
+def test_queries_for_bilibili_host_for_actual_spring_sonata_scenario_promote_yearless_duo_anchor() -> None:
+    recordings, works, composers = load_library_indices()
+    work_id = find_work_id(works=works, title_latin="Violin Sonata No.5, Op.24")
+    scenario = next(
+        scenario
+        for scenario in build_work_dataset(
+            work_id=work_id,
+            recordings=recordings,
+            works=works,
+            composers=composers,
+        )
+        if scenario.variant == "full" and "bilibili:BV1tN4y1B7fQ" in scenario.target_urls
+    )
+    provider = HttpSourceProvider()
+    draft = InputNormalizer().normalize(scenario.item)
+    profile = ProfileResolver().resolve(scenario.item)
+    host = next(host for host in provider._profile_loader.load(category="chamber_solo", tags=[]).streaming if "bilibili.com" in host.url)
+
+    queries = provider._queries_for_host(draft, profile, host)
+
+    assert any(
+        "spring" in query.lower()
+        and "Joseph Szigeti" in query
+        and "Mieczyslaw Horszowski" in query
+        and "1953" not in query
+        for query in queries[:6]
+    )
+    assert any("春天奏鸣曲" in query and "西盖蒂" in query for query in queries[:6])
+    assert queries[0] != "西盖蒂·约瑟夫 1953"
+
+
+def test_non_chinese_platform_queries_for_actual_appassionata_scenario_include_combined_named_numbered_anchor() -> None:
+    recordings, works, composers = load_library_indices()
+    work_id = find_work_id(works=works, title_latin="Piano Sonata No.23, Op.57")
+    scenario = next(
+        scenario
+        for scenario in build_work_dataset(
+            work_id=work_id,
+            recordings=recordings,
+            works=works,
+            composers=composers,
+        )
+        if scenario.variant == "full" and "youtube:eMi5KZ4lDCA" in scenario.target_urls
+    )
+    provider = HttpSourceProvider()
+    draft = InputNormalizer().normalize(scenario.item)
+    profile = RetrievalProfile(category="chamber_solo", tags=[], queries=[], latin_queries=[], zh_queries=[], mixed_queries=[])
+    host = next(host for host in provider._profile_loader.load(category="chamber_solo", tags=[]).streaming if "youtube.com" in host.url)
+
+    queries = provider._queries_for_host(draft, profile, host)
+
+    assert any(
+        "appassionata" in query.lower()
+        and "piano sonata no 23" in query.lower()
+        and "Walter Gieseking" in query
+        and "1951" not in query
+        and "1947" not in query
+        for query in queries[:6]
+    )
+
+
+def test_queries_for_bilibili_host_for_actual_szigeti_schnabel_scenario_include_compact_duo_anchor() -> None:
+    recordings, works, composers = load_library_indices()
+    work_id = find_work_id(works=works, title_latin="Violin Sonata No.5, Op.24")
+    scenario = next(
+        scenario
+        for scenario in build_work_dataset(
+            work_id=work_id,
+            recordings=recordings,
+            works=works,
+            composers=composers,
+        )
+        if scenario.variant == "full" and "bilibili:BV1nJ411r7n5" in scenario.target_urls
+    )
+    provider = HttpSourceProvider()
+    draft = InputNormalizer().normalize(scenario.item)
+    profile = ProfileResolver().resolve(scenario.item)
+    host = next(host for host in provider._profile_loader.load(category="chamber_solo", tags=[]).streaming if "bilibili.com" in host.url)
+
+    queries = provider._queries_for_host(draft, profile, host)
+
+    compact_duo_index = next(
+        (
+            index
+            for index, query in enumerate(queries[:6])
+            if ("Szigeti-Schnabel" in query or "Szigeti Schnabel" in query)
+            and ("spring" in query.lower() or "violin sonata no.5" in query.lower() or "violin sonata no 5" in query.lower())
+        ),
+        None,
+    )
+
+    assert compact_duo_index is not None
+    if "瑗跨洊钂偮风害鐟熷か 1948" in queries:
+        assert compact_duo_index < queries.index("瑗跨洊钂偮风害鐟熷か 1948")
+
+
+def test_queries_for_youtube_host_for_actual_mogilevsky_partial_scenario_include_transliterated_duo_query() -> None:
+    recordings, works, composers = load_library_indices()
+    work_id = find_work_id(works=works, title_latin="Violin Sonata No.5, Op.24")
+    scenario = next(
+        scenario
+        for scenario in build_work_dataset(
+            work_id=work_id,
+            recordings=recordings,
+            works=works,
+            composers=composers,
+        )
+        if scenario.variant == "partial" and "youtube:vCC5o4A3HMY" in scenario.target_urls
+    )
+    provider = HttpSourceProvider()
+    draft = InputNormalizer().normalize(scenario.item)
+    profile = ProfileResolver().resolve(scenario.item)
+    host = next(host for host in provider._profile_loader.load(category="chamber_solo", tags=[]).streaming if "youtube.com" in host.url)
+
+    queries = provider._queries_for_host(draft, profile, host)
+
+    assert any(
+        "spring" in query.lower()
+        and "Alexandre Moguilewsky" in query
+        and "Leonid Kreutzer" in query
+        for query in queries[:10]
+    )
+
+
+def test_queries_for_bilibili_host_for_actual_schneiderhan_seemann_scenario_include_mixed_named_work_compact_duo_anchor() -> None:
+    recordings, works, composers = load_library_indices()
+    work_id = find_work_id(works=works, title_latin="Violin Sonata No.5, Op.24")
+    scenario = next(
+        scenario
+        for scenario in build_work_dataset(
+            work_id=work_id,
+            recordings=recordings,
+            works=works,
+            composers=composers,
+        )
+        if scenario.variant == "full" and "bilibili:BV1qW4y1f7Ng" in scenario.target_urls
+    )
+    provider = HttpSourceProvider()
+    draft = InputNormalizer().normalize(scenario.item)
+    profile = ProfileResolver().resolve(scenario.item)
+    host = next(host for host in provider._profile_loader.load(category="chamber_solo", tags=[]).streaming if "bilibili.com" in host.url)
+
+    queries = provider._queries_for_host(draft, profile, host)
+
+    assert any(
+        ("\u6625\u5929" in query or "\u6625\u5929\u594f\u9e23\u66f2" in query)
+        and ("Schneiderhan Seemann" in query or "Schneiderhan-Seemann" in query)
+        for query in queries[:8]
+    )
+
+
+def test_prepare_bilibili_browser_queries_for_actual_schneiderhan_seemann_scenario_keep_mixed_named_work_compact_duo_query() -> None:
+    recordings, works, composers = load_library_indices()
+    work_id = find_work_id(works=works, title_latin="Violin Sonata No.5, Op.24")
+    scenario = next(
+        scenario
+        for scenario in build_work_dataset(
+            work_id=work_id,
+            recordings=recordings,
+            works=works,
+            composers=composers,
+        )
+        if scenario.variant == "full" and "bilibili:BV1qW4y1f7Ng" in scenario.target_urls
+    )
+    provider = HttpSourceProvider()
+    draft = InputNormalizer().normalize(scenario.item)
+    profile = ProfileResolver().resolve(scenario.item)
+    host = next(host for host in provider._profile_loader.load(category="chamber_solo", tags=[]).streaming if "bilibili.com" in host.url)
+
+    queries = provider._queries_for_host(draft, profile, host)
+    selected = prepare_bilibili_browser_queries(queries, max_queries=4)
+
+    assert any(
+        ("\u6625\u5929" in query or "\u6625\u5929\u594f\u9e23\u66f2" in query)
+        and ("Schneiderhan Seemann" in query or "Schneiderhan-Seemann" in query)
+        for query in selected
+    )
+
+
+def test_queries_for_bilibili_host_for_actual_schneiderhan_seemann_scenario_include_complete_bundle_year_anchor() -> None:
+    recordings, works, composers = load_library_indices()
+    work_id = find_work_id(works=works, title_latin="Violin Sonata No.5, Op.24")
+    scenario = next(
+        scenario
+        for scenario in build_work_dataset(
+            work_id=work_id,
+            recordings=recordings,
+            works=works,
+            composers=composers,
+        )
+        if scenario.variant == "full" and "bilibili:BV1qW4y1f7Ng" in scenario.target_urls
+    )
+    provider = HttpSourceProvider()
+    draft = InputNormalizer().normalize(scenario.item)
+    profile = ProfileResolver().resolve(scenario.item)
+    host = next(host for host in provider._profile_loader.load(category="chamber_solo", tags=[]).streaming if "bilibili.com" in host.url)
+
+    queries = provider._queries_for_host(draft, profile, host)
+
+    assert any(
+        "Schneiderhan Seemann" in query
+        and "complete violin sonatas" in query.lower()
+        and "1959" in query
+        for query in queries[:12]
+    )
+
+
+def test_queries_for_bilibili_host_for_actual_schneiderhan_seemann_scenario_include_complete_bundle_trailer_probe() -> None:
+    recordings, works, composers = load_library_indices()
+    work_id = find_work_id(works=works, title_latin="Violin Sonata No.5, Op.24")
+    scenario = next(
+        scenario
+        for scenario in build_work_dataset(
+            work_id=work_id,
+            recordings=recordings,
+            works=works,
+            composers=composers,
+        )
+        if scenario.variant == "full" and "bilibili:BV1qW4y1f7Ng" in scenario.target_urls
+    )
+    provider = HttpSourceProvider()
+    draft = InputNormalizer().normalize(scenario.item)
+    profile = ProfileResolver().resolve(scenario.item)
+    host = next(host for host in provider._profile_loader.load(category="chamber_solo", tags=[]).streaming if "bilibili.com" in host.url)
+
+    queries = provider._queries_for_host(draft, profile, host)
+
+    assert any(
+        "Schneiderhan Seemann" in query
+        and "complete violin sonatas" in query.lower()
+        and "trailer" in query.lower()
+        for query in queries[:12]
+    )
+
+
+def test_prepare_bilibili_browser_queries_for_actual_schneiderhan_seemann_scenario_keep_complete_bundle_year_anchor() -> None:
+    recordings, works, composers = load_library_indices()
+    work_id = find_work_id(works=works, title_latin="Violin Sonata No.5, Op.24")
+    scenario = next(
+        scenario
+        for scenario in build_work_dataset(
+            work_id=work_id,
+            recordings=recordings,
+            works=works,
+            composers=composers,
+        )
+        if scenario.variant == "full" and "bilibili:BV1qW4y1f7Ng" in scenario.target_urls
+    )
+    provider = HttpSourceProvider()
+    draft = InputNormalizer().normalize(scenario.item)
+    profile = ProfileResolver().resolve(scenario.item)
+    host = next(host for host in provider._profile_loader.load(category="chamber_solo", tags=[]).streaming if "bilibili.com" in host.url)
+
+    queries = provider._queries_for_host(draft, profile, host)
+    selected = prepare_bilibili_browser_queries(queries, max_queries=4)
+
+    assert any(
+        "Schneiderhan Seemann" in query
+        and "complete violin sonatas" in query.lower()
+        and "1959" in query
+        for query in selected
+    )
+
+
+def test_queries_for_bilibili_host_for_actual_szigeti_schnabel_partial_scenario_include_duo_bundle_query() -> None:
+    recordings, works, composers = load_library_indices()
+    work_id = find_work_id(works=works, title_latin="Violin Sonata No.5, Op.24")
+    scenario = next(
+        scenario
+        for scenario in build_work_dataset(
+            work_id=work_id,
+            recordings=recordings,
+            works=works,
+            composers=composers,
+        )
+        if scenario.variant == "partial" and "bilibili:BV1nJ411r7n5" in scenario.target_urls
+    )
+    provider = HttpSourceProvider()
+    draft = InputNormalizer().normalize(scenario.item)
+    profile = ProfileResolver().resolve(scenario.item)
+    host = next(host for host in provider._profile_loader.load(category="chamber_solo", tags=[]).streaming if "bilibili.com" in host.url)
+
+    queries = provider._queries_for_host(draft, profile, host)
+
+    assert any(
+        "Szigeti Schnabel" in query
+        and ("violin sonatas" in query.lower() or "sonata collection" in query.lower() or "sonatas" in query.lower())
+        for query in queries[:12]
+    )
+
+
+def test_queries_for_bilibili_host_for_actual_szigeti_schnabel_full_scenario_include_duo_bundle_query() -> None:
+    recordings, works, composers = load_library_indices()
+    work_id = find_work_id(works=works, title_latin="Violin Sonata No.5, Op.24")
+    scenario = next(
+        scenario
+        for scenario in build_work_dataset(
+            work_id=work_id,
+            recordings=recordings,
+            works=works,
+            composers=composers,
+        )
+        if scenario.variant == "full" and "bilibili:BV1nJ411r7n5" in scenario.target_urls
+    )
+    provider = HttpSourceProvider()
+    draft = InputNormalizer().normalize(scenario.item)
+    profile = ProfileResolver().resolve(scenario.item)
+    host = next(host for host in provider._profile_loader.load(category="chamber_solo", tags=[]).streaming if "bilibili.com" in host.url)
+
+    queries = provider._queries_for_host(draft, profile, host)
+
+    assert any(
+        "Szigeti Schnabel" in query
+        and ("violin sonatas" in query.lower() or "sonata collection" in query.lower() or "sonatas" in query.lower())
+        for query in queries[:12]
+    )
+
+
+def test_prepare_bilibili_browser_queries_for_actual_szigeti_schnabel_partial_scenario_keep_duo_bundle_query() -> None:
+    recordings, works, composers = load_library_indices()
+    work_id = find_work_id(works=works, title_latin="Violin Sonata No.5, Op.24")
+    scenario = next(
+        scenario
+        for scenario in build_work_dataset(
+            work_id=work_id,
+            recordings=recordings,
+            works=works,
+            composers=composers,
+        )
+        if scenario.variant == "partial" and "bilibili:BV1nJ411r7n5" in scenario.target_urls
+    )
+    provider = HttpSourceProvider()
+    draft = InputNormalizer().normalize(scenario.item)
+    profile = ProfileResolver().resolve(scenario.item)
+    host = next(host for host in provider._profile_loader.load(category="chamber_solo", tags=[]).streaming if "bilibili.com" in host.url)
+
+    queries = provider._queries_for_host(draft, profile, host)
+    selected = prepare_bilibili_browser_queries(queries, max_queries=4)
+
+    assert any(
+        "Szigeti Schnabel" in query
+        and ("violin sonatas" in query.lower() or "sonata collection" in query.lower() or "sonatas" in query.lower())
+        for query in selected
+    )
+
+
+def test_prepare_bilibili_browser_queries_for_actual_szigeti_schnabel_full_scenario_keep_duo_bundle_query() -> None:
+    recordings, works, composers = load_library_indices()
+    work_id = find_work_id(works=works, title_latin="Violin Sonata No.5, Op.24")
+    scenario = next(
+        scenario
+        for scenario in build_work_dataset(
+            work_id=work_id,
+            recordings=recordings,
+            works=works,
+            composers=composers,
+        )
+        if scenario.variant == "full" and "bilibili:BV1nJ411r7n5" in scenario.target_urls
+    )
+    provider = HttpSourceProvider()
+    draft = InputNormalizer().normalize(scenario.item)
+    profile = ProfileResolver().resolve(scenario.item)
+    host = next(host for host in provider._profile_loader.load(category="chamber_solo", tags=[]).streaming if "bilibili.com" in host.url)
+
+    queries = provider._queries_for_host(draft, profile, host)
+    selected = prepare_bilibili_browser_queries(queries, max_queries=4)
+
+    assert any(
+        "Szigeti Schnabel" in query
+        and ("violin sonatas" in query.lower() or "sonata collection" in query.lower() or "sonatas" in query.lower())
+        for query in selected
+    )
+
+
+def test_prepare_bilibili_browser_queries_keeps_cjk_orchestral_context_query() -> None:
+    queries = [
+        "幻想交响曲 伯恩斯坦 法国国家管弦乐团 1977",
+        "赫克托·路易·柏辽兹 幻想交响曲 伯恩斯坦 法国国家管弦乐团 1977",
+        "伯恩斯坦 1977",
+        "幻想交响曲 Leonard Bernstein 法国国家管弦乐团 1977",
+        "Symphonie Fantastique Leonard Bernstein 1977",
+        "Hector Louis Berlioz Symphonie Fantastique Leonard Bernstein 1977",
+        "Symphonie Fantastique 伯恩斯坦 1977",
+    ]
+
+    selected = prepare_bilibili_browser_queries(queries, max_queries=4)
+
+    assert "幻想交响曲 伯恩斯坦 法国国家管弦乐团 1977" in selected
+
+
+def test_non_chinese_platform_queries_for_actual_appassionata_scenario_split_ambiguous_years_into_single_year_anchor() -> None:
+    recordings, works, composers = load_library_indices()
+    work_id = find_work_id(works=works, title_latin="Piano Sonata No.23, Op.57")
+    scenario = next(
+        scenario
+        for scenario in build_work_dataset(
+            work_id=work_id,
+            recordings=recordings,
+            works=works,
+            composers=composers,
+        )
+        if scenario.variant == "full" and "youtube:eMi5KZ4lDCA" in scenario.target_urls
+    )
+    provider = HttpSourceProvider()
+    draft = InputNormalizer().normalize(scenario.item)
+    profile = RetrievalProfile(category="chamber_solo", tags=[], queries=[], latin_queries=[], zh_queries=[], mixed_queries=[])
+    host = next(host for host in provider._profile_loader.load(category="chamber_solo", tags=[]).streaming if "youtube.com" in host.url)
+
+    queries = provider._queries_for_host(draft, profile, host)
+
+    assert any(
+        "Walter Gieseking" in query
+        and "1947" in query
+        and "1951、1947" not in query
+        and ("appassionata" in query.lower() or "piano sonata no 23" in query.lower())
+        for query in queries[:8]
+    )
+
+
+def test_non_chinese_platform_queries_for_actual_ernst_levy_scenario_include_surname_named_work_rescue() -> None:
+    recordings, works, composers = load_library_indices()
+    work_id = find_work_id(works=works, title_latin="Piano Sonata No.23, Op.57")
+    scenario = next(
+        scenario
+        for scenario in build_work_dataset(
+            work_id=work_id,
+            recordings=recordings,
+            works=works,
+            composers=composers,
+        )
+        if scenario.variant == "full" and "youtube:4X7woG5vmb4" in scenario.target_urls
+    )
+    provider = HttpSourceProvider()
+    draft = InputNormalizer().normalize(scenario.item)
+    profile = RetrievalProfile(category="chamber_solo", tags=[], queries=[], latin_queries=[], zh_queries=[], mixed_queries=[])
+    host = next(host for host in provider._profile_loader.load(category="chamber_solo", tags=[]).streaming if "youtube.com" in host.url)
+
+    queries = provider._queries_for_host(draft, profile, host)
+
+    assert any(query.lower() == "levy appassionata beethoven" for query in queries[:8])
+
+
+def test_queries_for_bilibili_host_for_actual_egon_petri_scenario_include_surname_named_work_rescue() -> None:
+    recordings, works, composers = load_library_indices()
+    work_id = find_work_id(works=works, title_latin="Piano Sonata No.23, Op.57")
+    scenario = next(
+        scenario
+        for scenario in build_work_dataset(
+            work_id=work_id,
+            recordings=recordings,
+            works=works,
+            composers=composers,
+        )
+        if scenario.variant == "full" and "bilibili:BV14GZhYEE2D" in scenario.target_urls
+    )
+    provider = HttpSourceProvider()
+    draft = InputNormalizer().normalize(scenario.item)
+    profile = ProfileResolver().resolve(scenario.item)
+    host = next(host for host in provider._profile_loader.load(category="chamber_solo", tags=[]).streaming if "bilibili.com" in host.url)
+
+    queries = provider._queries_for_host(draft, profile, host)
+
+    assert any(query.lower() == "petri appassionata beethoven" for query in queries[:10])
+
+
+def test_prepare_bilibili_browser_queries_for_actual_egon_petri_scenario_keep_surname_named_work_rescue() -> None:
+    recordings, works, composers = load_library_indices()
+    work_id = find_work_id(works=works, title_latin="Piano Sonata No.23, Op.57")
+    scenario = next(
+        scenario
+        for scenario in build_work_dataset(
+            work_id=work_id,
+            recordings=recordings,
+            works=works,
+            composers=composers,
+        )
+        if scenario.variant == "full" and "bilibili:BV14GZhYEE2D" in scenario.target_urls
+    )
+    provider = HttpSourceProvider()
+    draft = InputNormalizer().normalize(scenario.item)
+    profile = ProfileResolver().resolve(scenario.item)
+    host = next(host for host in provider._profile_loader.load(category="chamber_solo", tags=[]).streaming if "bilibili.com" in host.url)
+
+    queries = provider._queries_for_host(draft, profile, host)
+    selected = prepare_bilibili_browser_queries(queries, max_queries=4)
+
+    assert any(query.lower() == "petri appassionata beethoven" for query in selected)
+
+
+def test_queries_for_bilibili_host_for_actual_egon_petri_scenario_include_full_name_year_named_work_rescue() -> None:
+    recordings, works, composers = load_library_indices()
+    work_id = find_work_id(works=works, title_latin="Piano Sonata No.23, Op.57")
+    scenario = next(
+        scenario
+        for scenario in build_work_dataset(
+            work_id=work_id,
+            recordings=recordings,
+            works=works,
+            composers=composers,
+        )
+        if scenario.variant == "full" and "bilibili:BV14GZhYEE2D" in scenario.target_urls
+    )
+    provider = HttpSourceProvider()
+    draft = InputNormalizer().normalize(scenario.item)
+    profile = ProfileResolver().resolve(scenario.item)
+    host = next(host for host in provider._profile_loader.load(category="chamber_solo", tags=[]).streaming if "bilibili.com" in host.url)
+
+    queries = provider._queries_for_host(draft, profile, host)
+
+    assert any(query.lower() == "appassionata egon petri 1956" for query in queries[:10])
+
+
+def test_queries_for_bilibili_host_for_actual_egon_petri_scenario_include_full_name_yearless_named_work_rescue() -> None:
+    recordings, works, composers = load_library_indices()
+    work_id = find_work_id(works=works, title_latin="Piano Sonata No.23, Op.57")
+    scenario = next(
+        scenario
+        for scenario in build_work_dataset(
+            work_id=work_id,
+            recordings=recordings,
+            works=works,
+            composers=composers,
+        )
+        if scenario.variant == "partial" and "bilibili:BV14GZhYEE2D" in scenario.target_urls
+    )
+    provider = HttpSourceProvider()
+    draft = InputNormalizer().normalize(scenario.item)
+    profile = ProfileResolver().resolve(scenario.item)
+    host = next(host for host in provider._profile_loader.load(category="chamber_solo", tags=[]).streaming if "bilibili.com" in host.url)
+
+    queries = provider._queries_for_host(draft, profile, host)
+
+    assert any(query.lower() == "appassionata egon petri" for query in queries[:10])
+
+
+def test_queries_for_bilibili_host_for_actual_egon_petri_scenario_include_opus_anchor() -> None:
+    recordings, works, composers = load_library_indices()
+    work_id = find_work_id(works=works, title_latin="Piano Sonata No.23, Op.57")
+    scenario = next(
+        scenario
+        for scenario in build_work_dataset(
+            work_id=work_id,
+            recordings=recordings,
+            works=works,
+            composers=composers,
+        )
+        if scenario.variant == "full" and "bilibili:BV14GZhYEE2D" in scenario.target_urls
+    )
+    provider = HttpSourceProvider()
+    draft = InputNormalizer().normalize(scenario.item)
+    profile = ProfileResolver().resolve(scenario.item)
+    host = next(host for host in provider._profile_loader.load(category="chamber_solo", tags=[]).streaming if "bilibili.com" in host.url)
+
+    queries = provider._queries_for_host(draft, profile, host)
+
+    assert any(query.lower() == "egon petri op 57" for query in queries[:3])
+
+
+def test_prepare_bilibili_browser_queries_for_actual_egon_petri_scenario_keep_full_name_year_named_work_rescue() -> None:
+    recordings, works, composers = load_library_indices()
+    work_id = find_work_id(works=works, title_latin="Piano Sonata No.23, Op.57")
+    scenario = next(
+        scenario
+        for scenario in build_work_dataset(
+            work_id=work_id,
+            recordings=recordings,
+            works=works,
+            composers=composers,
+        )
+        if scenario.variant == "full" and "bilibili:BV14GZhYEE2D" in scenario.target_urls
+    )
+    provider = HttpSourceProvider()
+    draft = InputNormalizer().normalize(scenario.item)
+    profile = ProfileResolver().resolve(scenario.item)
+    host = next(host for host in provider._profile_loader.load(category="chamber_solo", tags=[]).streaming if "bilibili.com" in host.url)
+
+    queries = provider._queries_for_host(draft, profile, host)
+    selected = prepare_bilibili_browser_queries(queries, max_queries=4)
+
+    assert any(query.lower() == "appassionata egon petri 1956" for query in selected)
+
+
+def test_queries_for_bilibili_host_for_actual_sonoda_scenario_include_cjk_numbered_piano_sonata_alias() -> None:
+    recordings, works, composers = load_library_indices()
+    work_id = find_work_id(works=works, title_latin="Piano Sonata No.23, Op.57")
+    scenario = next(
+        scenario
+        for scenario in build_work_dataset(
+            work_id=work_id,
+            recordings=recordings,
+            works=works,
+            composers=composers,
+        )
+        if scenario.variant == "full" and "bilibili:BV1ouNbzqEQt" in scenario.target_urls
+    )
+    provider = HttpSourceProvider()
+    draft = InputNormalizer().normalize(scenario.item)
+    profile = ProfileResolver().resolve(scenario.item)
+    host = next(host for host in provider._profile_loader.load(category="chamber_solo", tags=[]).streaming if "bilibili.com" in host.url)
+
+    queries = provider._queries_for_host(draft, profile, host)
+
+    assert any(
+        query.startswith("第二十三钢琴奏鸣曲 園田高弘") or query.startswith("热情op57 園田高弘")
+        for query in queries[:8]
+    )
+
+
+def test_prepare_bilibili_browser_queries_for_actual_sonoda_scenario_keep_cjk_numbered_piano_sonata_alias() -> None:
+    recordings, works, composers = load_library_indices()
+    work_id = find_work_id(works=works, title_latin="Piano Sonata No.23, Op.57")
+    scenario = next(
+        scenario
+        for scenario in build_work_dataset(
+            work_id=work_id,
+            recordings=recordings,
+            works=works,
+            composers=composers,
+        )
+        if scenario.variant == "full" and "bilibili:BV1ouNbzqEQt" in scenario.target_urls
+    )
+    provider = HttpSourceProvider()
+    draft = InputNormalizer().normalize(scenario.item)
+    profile = ProfileResolver().resolve(scenario.item)
+    host = next(host for host in provider._profile_loader.load(category="chamber_solo", tags=[]).streaming if "bilibili.com" in host.url)
+
+    queries = provider._queries_for_host(draft, profile, host)
+    selected = prepare_bilibili_browser_queries(queries, max_queries=4)
+
+    assert any(
+        query.startswith("第二十三钢琴奏鸣曲 園田高弘") or query.startswith("热情op57 園田高弘")
+        for query in selected
+    )
+
+
+def test_queries_for_bilibili_host_for_actual_szigeti_schnabel_scenario_include_numbered_work_year_anchor() -> None:
+    recordings, works, composers = load_library_indices()
+    work_id = find_work_id(works=works, title_latin="Violin Sonata No.5, Op.24")
+    scenario = next(
+        scenario
+        for scenario in build_work_dataset(
+            work_id=work_id,
+            recordings=recordings,
+            works=works,
+            composers=composers,
+        )
+        if scenario.variant == "full" and "bilibili:BV1nJ411r7n5" in scenario.target_urls
+    )
+    provider = HttpSourceProvider()
+    draft = InputNormalizer().normalize(scenario.item)
+    profile = RetrievalProfile(category="chamber_solo", tags=[], queries=[], latin_queries=[], zh_queries=[], mixed_queries=[])
+    host = next(host for host in provider._profile_loader.load(category="chamber_solo", tags=[]).streaming if "bilibili.com" in host.url)
+
+    queries = provider._queries_for_host(draft, profile, host)
+
+    assert any(
+        ("Szigeti-Schnabel" in query or "Szigeti Schnabel" in query)
+        and "1948" in query
+        and ("violin sonata no.5" in query.lower() or "violin sonata no 5" in query.lower())
+        for query in queries[:8]
+    )
+
+
+def test_non_chamber_profile_does_not_call_chamber_anchor_builders(monkeypatch) -> None:
+    import app.services.http_sources as http_sources_module
+
+    recordings, works, composers = load_library_indices()
+    work_id = find_work_id(works=works, title_latin="Piano Concerto, Op.54")
+    scenario = next(
+        scenario
+        for scenario in build_work_dataset(
+            work_id=work_id,
+            recordings=recordings,
+            works=works,
+            composers=composers,
+        )
+        if scenario.variant == "full" and "bilibili:BV1RiZJYAEBD" in scenario.target_urls
+    )
+    provider = HttpSourceProvider()
+    draft = InputNormalizer().normalize(scenario.item)
+    profile = RetrievalProfile(category="concerto", tags=[], queries=[], latin_queries=[], zh_queries=[], mixed_queries=[])
+    host = next(host for host in provider._profile_loader.load(category="concerto", tags=[]).streaming if "youtube.com" in host.url)
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("chamber anchor builder should not run for concerto profiles")
+
+    monkeypatch.setattr(http_sources_module, "build_chamber_work_anchor_queries", fail_if_called)
+
+    queries = provider._queries_for_host(draft, profile, host)
+
+    assert queries
+
+
+def test_score_recording_match_for_actual_appassionata_scenario_accepts_alternate_year_from_multi_year_source() -> None:
+    recordings, works, composers = load_library_indices()
+    work_id = find_work_id(works=works, title_latin="Piano Sonata No.23, Op.57")
+    scenario = next(
+        scenario
+        for scenario in build_work_dataset(
+            work_id=work_id,
+            recordings=recordings,
+            works=works,
+            composers=composers,
+        )
+        if scenario.variant == "full" and "youtube:eMi5KZ4lDCA" in scenario.target_urls
+    )
+    draft = InputNormalizer().normalize(scenario.item)
+
+    alternate_year_hit = score_recording_match(
+        'Walter Gieseking plays Beethoven Piano Sonata No.23 "Appassionata" (1947)',
+        "https://www.youtube.com/watch?v=eMi5KZ4lDCA",
+        draft,
+        duration_seconds=1114,
+    )
+    wrong_year = score_recording_match(
+        'Walter Gieseking plays Beethoven Piano Sonata No.23 "Appassionata" (1935)',
+        "https://www.youtube.com/watch?v=wrong-year",
+        draft,
+        duration_seconds=1114,
+    )
+
+    assert alternate_year_hit >= 0.45
+    assert alternate_year_hit > wrong_year
+
+
+def test_candidate_title_quality_score_for_actual_appassionata_scenario_accepts_alternate_year_from_multi_year_source() -> None:
+    recordings, works, composers = load_library_indices()
+    work_id = find_work_id(works=works, title_latin="Piano Sonata No.23, Op.57")
+    scenario = next(
+        scenario
+        for scenario in build_work_dataset(
+            work_id=work_id,
+            recordings=recordings,
+            works=works,
+            composers=composers,
+        )
+        if scenario.variant == "full" and "youtube:eMi5KZ4lDCA" in scenario.target_urls
+    )
+    draft = InputNormalizer().normalize(scenario.item)
+
+    alternate_year_title = 'Walter Gieseking plays Beethoven Piano Sonata No.23 "Appassionata" (1947)'
+    wrong_year_title = 'Walter Gieseking plays Beethoven Piano Sonata No.23 "Appassionata" (1935)'
+
+    assert candidate_title_quality_score(draft, alternate_year_title) >= 0.08
+    assert candidate_title_quality_score(draft, alternate_year_title) > candidate_title_quality_score(draft, wrong_year_title)
 
 
 def test_score_recording_match_accepts_group_acronym_and_year_when_latin_fields_missing() -> None:
@@ -6489,7 +8263,7 @@ def test_score_recording_match_keeps_exact_annie_schumann_above_wrong_concerto_v
     draft = DraftRecordingEntry(
         item_id="recording-annie-version-guard",
         title="Annie Fischer & Kletzki",
-        composer_name="鑸掓浖",
+        composer_name="罗伯特·舒曼",
         composer_name_latin="Robert Schumann",
         work_title="a小调钢琴协奏曲",
         work_title_latin="Piano Concerto, Op.54",

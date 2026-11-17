@@ -24,15 +24,16 @@ from app.services.http_sources import materials_root
 from app.services.input_analysis import analyze_raw_text
 from app.services.llm_client import (
     DualModelLlmClient,
+    default_llm_config_path,
+    ensure_runtime_llm_config,
     is_llm_configured,
-    legacy_llm_config_path,
     load_llm_config,
 )
 from app.services.orchestrator import JobOrchestrator, TERMINAL_JOB_STATUSES
 from app.services.retrieval import StubRetriever
 from app.services.source_profiles import PersonAliasLoader, ensure_orchestra_alias_file, ensure_person_alias_file
+from app.version import APP_VERSION
 
-APP_VERSION = "0.1.0"
 SERVICE_NAME = "recording-retrieval-service"
 
 
@@ -40,7 +41,7 @@ def profile_group_paths() -> dict[str, Path]:
     return {
         "high-quality": materials_root() / "high-quality.txt",
         "streaming": materials_root() / "streaming.txt",
-        "llm-config": legacy_llm_config_path(),
+        "llm-config": default_llm_config_path(),
         "orchestra-aliases": ensure_orchestra_alias_file(),
         "person-aliases": ensure_person_alias_file(),
     }
@@ -109,7 +110,9 @@ def profile_targets_payload() -> dict[str, dict[str, str]]:
     }
     for group, path in profile_group_paths().items():
         path.parent.mkdir(parents=True, exist_ok=True)
-        if not path.exists():
+        if group == "llm-config":
+            ensure_runtime_llm_config(path)
+        elif not path.exists():
             path.write_text("", encoding="utf-8")
         payload[key_map[group]] = {
             "group": group,
